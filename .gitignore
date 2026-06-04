@@ -1,0 +1,37 @@
+# Docker build artifacts
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Python / uv
+.venv/
+*.egg-info/
+
+# Environment files (contain secrets)
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Certificates (should not be committed)
+/certs/
+*.key
+*.crt
+*.pem
+
+# Generated model splits
+models/
+
+# Logs
+*.log
+
+config.json
