@@ -56,7 +56,7 @@ def show_single_node_logs(config: ClusterConfig) -> None:
 
 
 def show_all_logs(config: ClusterConfig) -> None:
-    """全ノードの最新ログ（最終5行）を一括表示する"""
+    """全ノードの最新ログ（最終32行）を一括表示する"""
 
     from common import ssh_via_master
 
@@ -66,7 +66,7 @@ def show_all_logs(config: ClusterConfig) -> None:
         log("INFO", f"Rank {rank} ({ip})")
         result = ssh_via_master(
             config.ssh_user, config.master_addr, ip,
-            "docker logs --tail 5 llm-node 2>&1",
+            "docker logs --tail 32 llm-node 2>&1",
             timeout=15,
             extra_opts=["-o", "ConnectTimeout=5"],
         )

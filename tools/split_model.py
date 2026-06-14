@@ -356,6 +356,21 @@ def split_model(
             log("INFO", f"Skip existing: {fname}")
         layer_info["lm_head"] = {"file": fname, "keys": [lm_head_key]}
 
+    # final norm (Gemma-4: model.language_model.norm.weight)
+    norm_key = "model.language_model.norm.weight"
+    if norm_key in all_weights:
+        fname = f"norm.{ext}"
+        fpath = output_dir / fname
+        if not fpath.exists() or "norm" not in existing_info:
+            if weight_format == "safetensors" and safetensors_save_file is not None:
+                safetensors_save_file({norm_key: all_weights[norm_key]}, str(fpath))
+            else:
+                torch.save({norm_key: all_weights[norm_key]}, str(fpath))
+            log("OK", f"norm: {fname}")
+        else:
+            log("INFO", f"Skip existing: {fname}")
+        layer_info["norm"] = {"file": fname, "keys": [norm_key]}
+
     # 分割情報を保存
     info_path.write_text(json.dumps(layer_info, indent=2, ensure_ascii=False))
     log("INFO", f"Split info saved: {info_path}")

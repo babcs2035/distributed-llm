@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
@@ -35,7 +36,7 @@ def send_prompt_http(config: ClusterConfig, prompt: str) -> str:
         ip = "127.0.0.1"
 
     url = f"http://{ip}:8082/predict"
-    body = json.dumps({"prompt": prompt}).encode("utf-8")
+    body = json.dumps({"prompt": prompt}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"},
         method="POST",
@@ -45,26 +46,44 @@ def send_prompt_http(config: ClusterConfig, prompt: str) -> str:
     return result.get("result", "")
 
 
-def send_prompt_ssh(config: ClusterConfig, prompt: str) -> str:
-    """管理ノード上で curl を実行し、結果を取得する（SSH経由）。"""
+# リモートで実行するPythonスクリプト（base64エンコード済みで渡す）
+_REMOTE_SCRIPT = (
+    "import os, json, urllib.request, base64\n"
+    "d = base64.b64decode(os.environ['PROMPT_B64'])\n"
+    "r = urllib.request.Request('http://localhost:8082/predict', data=d,\n"
+    "    headers={'Content-Type': 'application/json'}, method='POST')\n"
+    "print(json.loads(urllib.request.urlopen(r, timeout=300).read().decode())['result'])\n"
+)
+_REMOTE_SCRIPT_B64 = base64.b64encode(_REMOTE_SCRIPT.encode("utf-8")).decode("ascii")
 
-    body = json.dumps({"prompt": prompt})
-    cmd = [
-        "ssh", "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=10",
-        config.master_addr,
-        "curl -s --max-time 300 http://localhost:8082/predict "
-        "-X POST -H 'Content-Type: application/json' -d @-",
-    ]
+
+def send_prompt_ssh(config: ClusterConfig, prompt: str) -> str:
+    """管理ノードの Docker コンテナ上でHTTP POSTし、結果を取得する。"""
+
+    body = json.dumps({"prompt": prompt}, ensure_ascii=False).encode("utf-8")
+    prompt_b64 = base64.b64encode(body).decode("ascii")
+
+    # Dockerコンテナ内でスクリプトを実行（base64エンコード済み）
+    # データを直接-eで渡す（変数展開の問題回避）
+    cmd = (
+        "LC_ALL=C docker exec -i -e PROMPT_B64=\""
+        + prompt_b64
+        + "\" llm-node python3 -c "
+        "'import base64,os,sys; exec(base64.b64decode(\""
+        + _REMOTE_SCRIPT_B64
+        + "\").decode())'"
+    )
+
     result = subprocess.run(
-        cmd, input=body, capture_output=True, text=True, timeout=310,
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+         config.master_addr, cmd],
+        capture_output=True, text=True, timeout=310,
     )
     if result.returncode != 0:
         err = result.stderr.strip()
         print(f"Error via SSH: {err}", file=sys.stderr)
         sys.exit(1)
-    resp = json.loads(result.stdout.strip())
-    return resp.get("result", "")
+    return result.stdout.strip()
 
 
 def main() -> None:
@@ -76,7 +95,7 @@ def main() -> None:
     parser.add_argument("--config", "-c", default="config.json",
                         help="Path to config.json")
     parser.add_argument("--http", action="store_true",
-                        help="Connect directly via HTTP (not SSH)")
+                        help="Connect directly via HTTP (not HTTP)")
     parser.add_argument("--prompt", "-p",
                         help="Prompt text (skip input() prompt)")
     args = parser.parse_args()

@@ -239,6 +239,10 @@ class ClusterConfig:
 
         # --- model ---
         model_cfg = c.get("model", {})
+        self.model_name = (
+            os.environ.get("MODEL_NAME")
+            or model_cfg.get("name", "google/gemma-4-31B-it")
+        )
         overrides = model_cfg.get("overrides", {})
         self.total_layers = (
             int(os.environ.get("TOTAL_LAYERS") or overrides.get("num_hidden_layers", 60))

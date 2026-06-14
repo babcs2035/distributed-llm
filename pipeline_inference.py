@@ -29,6 +29,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from tqdm import tqdm
 
 # ====================================================================
@@ -83,18 +84,30 @@ _barrier_done = False
 # リレー実行中フラグ（パイプラインループとのバッファ競合防止）
 _relay_active = False
 _relay_lock = threading.Lock()
+# HTTPハンドラがリクエストを開始したかどうかのフラグ
+_http_initiated = False
+# リレー用ACK受信用ポート
+_RELAY_PORT = 8083
 # パイプラインループ停止フラグ
 _pipeline_stopped = False
+# トークナイザーとモデル部品（遅延ロード）
+_model_name = None
+_tokenizer = None
+_embed_tokens = None
+_lm_head = None
+_final_norm = None
 
 
-def _encode_prompt(prompt: str, shape: tuple[int, ...]) -> torch.Tensor:
-    """プロンプト文字列をテンソルにエンコードする。"""
-    size = shape[0] * shape[1] * shape[2]
-    data = [0.0] * size
-    for i, ch in enumerate(prompt):
-        if i < size:
-            data[i] = ord(ch) / 255.0
-    return torch.tensor(data, dtype=torch.bfloat16).reshape(shape)
+def _tokenize(prompt: str) -> torch.Tensor:
+    """プロンプト文字列をトークン ID に変換する。"""
+    global _tokenizer
+    if _tokenizer is None:
+        from transformers import AutoTokenizer
+        _tokenizer = AutoTokenizer.from_pretrained(
+            _model_name, trust_remote_code=True,
+        )
+    inputs = _tokenizer(prompt, return_tensors="pt")
+    return inputs.input_ids  # shape: (1, seq_len)
 
 
 # ====================================================================
@@ -109,6 +122,7 @@ class _Color:
     YELLOW = "\033[0;33m"
     BLUE = "\033[0;34m"
     BOLD = "\033[1m"
+    DIM = "\033[2m"
     NC = "\033[0m"  # No Color
 
 
@@ -118,6 +132,7 @@ if not sys.stdout.isatty():
     _Color.YELLOW = ""
     _Color.BLUE = ""
     _Color.BOLD = ""
+    _Color.DIM = ""
     _Color.NC = ""
 
 
@@ -134,6 +149,7 @@ _LOG_LEVELS: dict[str, str] = {
     "ERROR": f"{_Color.RED}x{_Color.NC} ERROR",
     "STEP": f"{_Color.BOLD}-{_Color.NC} STEP",
     "RESULT": f"{_Color.GREEN}*{_Color.NC} RESULT",
+    "TRACE": f"{_Color.DIM}.{_Color.NC} TRACE",
 }
 
 
@@ -242,6 +258,7 @@ class PipelineConfig:
     def __init__(self, config_path: str = "config.json") -> None:
         # config.json からモデル仕様を取得
         file_config = _load_model_config(config_path)
+        self.model_name = file_config.get("model", {}).get("name", "")
         (
             self.num_hidden_layers,
             self.hidden_size,
@@ -365,7 +382,10 @@ class FullyOptimizedPipelineNode:
         # 2. 分散プロセスグループの構築
         self._init_process_group()
 
-        # 3. ゼロアロケーション通信用の事前確保バッファ
+        # 3. KV-cache 初期化 (レイヤー構築より前に必要)
+        self._init_kv_cache()
+
+        # 4. ゼロアロケーション通信用の事前確保バッファ
         self._allocate_communication_buffers()
 
         # 5. モデル重みのロード
@@ -407,6 +427,19 @@ class FullyOptimizedPipelineNode:
         except Exception:
             pass
         return "0.0.0.0"
+
+    def _resolve_master_ip(self) -> str:
+        """MASTER_ADDRを解決し、ループバック以外の外部IPを返す。"""
+        master_addr = self.config.master_addr
+        try:
+            resolved = socket.gethostbyname(master_addr)
+            if not resolved.startswith("127."):
+                return resolved
+            ifc = os.environ.get("GLOO_SOCKET_IFNAME", "eth0")
+            return self._get_external_ip(ifc)
+        except socket.gaierror:
+            pass
+        return self.config.master_addr
 
     def _init_process_group(self) -> None:
         """Glooバックエンドによる分散プロセスグループを初期化する"""
@@ -455,6 +488,18 @@ class FullyOptimizedPipelineNode:
                 )
                 elapsed = time.monotonic() - start
                 _log("OK", f"Process group initialized on attempt {attempt} ({elapsed:.1f}s)")
+                # Rank 0: 自分のIPを全ノードにbroadcast
+                if self.config.rank == 0:
+                    rank0_ip = self._resolve_master_ip()
+                    ip_buf = torch.tensor(list(rank0_ip.encode()), dtype=torch.uint8)
+                    dist.broadcast(ip_buf, src=0)
+                    self._rank0_ip_bytes = ip_buf.tolist()
+                    _log("INFO", f"Rank 0: broadcast rank0_ip={rank0_ip}")
+                else:
+                    ip_buf = torch.zeros(16, dtype=torch.uint8)
+                    dist.broadcast(ip_buf, src=0)
+                    self._rank0_ip_bytes = ip_buf.tolist()
+                    _log("INFO", f"Rank {self.config.rank}: received rank0_ip={bytes(ip_buf.tolist()).decode()}")
                 return
             except Exception as e:
                 _log("WARN", f"Attempt {attempt}/{max_retries} failed: {e}")
@@ -502,6 +547,51 @@ class FullyOptimizedPipelineNode:
             f"Comm buffers allocated: {buffer_bytes / (1024 * 1024):.2f} MB ({elapsed:.2f}s)",
         )
 
+    def _init_kv_cache(self) -> None:
+        """
+        各レイヤーの KV-cache を初期化する。
+
+        推論用に、各レイヤーの key_cache と value_cache を事前確保する。
+        cache は (batch, num_kv_heads, max_seq_len, head_dim) 形式。
+        """
+
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(_model_name, trust_remote_code=True)
+        text_config = config.text_config if hasattr(config, "text_config") else config
+
+        self.kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        max_gen_tokens = 128  # 最大生成トークン数
+
+        for layer_idx in range(text_config.num_hidden_layers):
+            layer_type = text_config.layer_types[layer_idx]
+            is_sliding = (layer_type == "sliding_attention")
+            head_dim = text_config.head_dim if is_sliding else (getattr(text_config, "global_head_dim", None) or text_config.head_dim)
+
+            if is_sliding:
+                n_kv_heads = text_config.num_key_value_heads
+            else:
+                n_kv_heads = getattr(text_config, "num_global_key_value_heads", text_config.num_key_value_heads)
+
+            # KV-cache: (batch=1, num_kv_heads, max_gen_tokens, head_dim)
+            # 推論時は各ステップで 1 トークン追加するため、max_gen_tokens 分を確保
+            key_cache = torch.zeros(
+                (1, n_kv_heads, max_gen_tokens, head_dim),
+                dtype=torch.bfloat16,
+            )
+            value_cache = torch.zeros(
+                (1, n_kv_heads, max_gen_tokens, head_dim),
+                dtype=torch.bfloat16,
+            )
+            self.kv_cache[layer_idx] = (key_cache, value_cache)
+
+        # 全レイヤー共有の書き込み位置カウンター（リクエスト間でリセット可能）
+        self._kv_cache_write_pos_ref = [0]
+
+        _log(
+            "OK",
+            f"KV-cache initialized: {len(self.kv_cache)} layers, max_gen_tokens={max_gen_tokens}",
+        )
+
     def _load_local_weights(self) -> list:
         """
         ローカルディスクからモデル重みを読み込む。
@@ -530,8 +620,7 @@ class FullyOptimizedPipelineNode:
             start = time.monotonic()
 
             if os.path.exists(weight_file):
-                layer_weights = self._load_weight_file(weight_file)
-                loaded_layers.append(self._build_transformer_layer(layer_weights))
+                loaded_layers.append(self._build_transformer_layer(weight_file, layer_idx, self.config.rank, self.kv_cache, self._kv_cache_write_pos_ref))
                 elapsed = time.monotonic() - start
                 _log("INFO", f"  [{i+1}/{len(assigned_layers)}] Layer {layer_idx} loaded ({elapsed:.2f}s)")
             else:
@@ -539,7 +628,38 @@ class FullyOptimizedPipelineNode:
                     "WARN",
                     f"  [{i+1}/{len(assigned_layers)}] Weight file not found: {weight_file} (using mock layer {layer_idx})",
                 )
-                loaded_layers.append(self._build_transformer_layer(None))
+                loaded_layers.append(self._build_transformer_layer("", layer_idx, self.config.rank, self.kv_cache, self._kv_cache_write_pos_ref))
+
+        # Rank 0: embed_tokens を読み込み
+        if self.config.rank == 0:
+            embed_file = os.path.join(self.config.model_path, f"embed_tokens.{ext}")
+            if os.path.exists(embed_file):
+                weights = self._load_weight_file(embed_file)
+                for k, v in weights.items():
+                    if "embed_tokens" in k:
+                        _log("INFO", f"Rank 0: loading embed_tokens ({v.shape})")
+                        _load_embed_tokens(v)
+            else:
+                _log("WARN", "Rank 0: embed_tokens file not found")
+        else:
+            _log("INFO", f"Rank {self.config.rank}: no embed_tokens needed")
+
+        # 最終ランク: lm_head + final_norm を読み込み
+        is_last_rank = (self.config.next_rank is None)
+        if is_last_rank:
+            lm_head_file = os.path.join(self.config.model_path, f"lm_head.{ext}")
+            if os.path.exists(lm_head_file):
+                weights = self._load_weight_file(lm_head_file)
+                for k, v in weights.items():
+                    if "lm_head" in k:
+                        _log("INFO", f"Rank {self.config.rank}: loading lm_head ({v.shape})")
+                        _load_lm_head(v)
+            else:
+                _log("WARN", "Rank 50: lm_head file not found")
+            _log("INFO", f"Rank {self.config.rank}: loading final_norm")
+            _load_final_norm()
+        else:
+            _log("INFO", f"Rank {self.config.rank}: no lm_head/final_norm needed")
 
         _log("OK", f"Weights loaded: {len(loaded_layers)} layers")
         return loaded_layers
@@ -563,19 +683,176 @@ class FullyOptimizedPipelineNode:
                 path, map_location="cpu", mmap=True, weights_only=True
             )
 
-    @staticmethod
-    def _build_transformer_layer(weights: object):
-        """
-        Transformerブロックの構築（モック実装）。
+    def _build_transformer_layer(self, weight_file: str, layer_idx: int, rank: int = 0, kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None, kv_cache_write_pos_ref: list[int] | None = None):
+        """safetensors 重みからミニマルデコーダーレイヤーを構築する。
 
-        実際のプロダクション環境では、ここに完全なTransformerDecoderLayerの
-        実装（Self-Attention + FFN + RMSNorm）が入る。
-        本モックではパイプライン通信の検証のため、入力をそのまま出力する
-        アイデンティティ演算を行う。
+        KV-cache 対応により、推論時に逐次トークンを効率的に処理できる。
+        各ステップで new KV を cache に追加し、attention は full cache を使用。
         """
 
-        def forward(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor
+        from safetensors.torch import load_file
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            _model_name, trust_remote_code=True,
+        )
+        text_config = config.text_config if hasattr(config, "text_config") else config
+
+        layer_type = text_config.layer_types[layer_idx]
+        is_sliding = (layer_type == "sliding_attention")
+        head_dim = text_config.head_dim if is_sliding else (getattr(text_config, "global_head_dim", None) or text_config.head_dim)
+        rope_cfg = text_config.rope_parameters[layer_type]
+        rms_norm_eps = text_config.rms_norm_eps
+
+        # sliding_attention: num_key_value_heads, full_attention: num_global_key_value_heads
+        if is_sliding:
+            n_kv_heads = text_config.num_key_value_heads
+        else:
+            n_kv_heads = getattr(text_config, "num_global_key_value_heads", text_config.num_key_value_heads)
+
+        # Gemma 4: attention scaling & softcapping
+        # Gemma 4 uses standard head_dim**-0.5 scaling (no query_pre_attn_scalar)
+        # Gemma 4 has final_logit_softcapping but NO attn_logit_softcapping
+        query_pre_attn_scalar = head_dim
+        attn_logit_softcapping = 0.0
+        final_logit_softcapping = getattr(text_config, "final_logit_softcapping", 0.0)
+
+        # Load weights
+        if weight_file:
+            weights = load_file(weight_file)
+            prefix = f"model.language_model.layers.{layer_idx}."
+            state_dict = {}
+            for k, v in weights.items():
+                if k.startswith(prefix):
+                    state_dict[k[len(prefix):]] = v
+        else:
+            state_dict = {}
+
+        _layer_idx = layer_idx
+        _rank = rank
+        _kv_cache = kv_cache
+        # 共有書き込み位置カウンター（Noneの場合はローカル作成）
+        _kv_cache_write_pos = kv_cache_write_pos_ref if kv_cache_write_pos_ref is not None else [0]
+
+        def forward(hidden_state: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+            import time as _time
+            _t0 = _time.monotonic()
+            _bh, _sl, _hs = hidden_state.shape
+            _t_layer = _time.monotonic()
+
+            # --- 詳細ログ: 入力統計 ---
+            _log("TRACE", f"R{_rank} L{_layer_idx} [{layer_type}] IN shape=({_bh},{_sl},{_hs}) dtype={hidden_state.dtype} mean={hidden_state.mean().item():.6f} std={hidden_state.std().item():.6f} min={hidden_state.min().item():.6f} max={hidden_state.max().item():.6f}")
+
+            # Residual
+            residual = hidden_state
+
+            # --- Pre-attention RMSNorm ---
+            _t1 = _time.monotonic()
+            hidden_state = _rms_norm(hidden_state, state_dict.get("input_layernorm.weight"), rms_norm_eps)
+            _log("TRACE", f"R{_rank} L{_layer_idx} input_layernorm dt={_time.monotonic()-_t1:.4f}s")
+
+            # --- Self-attention: linear projections ---
+            _t2 = _time.monotonic()
+            q = F.linear(hidden_state, state_dict["self_attn.q_proj.weight"])  # (bh, sl, n_heads*head_dim)
+            k = F.linear(hidden_state, state_dict["self_attn.k_proj.weight"])
+            v = F.linear(hidden_state, state_dict["self_attn.v_proj.weight"]) if "self_attn.v_proj.weight" in state_dict else k
+            _log("TRACE", f"R{_rank} L{_layer_idx} qkv_proj q=({_bh},{_sl},{text_config.num_attention_heads*head_dim}) k/v=({_bh},{_sl},{n_kv_heads*head_dim}) dt={_time.monotonic()-_t2:.4f}s")
+
+            # --- Reshape for attention ---
+            _t3 = _time.monotonic()
+            n_heads = text_config.num_attention_heads
+            q = q.view(q.size(0), q.size(1), n_heads, head_dim).transpose(1, 2)  # (bh, n_heads, sl, head_dim)
+            k = k.view(k.size(0), k.size(1), n_kv_heads, head_dim).transpose(1, 2)
+            v = v.view(v.size(0), v.size(1), n_kv_heads, head_dim).transpose(1, 2)
+            _log("TRACE", f"R{_rank} L{_layer_idx} reshape q=({_bh},{n_heads},{_sl},{head_dim}) k/v=({_bh},{n_kv_heads},{_sl},{head_dim}) dt={_time.monotonic()-_t3:.4f}s")
+
+            # --- RMSNorm AFTER reshape (q_norm/k_norm) ---
+            _t4 = _time.monotonic()
+            q = _rms_norm(q, state_dict.get("self_attn.q_norm.weight"), rms_norm_eps)
+            k = _rms_norm(k, state_dict.get("self_attn.k_norm.weight"), rms_norm_eps)
+            _log("TRACE", f"R{_rank} L{_layer_idx} q_norm/k_norm dt={_time.monotonic()-_t4:.4f}s")
+
+            # --- Apply RoPE ---
+            _t5 = _time.monotonic()
+            q = _apply_rope(q, position_ids, rope_cfg, text_config)
+            k = _apply_rope(k, position_ids, rope_cfg, text_config)
+            _log("TRACE", f"R{_rank} L{_layer_idx} rope dt={_time.monotonic()-_t5:.4f}s")
+
+            # --- KV-cache: append new KV to cache (position-based for autoregressive) ---
+            _t6 = _time.monotonic()
+            if _kv_cache is not None and layer_idx in _kv_cache:
+                nonlocal _kv_cache_write_pos
+                key_cache, value_cache = _kv_cache[layer_idx]
+                _sl = q.shape[2]
+                # 書き込み位置: step 0 では prompt 全体、step 1+ では新トークン1つ
+                write_pos = _kv_cache_write_pos[0]
+                _kv_cache_write_pos[0] += _sl
+                # 新しい KV を cache に書き込み
+                key_cache[:, :, write_pos:write_pos+_sl, :] = k
+                value_cache[:, :, write_pos:write_pos+_sl, :] = v
+                # attention は full cache (0..write_pos+_sl-1) を使用
+                k_full = key_cache[:, :, :write_pos+_sl, :]
+                v_full = value_cache[:, :, :write_pos+_sl, :]
+                _log("TRACE", f"R{_rank} L{_layer_idx} kv_cache pos={write_pos}+{_sl}={write_pos+_sl}/{key_cache.size(2)} dt={_time.monotonic()-_t6:.4f}s")
+            else:
+                k_full = k
+                v_full = v
+                _log("TRACE", f"R{_rank} L{_layer_idx} kv_cache skip (not available) dt={_time.monotonic()-_t6:.4f}s")
+
+            # --- KV groups (GQA) ---
+            _t7 = _time.monotonic()
+            if n_heads != n_kv_heads:
+                k_full = k_full.repeat_interleave(n_heads // n_kv_heads, dim=1)
+                v_full = v_full.repeat_interleave(n_heads // n_kv_heads, dim=1)
+            _log("TRACE", f"R{_rank} L{_layer_idx} gqa_expand heads={n_heads} kv_heads={n_kv_heads} ratio={n_heads//n_kv_heads} dt={_time.monotonic()-_t7:.4f}s")
+
+            # --- Attention scores ---
+            _t8 = _time.monotonic()
+            scores = torch.matmul(q, k_full.transpose(2, 3)) * (query_pre_attn_scalar ** -0.5)  # (bh, n_heads, 1, cache_len)
+            # Gemma 2: logit softcapping
+            if attn_logit_softcapping > 0:
+                scores = torch.tanh(scores / attn_logit_softcapping) * attn_logit_softcapping
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, v_full)  # (bh, n_heads, 1, head_dim)
+            _log("TRACE", f"R{_rank} L{_layer_idx} attention scores=({_bh},{n_heads},1,{write_pos+_sl}) attn_out=({_bh},{n_heads},1,{head_dim}) dt={_time.monotonic()-_t8:.4f}s")
+
+            # --- Reshape back + output projection ---
+            _t9 = _time.monotonic()
+            attn_output = attn_output.transpose(1, 2).contiguous()  # (bh, 1, n_heads*head_dim)
+            attn_output = attn_output.view(attn_output.size(0), attn_output.size(1), -1)  # (bh, 1, hidden)
+            attn_output = F.linear(attn_output, state_dict["self_attn.o_proj.weight"])
+            _log("TRACE", f"R{_rank} L{_layer_idx} o_proj attn_out=({_bh},{_sl},{_hs}) dt={_time.monotonic()-_t9:.4f}s")
+
+            # --- Post-attention RMSNorm + residual ---
+            _t10 = _time.monotonic()
+            hidden_state = residual + _rms_norm(attn_output, state_dict.get("post_attention_layernorm.weight"), rms_norm_eps)
+            _log("TRACE", f"R{_rank} L{_layer_idx} post_attn_norm+residual dt={_time.monotonic()-_t10:.4f}s")
+
+            # --- Pre-FFN RMSNorm ---
+            _t11 = _time.monotonic()
+            residual_ffn = hidden_state
+            hidden_state = _rms_norm(hidden_state, state_dict.get("pre_feedforward_layernorm.weight"), rms_norm_eps)
+
+            # --- MLP (GELU) ---
+            gate = F.linear(hidden_state, state_dict["mlp.gate_proj.weight"])
+            up = F.linear(hidden_state, state_dict["mlp.up_proj.weight"])
+            hidden_state = F.gelu(gate, approximate="tanh") * up
+            hidden_state = F.linear(hidden_state, state_dict["mlp.down_proj.weight"])
+            _log("TRACE", f"R{_rank} L{_layer_idx} mlp gate=({_bh},{_sl},{_hs}) up=({_bh},{_sl},{_hs}) down=({_bh},{_sl},{_hs}) dt={_time.monotonic()-_t11:.4f}s")
+
+            # --- Post-FFN RMSNorm + residual ---
+            _t12 = _time.monotonic()
+            hidden_state = _rms_norm(hidden_state, state_dict.get("post_feedforward_layernorm.weight"), rms_norm_eps)
+            hidden_state = residual_ffn + hidden_state
+            _log("TRACE", f"R{_rank} L{_layer_idx} post_ffn_norm+residual dt={_time.monotonic()-_t12:.4f}s")
+
+            # --- Layer scalar ---
+            layer_scalar = state_dict.get("layer_scalar", torch.ones(1))
+            hidden_state = hidden_state * layer_scalar
+
+            _dt = _time.monotonic() - _t0
+            _log("TRACE", f"R{_rank} L{_layer_idx} DONE total={_dt:.4f}s mean={hidden_state.mean().item():.6f} std={hidden_state.std().item():.6f} min={hidden_state.min().item():.6f} max={hidden_state.max().item():.6f}")
+            return hidden_state
 
         return forward
 
@@ -596,7 +873,7 @@ class FullyOptimizedPipelineNode:
             self.recv_buffers[mb].normal_(mean=0.0, std=INPUT_STDDEV)
         else:
             try:
-                dist.recv(tensor=self.recv_buffers[mb], src=self.config.prev_rank, timeout=timedelta(seconds=2))
+                dist.recv(tensor=self.recv_buffers[mb], src=self.config.prev_rank)
             except Exception:
                 # タイムアウトまたはエラー時は何もしない
                 return
@@ -617,7 +894,7 @@ class FullyOptimizedPipelineNode:
                     pbar.update(1)
         else:
             try:
-                dist.send(tensor=self.send_buffers[mb], dst=self.config.next_rank, timeout=timedelta(seconds=2))
+                dist.send(tensor=self.send_buffers[mb], dst=self.config.next_rank)
             except Exception:
                 pass
 
@@ -635,9 +912,12 @@ class FullyOptimizedPipelineNode:
         # dist.barrier() はGloo接続を占有するため、接続切れの原因になる。
         # 代わりに単に待機してbarrier完了フラグを立てる。
         _log("INFO", f"All nodes connected. Waiting for model loading to complete...")
-        time.sleep(5.0)
+        # 最終ランクのthundering herd待機(100秒) + PG初期化時間を考慮
+        time.sleep(120.0)
         # barrier完了をHTTPハンドラに通知
-        global _barrier_done
+        # 最終ランクのthundering herd待機(100秒)を考慮し、十分待機してからリクエスト受け付け開始
+        global _barrier_done, _request_prompt, _request_result
+        _barrier_done_time = time.monotonic()
         _barrier_done = True
         _log("OK", f"Inference loop started. micro_batches={self.config.num_micro_batches}, pipeline_stages={self.config.world_size}")
 
@@ -647,33 +927,53 @@ class FullyOptimizedPipelineNode:
         _signal_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         _signal_socket.bind(("0.0.0.0", _SIGNAL_PORT))
         _signal_socket.listen(16)
-        _signal_socket.settimeout(1.0)
+        _signal_socket.settimeout(0.5)
 
         try:
             while not _shutdown_requested:
-                # シグナルソケットで接続を受容
+                # シグナルソケットで接続を受容（0.5s タイムアウト）
                 try:
-                    _signal_socket.accept()
-                    _log("INFO", f"Rank {self.config.rank}: detected request signal")
-                    _request_event.set()
+                    conn, _ = _signal_socket.accept()
+                    # クライアントからpromptテキストを受信
+                    try:
+                        conn.settimeout(2.0)
+                        data = conn.recv(65536)
+                        if data:
+                            prompt_text = data.decode("utf-8").strip()
+                            if prompt_text:
+                                with _request_lock:
+                                    _request_prompt = prompt_text
+                                _log("INFO", f"Rank {self.config.rank}: prompt received via signal socket ({len(prompt_text)} chars)")
+                                # ACKを同じ接続で返信
+                                try:
+                                    conn.sendall(b"ACK\n")
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    finally:
+                        conn.close()
                 except socket.timeout:
                     pass
                 except OSError:
                     pass
 
-                if _request_event.is_set():
-                    global _request_prompt, _request_result
-                    # 他ノードが信号を検知する時間を確保
-                    time.sleep(10.0)
-                    # リレーモード: 全ノードでリレー通信
-                    with _request_lock:
-                        prompt = _request_prompt
-                    _request_event.clear()
-                    with _request_lock:
+                # プロンプトチェック
+                with _request_lock:
+                    prompt = _request_prompt
+                    if prompt is not None:
                         _request_prompt = None
-                    decoded = self._relay_request(prompt or "")
-                    _request_result = decoded
-                    _result_available.set()
+                _log("TRACE", f"Rank {self.config.rank}: checking prompt={prompt is not None}")
+                if prompt is not None:
+                    # Rank 0のsignal threadはrelayを呼ばない（HTTP handlerが呼ぶ）
+                    # 他ノードのsignal threadはrelayを呼ぶ
+                    if self.config.rank != 0:
+                        _request_event.clear()
+                        _log("INFO", f"Rank {self.config.rank}: entering relay (prompt_len={len(prompt)})")
+                        decoded = self._relay_request(prompt)
+                        _request_result = decoded
+                        _result_available.set()
+                        _log("INFO", f"Rank {self.config.rank}: relay complete, result set")
         finally:
             _signal_socket.close()
 
@@ -723,46 +1023,300 @@ class FullyOptimizedPipelineNode:
             dist.destroy_process_group()
             _log("INFO", "Process group destroyed.")
 
+    def _broadcast_prompt_and_wait(self, prompt: str) -> None:
+        """
+        全ノードにpromptをブロードキャストし、全ノードが受信するのを待機する。
+
+        Rank 0は全ノードのIPに直接接続し、他ノードはRank 0に接続する。
+        """
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        # Rank 0のIPを取得（init時にbroadcast済み）
+        rank0_ip = bytes(self._rank0_ip_bytes).decode().rstrip("\x00")
+
+        # ノードIPマッピング（環境に応じて調整）
+        # Rank 0: wafl-ctrl1 = 192.168.11.10
+        # Rank 1-40: wafl100-139 = 192.168.11.100-139
+        # Rank 41-50: wafl200-209 = 192.168.12.100-109
+        def get_node_ip(r):
+            if r == 0:
+                return rank0_ip
+            elif r <= 40:
+                # wafl100 -> 192.168.11.100, wafl101 -> .101, ...
+                return f"192.168.11.{100 + (r - 1)}"
+            else:
+                # wafl200 -> 192.168.12.100, wafl201 -> .101, ...
+                return f"192.168.12.{100 + (r - 41)}"
+
+        _log("INFO", f"Rank {rank}: rank0_ip={rank0_ip}")
+
+        # Rank 0以外: Rank 0のsignal portにpromptを送信
+        if rank != 0:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5.0)
+                s.connect((rank0_ip, _SIGNAL_PORT))
+                s.sendall((prompt + "\n").encode("utf-8"))
+                ack_data = s.recv(1024)
+                s.close()
+                if ack_data:
+                    _log("INFO", f"Rank {rank}: prompt sent to Rank 0")
+            except Exception:
+                _log("WARN", f"Rank {rank}: failed to connect to Rank 0")
+            return  # 他ノードはRank 0に送ったら終了
+
+        # Rank 0: 全ノードにpromptを送信
+        _log("INFO", f"Rank 0: broadcasting to {world_size - 1} nodes")
+        ack_count = 0
+        for r in range(1, world_size):
+            target_ip = get_node_ip(r)
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5.0)
+                s.connect((target_ip, _SIGNAL_PORT))
+                s.sendall((prompt + "\n").encode("utf-8"))
+                ack_data = s.recv(1024)
+                s.close()
+                if ack_data:
+                    ack_count += 1
+                    _log("INFO", f"Rank 0: ACK from rank {r} ({target_ip}) ({ack_count}/{world_size - 1})")
+            except Exception:
+                _log("WARN", f"Rank 0: failed to communicate with rank {r} ({target_ip})")
+
+        _log("INFO", f"Rank 0: broadcast complete ({ack_count} ACKs)")
+
     def _relay_request(self, prompt: str) -> str:
         """
-        リレーモードで1リクエストを処理する。
+        リレーモードでオート回帰推論を処理する。
 
-        Rank 0: プロンプトをエンコード → dist.send(dst=1)
-        他ランク: prevから受信 → 計算 → nextへ送信（最終段のみ結果返却）
-        リレー中はパイプラインループとのバッファ競合を防止するため、
-        全体としてロックする（timeout付き）。
+        各ステップ:
+          Phase 1 (順チェーン): Rank 0 → Rank 1 → ... → Rank N
+            Rank 0: seq_len + hidden_state を Rank 1 に送信
+            他ランク: prevから受信 → 計算 → nextへ送信
+            Rank N: 計算 → final_norm → lm_head → token_id を next=(rank-1)へ
+
+          Phase 2 (逆チェーン): Rank N → Rank N-1 → ... → Rank 0
+            Rank N: token_id を (rank-1)へ送信
+            他ランク: nextからtoken_idを受信 → prevへ送信
+            Rank 0: Rank 1からtoken_idを受信
+
+        完全なblocking send/recvによりデッドロックを回避。
         """
+        import time as _time
+
         global _relay_active
         with _relay_lock:
             _relay_active = True
 
+        # 全ノードの同期: 全ノードがrelay開始前にここで合流
         try:
+            dist.barrier()
+        except Exception:
+            pass
+
+        # 生成パラメータ
+        max_new_tokens = 32
+        last_rank = self.config.world_size - 1
+
+        # Gemma 4: final logit softcapping (標準値 30.0)
+        final_logit_softcapping = 30.0
+
+        try:
+            # --- 全ランク共通: KV-cacheと書き込み位置をリセット ---
+            if self.kv_cache:
+                for lid, (kc, vc) in self.kv_cache.items():
+                    kc.zero_()
+                    vc.zero_()
+                _log("INFO", f"Rank {self.config.rank}: KV-cache reset ({len(self.kv_cache)} layers)")
+            if hasattr(self, '_kv_cache_write_pos_ref'):
+                self._kv_cache_write_pos_ref[0] = 0
+
             if self.config.rank == 0:
-                shape = (self.config.batch_size,
-                         self.config.seq_len,
-                         self.config.hidden_size)
-                input_tensor = _encode_prompt(prompt, shape)
-                _log("INFO", f"Rank 0: sending input to rank 1")
-                dist.send(input_tensor, dst=1)
-                result_buf = torch.zeros(shape, dtype=torch.bfloat16)
-                _log("INFO", f"Rank 0: waiting for result from rank {self.config.world_size - 1}")
-                dist.recv(tensor=result_buf, src=self.config.world_size - 1)
-                return _decode_result(result_buf)
+                # ===== ステップ 0: プロンプト処理 =====
+                _log("INFO", f"Rank 0: prompt='{prompt}'")
+                input_ids = _tokenize(prompt)  # (1, seq_len)
+                seq_len = input_ids.size(1)
+                embed = F.embedding(input_ids, _embed_tokens)  # (1, seq_len, hidden_size)
+                _log("INFO", f"Rank 0: prompt tokens={seq_len}, embedding shape={embed.shape} mean={embed.mean().item():.6f} std={embed.std().item():.6f} min={embed.min().item():.6f} max={embed.max().item():.6f}")
+
+                # 生成トークン蓄積
+                generated_ids = []
+
+                # ===== ステップ 0..N-1: 統一ループ =====
+                for step in range(max_new_tokens):
+                    is_first = (step == 0)
+                    _log("INFO", f"Rank 0: === step {step}/{max_new_tokens} is_first={is_first} ===")
+                    _t_step = _time.monotonic()
+
+                    if is_first:
+                        # プロンプトを送信
+                        seq_len_buf = torch.tensor([float(seq_len)], dtype=torch.float32)
+                        dist.send(seq_len_buf, dst=1)
+                        dist.send(embed, dst=1)
+                        _log("INFO", f"Rank 0: sent prompt embed (seq_len={seq_len})")
+                    else:
+                        # 前ステップの生成トークンを埋め込み
+                        new_token_tensor = torch.tensor([[generated_ids[-1]]], dtype=torch.long)
+                        new_embed = F.embedding(new_token_tensor, _embed_tokens)
+                        dist.send(torch.tensor([1.0], dtype=torch.float32), dst=1)
+                        dist.send(new_embed, dst=1)
+                        _log("INFO", f"Rank 0: step {step} sent token_embed token={generated_ids[-1]}")
+
+                    # 逆チェーン: Rank 1からtoken_idを受信（非同期）
+                    token_id_buf = torch.zeros(1, dtype=torch.float32)
+                    op = dist.irecv(token_id_buf, src=1)
+                    op.wait()
+                    token_id = int(token_id_buf.item())
+                    generated_ids.append(token_id)
+
+                    step_dt = _time.monotonic() - _t_step
+                    _log("INFO", f"Rank 0: step {step} done token={token_id} dt={step_dt:.3f}s")
+
+                    # 特殊トークンで終了
+                    if token_id in (2, 3):
+                        _log("INFO", f"Rank 0: stop token={token_id} at step {step}")
+                        break
+
+                # ===== デコード =====
+                _log("INFO", f"Rank 0: decoding {len(generated_ids)} tokens...")
+                _t_decode = _time.monotonic()
+                result = _tokenizer.decode(generated_ids)
+                _log("INFO", f"Rank 0: decoded in {_time.monotonic()-_t_decode:.3f}s: '{result}'")
+                return result
+
+            elif self.config.rank == last_rank:
+                # ===== 最終ランク: 計算 → final_norm → lm_head → 逆チェーンで返却 =====
+                seq_len = 0
+
+                for step in range(max_new_tokens):
+                    is_first = (step == 0)
+                    _log("INFO", f"Rank {self.config.rank}: === step {step}/{max_new_tokens} is_first={is_first} ===")
+                    _t_step = _time.monotonic()
+
+                    # 前ランクからhidden_stateを受信
+                    if is_first:
+                        seq_len_buf = torch.zeros(1, dtype=torch.float32)
+                        dist.recv(tensor=seq_len_buf, src=self.config.prev_rank)
+                        recv_seq_len = int(seq_len_buf.item())
+
+                        if recv_seq_len > 1:
+                            hidden_state = torch.zeros(
+                                (self.config.batch_size, recv_seq_len, self.config.hidden_size),
+                                dtype=torch.bfloat16,
+                            )
+                            _log("INFO", f"Rank {self.config.rank}: allocated hidden for seq_len={recv_seq_len}")
+                        else:
+                            hidden_state = self.recv_buffers[0]
+                        dist.recv(tensor=hidden_state, src=self.config.prev_rank)
+                        seq_len = recv_seq_len
+                        _log("INFO", f"Rank {self.config.rank}: recv_hidden dt={_time.monotonic()-_t_step:.3f}s")
+                    else:
+                        seq_len_buf = torch.zeros(1, dtype=torch.float32)
+                        hidden_state = self.recv_buffers[0]
+                        op_seq = dist.irecv(seq_len_buf, src=self.config.prev_rank)
+                        op_hidden = dist.irecv(hidden_state, src=self.config.prev_rank)
+                        op_seq.wait()
+                        op_hidden.wait()
+                        recv_seq_len = int(seq_len_buf.item())
+
+                    # 計算
+                    _t = _time.monotonic()
+                    if is_first:
+                        positions = torch.arange(recv_seq_len, dtype=torch.long).unsqueeze(0)
+                    else:
+                        pos_id = seq_len + step - 1
+                        positions = torch.tensor([[pos_id]], dtype=torch.long)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} computing pos_id={positions.max().item()}")
+
+                    for layer in self.my_layers:
+                        hidden_state = layer(hidden_state, position_ids=positions)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} compute dt={_time.monotonic()-_t:.3f}s hidden_mean={hidden_state.mean().item():.6f} hidden_std={hidden_state.std().item():.6f} hidden_min={hidden_state.min().item():.6f} hidden_max={hidden_state.max().item():.6f}")
+
+                    # final_norm + lm_head
+                    last_hidden = hidden_state[:, -1:, :]
+                    hidden_state = _final_norm(last_hidden)
+                    logits = F.linear(hidden_state, _lm_head)
+                    # Gemma 4: final logit softcapping
+                    raw_top5_val, raw_top5_id = torch.topk(logits[0, 0], 5)
+                    raw_logit_max = raw_top5_val[0].item()
+                    raw_diff = (raw_top5_val[0] - raw_top5_val[1]).item()
+                    if final_logit_softcapping > 0:
+                        logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
+                    token_id = torch.argmax(logits, dim=-1).to(torch.int64)
+                    top5_val, top5_id = torch.topk(logits[0, 0], 5)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} token_id={token_id.item()} raw_max={raw_logit_max:.2f} raw_diff={raw_diff:.4f} raw_top5={raw_top5_id.tolist()} soft_top5={top5_id.tolist()} soft_vals={top5_val.tolist()}")
+
+                    # 逆チェーン: 前のランクへtoken_idを送信
+                    dist.send(token_id.float(), dst=self.config.prev_rank)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} sent token_id to prev")
+
             else:
-                hidden_state = self.recv_buffers[0]
-                if self.config.prev_rank is not None:
-                    _log("INFO", f"Rank {self.config.rank}: receiving from rank {self.config.prev_rank}")
-                    dist.recv(tensor=hidden_state, src=self.config.prev_rank)
-                for layer in self.my_layers:
-                    hidden_state = layer(hidden_state)
-                self.send_buffers[0].copy_(hidden_state)
-                if self.config.next_rank is not None:
-                    _log("INFO", f"Rank {self.config.rank}: sending to rank {self.config.next_rank}")
-                    dist.send(tensor=self.send_buffers[0], dst=self.config.next_rank)
-                else:
-                    _log("INFO", f"Rank {self.config.rank}: sending result back to rank 0")
-                    dist.send(tensor=self.send_buffers[0], dst=0)
-                    return _decode_result(self.send_buffers[0])
+                # ===== 中間ランク: 順チェーン + 逆チェーン =====
+                seq_len = 0
+
+                for step in range(max_new_tokens):
+                    is_first = (step == 0)
+                    _log("INFO", f"Rank {self.config.rank}: === step {step}/{max_new_tokens} is_first={is_first} ===")
+                    _t_step = _time.monotonic()
+
+                    # --- Phase 1: 順チェーン (prev → self → next) ---
+                    if is_first:
+                        # step 0: Rank 0が先にsendするのでblocking recv
+                        seq_len_buf = torch.zeros(1, dtype=torch.float32)
+                        dist.recv(tensor=seq_len_buf, src=self.config.prev_rank)
+                        recv_seq_len = int(seq_len_buf.item())
+
+                        if recv_seq_len > 1:
+                            hidden_state = torch.zeros(
+                                (self.config.batch_size, recv_seq_len, self.config.hidden_size),
+                                dtype=torch.bfloat16,
+                            )
+                            _log("INFO", f"Rank {self.config.rank}: allocated hidden for seq_len={recv_seq_len}")
+                        else:
+                            hidden_state = self.recv_buffers[0]
+                        dist.recv(tensor=hidden_state, src=self.config.prev_rank)
+                        seq_len = recv_seq_len
+                        _log("INFO", f"Rank {self.config.rank}: recv_hidden dt={_time.monotonic()-_t_step:.3f}s")
+                    else:
+                        # step 1+: Rank 0がsendする前にirecvをposteする
+                        seq_len_buf = torch.zeros(1, dtype=torch.float32)
+                        hidden_state = self.recv_buffers[0]
+                        op_seq = dist.irecv(seq_len_buf, src=self.config.prev_rank)
+                        op_hidden = dist.irecv(hidden_state, src=self.config.prev_rank)
+                        op_seq.wait()
+                        op_hidden.wait()
+                        recv_seq_len = int(seq_len_buf.item())
+
+                    # 計算
+                    _t = _time.monotonic()
+                    if is_first:
+                        positions = torch.arange(recv_seq_len, dtype=torch.long).unsqueeze(0)
+                    else:
+                        pos_id = seq_len + step - 1
+                        positions = torch.tensor([[pos_id]], dtype=torch.long)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} computing pos_id={positions.max().item()}")
+
+                    for layer in self.my_layers:
+                        hidden_state = layer(hidden_state, position_ids=positions)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} compute dt={_time.monotonic()-_t:.3f}s hidden_mean={hidden_state.mean().item():.6f} hidden_std={hidden_state.std().item():.6f} hidden_min={hidden_state.min().item():.6f} hidden_max={hidden_state.max().item():.6f}")
+
+                    # nextランクへ送信
+                    dist.send(torch.tensor([float(recv_seq_len)], dtype=torch.float32), dst=self.config.next_rank)
+                    dist.send(tensor=hidden_state, dst=self.config.next_rank)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} send to next dt={_time.monotonic()-_t:.3f}s")
+
+                    # --- Phase 2: 逆チェーン (next → self → prev) ---
+                    # nextランクからtoken_idを受信（非同期）
+                    token_id_buf = torch.zeros(1, dtype=torch.float32)
+                    op_token = dist.irecv(token_id_buf, src=self.config.next_rank)
+                    op_token.wait()
+                    token_id = int(token_id_buf.item())
+
+                    # prevランクへtoken_idを送信
+                    if self.config.prev_rank is not None:
+                        dist.send(token_id_buf, dst=self.config.prev_rank)
+                    _log("INFO", f"Rank {self.config.rank}: step {step} token_id={token_id}")
         finally:
             with _relay_lock:
                 _relay_active = False
@@ -785,7 +1339,9 @@ class _PredictHandler(BaseHTTPRequestHandler):
 
         try:
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            raw = self.rfile.read(length)
+            _log("INFO", f"Raw request body: {raw}")
+            body = json.loads(raw)
             prompt = body.get("prompt", "")
         except Exception:
             self._respond(400, '{"error": "invalid json"}')
@@ -815,38 +1371,20 @@ class _PredictHandler(BaseHTTPRequestHandler):
             self._respond(503, '{"error": "barrier not completed"}')
             return
 
+        # Rank 0 のみリレーモードに対応
+        if dist.get_rank() != 0:
+            self._respond(500, '{"error": "only rank 0 handles requests"}')
+            return
+
         _log("INFO", f"Request received: prompt='{prompt[:60]}...'")
 
         try:
-            # プロンプトを保存
+            # Rank 0のsignal threadが検知できるようpromptを設定
             global _request_prompt
             with _request_lock:
                 _request_prompt = prompt
-            # 全ノードへのシグナル（ソケット接続）
-            node_ips_str = os.environ.get("NODE_IPS", "")
-            if node_ips_str:
-                node_ips = node_ips_str.split(",")
-            else:
-                node_ips = []
-            for node_ip in node_ips:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3)
-                try:
-                    s.connect((node_ip, _SIGNAL_PORT))
-                    s.close()
-                except Exception:
-                    pass
-            # 全ノードが検知する時間を確保
-            time.sleep(1.0)
-            _request_event.set()
-
-            # 結果が返ってくるまで待つ
-            _result_available.wait()
-            global _request_result
-            decoded = _request_result
-            _request_result = None
-            _result_available.clear()
-
+            self.server.node._broadcast_prompt_and_wait(prompt)
+            decoded = self.server.node._relay_request(prompt)
             _log("RESULT", f"Request response: '{decoded[:100]}'")
             self._respond(200, json.dumps({"result": decoded}))
         except Exception:
@@ -854,10 +1392,110 @@ class _PredictHandler(BaseHTTPRequestHandler):
             self._respond(500, '{"error": "request failed"}')
 
 
-def _decode_result(tensor: torch.Tensor) -> str:
-    """推論結果テンソルを文字列にデコードする。"""
-    chars = [round(v.item() * 255) for v in tensor.flatten() if v.item() > 0]
-    return "".join(chr(c) for c in chars if 32 <= c < 0x110000)
+def _load_embed_tokens(weight: torch.Tensor) -> None:
+    """埋め込み重みをグローバル変数に設定する。"""
+    global _embed_tokens
+    _embed_tokens = weight  # shape: (vocab_size, hidden_size)
+
+
+def _load_lm_head(weight: torch.Tensor) -> None:
+    """LM ヘッド重みをグローバル変数に設定する。"""
+    global _lm_head
+    _lm_head = weight  # shape: (vocab_size, hidden_size)
+
+
+def _rms_norm(hidden_state: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
+    """RMSNorm を適用する。"""
+    variance = (hidden_state ** 2).mean(-1, keepdim=True)
+    hidden_state = hidden_state * torch.rsqrt(variance + eps)
+    if weight is not None:
+        hidden_state = hidden_state * weight
+    return hidden_state
+
+
+def _apply_rope(
+    x: torch.Tensor, position_ids: torch.Tensor, rope_cfg: dict, text_config,
+) -> torch.Tensor:
+    """Rotary Position Embedding を適用する。"""
+    head_dim = x.size(-1)
+    rope_theta = rope_cfg["rope_theta"]
+    rope_type = rope_cfg.get("rope_type", "default")
+
+    # inv_freq
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=x.device) / head_dim)
+    )
+
+    # position ids
+    max_seq = 2048
+    position_ids_pos = position_ids.reshape(-1)  # (seq_len,)
+
+    # freqs: (seq_len, head_dim//2)
+    freqs = torch.outer(position_ids_pos.float(), inv_freq)
+    emb = freqs  # already head_dim//2; cos/sin will match x1/x2
+
+    # scaling
+    attention_scaling = 1.0
+    if rope_type == "proportional":
+        n_ctx = text_config.max_position_embeddings
+        attention_scaling = float(n_ctx) / float(max_seq)
+
+    cos = (emb.cos() * attention_scaling).to(dtype=x.dtype)  # (seq_len, head_dim//2)
+    sin = (emb.sin() * attention_scaling).to(dtype=x.dtype)
+
+    # Apply RoPE: x * cos + rotate_half(x) * sin
+    x1 = x[..., 0::2]  # even indices
+    x2 = x[..., 1::2]  # odd indices
+    out = torch.zeros_like(x)
+    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim//2)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x2 * cos + x1 * sin
+    return out
+
+
+def _get_layer_class(text_config) -> type:
+    """モデルタイプに応じたデコーダーレイヤークラスを返す。"""
+    model_type = getattr(text_config, "model_type", "")
+    if "gemma4" in model_type or "gemma" in model_type:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        return Gemma4TextDecoderLayer
+    raise ValueError(f"Unsupported model type: {model_type}")
+
+
+def _load_final_norm() -> None:
+    """最終 RMSNorm を構築する。"""
+    global _final_norm
+    from pathlib import Path
+
+    # Gemma-4 標準の rms_norm_eps。layer 内でも使用されている値と同一。
+    eps = 1e-5
+
+    model_path = os.environ.get('MODEL_PATH', '/models')
+    nf = Path(model_path) / 'norm.safetensors'
+    if nf.exists():
+        from safetensors.torch import load_file
+        w = load_file(str(nf))
+        for k, v in w.items():
+            if 'norm' in k:
+                _log("INFO", f"Rank: loaded norm.weight from safetensors ({v.shape})")
+                _final_norm = lambda x, weight=v, e=eps: _rms_norm(x, weight, e)
+                return
+        _log("WARN", f"Rank: 'norm' key not found in {nf}")
+    else:
+        _log("WARN", f"Rank: norm.safetensors not found at {nf}")
+    _final_norm = lambda x, e=eps: _rms_norm(x, None, e)
+
+
+def _decode_result_token(token_id: int) -> str:
+    """トークン ID を文字列にデコードする。"""
+    global _tokenizer
+    if _tokenizer is None:
+        from transformers import AutoTokenizer
+        _tokenizer = AutoTokenizer.from_pretrained(
+            _model_name, trust_remote_code=True,
+        )
+    return _tokenizer.decode([token_id])
 
 
 def _start_http_server(config: PipelineConfig, node: "FullyOptimizedPipelineNode", host: str = "0.0.0.0", port: int = 8082) -> None:
@@ -889,6 +1527,8 @@ def main() -> None:
         sys.exit(1)
 
     config = PipelineConfig()
+    global _model_name
+    _model_name = config.model_name
 
     assigned = config.get_assigned_layers()
     _log("STEP", "=" * 60)
