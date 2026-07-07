@@ -1,10 +1,10 @@
 """
-クラスタ制御（停止・再起動・クリーンアップ）
+Cluster control (stop, restart, cleanup).
 
-使用法:
-  uv run python tools/cluster_control.py stop     # 全ノード停止
-  uv run python tools/cluster_control.py restart  # 全ノード再起動
-  uv run python tools/cluster_control.py clean    # 全ノードクリーンアップ
+Usage:
+  uv run python tools/cluster_control.py stop     # Stop all nodes
+  uv run python tools/cluster_control.py restart  # Restart all nodes
+  uv run python tools/cluster_control.py clean    # Clean up all nodes
 """
 
 from __future__ import annotations
@@ -17,12 +17,12 @@ from common import ClusterConfig, log, read_hosts, ssh_run, ssh_via_master
 
 
 def _stop_node(config: ClusterConfig, rank: int, ip: str) -> None:
-    """単一ノードのコンテナを停止する"""
+    """Stop containers on a single node."""
 
     log("INFO", f"Rank {rank} ({ip}): stopping...")
     result = ssh_via_master(
         config.ssh_user, config.master_addr, ip,
-        "docker stop llm-node >/dev/null 2>&1 && echo 'Stopped' || echo '(not running)'",
+        "docker stop distributed-llm >/dev/null 2>&1 && echo 'Stopped' || echo '(not running)'",
         timeout=30,
     )
     output = (result.stdout or "").strip()
@@ -31,9 +31,9 @@ def _stop_node(config: ClusterConfig, rank: int, ip: str) -> None:
 
 
 def stop_all(config: ClusterConfig) -> None:
-    """全ノードの推論コンテナを並列停止する"""
+    """Stop inference containers on all nodes in parallel."""
 
-    log("INFO", "Stopping llm-node containers on all nodes...")
+    log("INFO", "Stopping distributed-llm containers on all nodes...")
 
     hosts = read_hosts(config.hosts_file)
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -43,12 +43,12 @@ def stop_all(config: ClusterConfig) -> None:
 
 
 def _restart_node(config: ClusterConfig, rank: int, ip: str) -> None:
-    """単一ノードのコンテナを再起動する"""
+    """Restart containers on a single node."""
 
     log("INFO", f"Rank {rank} ({ip}): restarting...")
     result = ssh_via_master(
         config.ssh_user, config.master_addr, ip,
-        "docker restart llm-node 2>&1 && echo 'Restarted' || echo '(restart failed)'",
+        "docker restart distributed-llm 2>&1 && echo 'Restarted' || echo '(restart failed)'",
         timeout=30,
     )
     output = (result.stdout or "").strip()
@@ -57,9 +57,9 @@ def _restart_node(config: ClusterConfig, rank: int, ip: str) -> None:
 
 
 def restart_all(config: ClusterConfig) -> None:
-    """全ノードの推論コンテナを並列再起動する"""
+    """Restart inference containers on all nodes in parallel."""
 
-    log("INFO", "Restarting llm-node containers on all nodes...")
+    log("INFO", "Restarting distributed-llm containers on all nodes...")
 
     hosts = read_hosts(config.hosts_file)
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -69,28 +69,29 @@ def restart_all(config: ClusterConfig) -> None:
 
 
 def _clean_node(config: ClusterConfig, rank: int, ip: str, target_image: str) -> None:
-    """単一ノードのコンテナとイメージを削除する"""
+    """Remove containers and images from a single node."""
 
     log("INFO", f"Rank {rank} ({ip}): cleaning up...")
     ssh_via_master(
         config.ssh_user, config.master_addr, ip,
-        f"docker stop llm-node >/dev/null 2>&1 || true; "
-        f"docker rm llm-node >/dev/null 2>&1 || true; "
+        f"docker stop distributed-llm >/dev/null 2>&1 || true; "
+        f"docker rm distributed-llm >/dev/null 2>&1 || true; "
         f"docker rmi {target_image} >/dev/null 2>&1 || true; "
         f"echo 'Cleaned'",
         timeout=60,
     )
 
 
-def clean_all(config: ClusterConfig) -> None:
-    """全ノードのコンテナとイメージを並列削除する"""
+def clean_all(config: ClusterConfig, force: bool = False) -> None:
+    """Remove containers and images from all nodes in parallel."""
 
-    log("INFO", "Removing llm-node containers and images on all nodes...")
+    log("INFO", "Removing distributed-llm containers and images on all nodes...")
 
-    confirm = input("Are you sure? [y/N] ")
-    if confirm.lower() != "y":
-        log("INFO", "Cancelled.")
-        return
+    if not force:
+        confirm = input("Are you sure? [y/N] ")
+        if confirm.lower() != "y":
+            log("INFO", "Cancelled.")
+            return
 
     hosts = read_hosts(config.hosts_file)
     target_image = config.target_image
@@ -102,7 +103,7 @@ def clean_all(config: ClusterConfig) -> None:
 
 
 def main() -> None:
-    """コンテナの停止・再起動・クリーンアップを実行する"""
+    """Execute container stop, restart, or cleanup."""
 
     parser = argparse.ArgumentParser(description="Cluster control")
     parser.add_argument(
@@ -110,14 +111,15 @@ def main() -> None:
         choices=["stop", "restart", "clean"],
         help="Action to perform",
     )
+    parser.add_argument("--force", "-f", action="store_true", help="Skip confirmation")
     args = parser.parse_args()
 
     config = ClusterConfig()
 
     actions = {
-        "stop": stop_all,
-        "restart": restart_all,
-        "clean": clean_all,
+        "stop": lambda c: stop_all(c),
+        "restart": lambda c: restart_all(c),
+        "clean": lambda c: clean_all(c, force=args.force),
     }
     actions[args.action](config)
 

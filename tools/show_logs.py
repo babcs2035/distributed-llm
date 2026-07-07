@@ -1,9 +1,9 @@
 """
-コンテナログ表示ツール
+Container log display tool.
 
-使用法:
-  RANK=0 uv run python tools/show_logs.py          # 特定ノードのログ
-  uv run python tools/show_logs.py --all            # 全ノードの最新ログ
+Usage:
+  RANK=0 uv run python tools/show_logs.py          # Logs for a specific node
+  uv run python tools/show_logs.py --all            # Latest logs from all nodes
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ SSH_BASE_OPTS = [
 
 
 def show_single_node_logs(config: ClusterConfig) -> None:
-    """特定ノードのコンテナログをフォロー表示する"""
+    """Follow logs for a specific node's container."""
 
     rank_str = os.environ.get("RANK")
     if rank_str is None:
@@ -41,13 +41,13 @@ def show_single_node_logs(config: ClusterConfig) -> None:
     ip = hosts[rank]
     log("INFO", f"Container logs for Rank {rank} ({ip})")
 
-    # ログのフォロー表示（Ctrl+Cで終了）はsubprocessで直接実行
+    # Follow log display (Ctrl+C to exit) runs directly via subprocess
     cmd = [
         "ssh", *SSH_BASE_OPTS,
         f"{config.ssh_user}@{config.master_addr}",
         "ssh", *SSH_BASE_OPTS,
         f"{config.ssh_user}@{ip}",
-        "docker logs --tail 100 -f llm-node",
+        "docker logs --tail 100 -f distributed-llm",
     ]
     try:
         subprocess.run(cmd, check=False)
@@ -56,7 +56,7 @@ def show_single_node_logs(config: ClusterConfig) -> None:
 
 
 def show_all_logs(config: ClusterConfig) -> None:
-    """全ノードの最新ログ（最終32行）を一括表示する"""
+    """Display latest logs (last 32 lines) from all nodes at once."""
 
     from common import ssh_via_master
 
@@ -66,7 +66,7 @@ def show_all_logs(config: ClusterConfig) -> None:
         log("INFO", f"Rank {rank} ({ip})")
         result = ssh_via_master(
             config.ssh_user, config.master_addr, ip,
-            "docker logs --tail 32 llm-node 2>&1",
+            "docker logs --tail 32 distributed-llm 2>&1",
             timeout=15,
             extra_opts=["-o", "ConnectTimeout=5"],
         )
@@ -78,7 +78,7 @@ def show_all_logs(config: ClusterConfig) -> None:
 
 
 def main() -> None:
-    """コンテナログを表示する"""
+    """Display container logs."""
 
     parser = argparse.ArgumentParser(description="Container log display")
     parser.add_argument(

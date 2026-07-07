@@ -1,5 +1,5 @@
 # ====================================================================
-# mise.toml - 分散LLM推論パイプライン タスク定義
+# mise.toml - Distributed LLM Inference Pipeline Task Definitions
 # ====================================================================
 
 [tools]
@@ -7,117 +7,117 @@ python = "3.12"
 uv = "latest"
 
 # ====================================================================
-# 環境構築
+# Environment Setup
 # ====================================================================
 
 [tasks.sync]
-description = "Python 仮想環境を構築・同期する"
+description = "Create and sync Python virtual environment"
 run = "uv sync"
 
 [tasks."setup:env"]
-description = "config.json テンプレートを作成する"
+description = "Create config.json template"
 run = "test -f config.json && echo 'config.json already exists' || cp config.json.example config.json && echo 'config.json created'"
 
 [tasks."setup:registry"]
-description = "プライベートDockerレジストリを管理サーバ上に構築する"
+description = "Set up private Docker registry on management server"
 run = "uv run python tools/setup_registry.py"
 
 # ====================================================================
-# ビルド
+# Build
 # ====================================================================
 
 [tasks.build]
-description = "Dockerイメージをローカルビルドしてレジストリにプッシュ（SSHトンネル経由）"
+description = "Build Docker image locally and push to registry (via SSH tunnel)"
 run = "uv run python tools/deploy.py --build-only"
 
 # ====================================================================
-# モデル分割
+# Model Split
 # ====================================================================
 
 [tasks."split:models"]
-description = "Hugging Face モデルをダウンロード・分割し、マスターへ転送"
+description = "Download and split Hugging Face model, transfer to master"
 run = "uv run python tools/deploy.py --split-only"
 
 [tasks."split:models:dry-run"]
-description = "モデル分割の計画のみ表示（ローカル）"
+description = "Show split plan only (local)"
 run = "uv run python tools/split_model.py --dry-run"
 
 # ====================================================================
-# デプロイ
+# Deploy
 # ====================================================================
 
 [tasks.deploy]
-description = "フルデプロイ（ローカル build + split + transfer + distribute + deploy）"
+description = "Full deploy (local build + split + transfer + distribute + deploy)"
 run = "uv run python tools/deploy.py"
 
 [tasks."deploy:dry-run"]
-description = "デプロイのドライラン"
+description = "Dry run of deploy"
 run = "uv run python tools/deploy.py --dry-run"
 
 # ====================================================================
-# 運用・監視
+# Operations & Monitoring
 # ====================================================================
 
 [tasks.status]
-description = "全ノードのヘルスチェック"
+description = "Health check on all nodes"
 run = "uv run python tools/healthcheck.py"
 
 [tasks."status:verbose"]
-description = "詳細ヘルスチェック（ログ・CPU温度含む）"
+description = "Verbose health check (includes logs and CPU temperature)"
 run = "uv run python tools/healthcheck.py --verbose"
 
 [tasks."logs"]
-description = "全ノードの最新ログを一括表示"
+description = "Display latest logs from all nodes"
 run = "uv run python tools/show_logs.py --all"
 
 # ====================================================================
-# 停止・クリーンアップ
+# Stop & Cleanup
 # ====================================================================
 
 [tasks.stop]
-description = "全ノードの推論コンテナを停止する"
+description = "Stop inference containers on all nodes"
 run = "uv run python tools/cluster_control.py stop"
 
 [tasks.restart]
-description = "全ノードの推論コンテナを再起動する"
+description = "Restart inference containers on all nodes"
 run = "uv run python tools/cluster_control.py restart"
 
 [tasks.clean]
-description = "全ノードのコンテナとイメージを完全削除する"
+description = "Completely remove containers and images on all nodes"
 run = "uv run python tools/cluster_control.py clean"
 
 # ====================================================================
-# デバッグ
+# Debug
 # ====================================================================
 
 [tasks."debug:ssh"]
-description = "全ノードへのSSH接続テスト"
+description = "Test SSH connections to all nodes"
 run = "uv run python tools/debug_tools.py ssh"
 
 [tasks."debug:mtu"]
-description = "全ノードのMTU設定を確認する"
+description = "Check MTU settings on all nodes"
 run = "uv run python tools/debug_tools.py mtu"
 
 [tasks."debug:models"]
-description = "全ノードのモデル重み配置状態を確認する"
+description = "Check model weight deployment on all nodes"
 run = "uv run python tools/debug_tools.py models"
 
 [tasks."debug:ports"]
-description = "管理サーバの必要ポートの開放状態を確認する"
+description = "Check port availability on management server"
 run = "uv run python tools/debug_tools.py ports"
 
 [tasks."debug:temp"]
-description = "全ノードのCPU温度を確認する"
+description = "Check CPU temperature on all nodes"
 run = "uv run python tools/debug_tools.py temp"
 
 # ====================================================================
-# 推論
+# Inference
 # ====================================================================
 
 [tasks.predict]
-description = "分散LLMにプロンプトを送信して推論結果を表示する（SSH経由）"
+description = "Send prompt to distributed LLM and display inference result (via SSH)"
 run = "uv run python tools/predict.py"
 
 [tasks."predict:demo"]
-description = "デモンストレーション用プロンプトを送信する"
-run = 'uv run python tools/predict.py --prompt "こんにちは！"'
+description = "Send demo prompt for demonstration"
+run = 'uv run python tools/predict.py --prompt "Hello!"'

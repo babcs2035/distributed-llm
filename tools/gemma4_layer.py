@@ -1,8 +1,8 @@
 """
-Gemma4 デコーダーレイヤー - safetensors 重み読み込み用
+Gemma4 decoder layer - safetensors weight loader.
 
-safetensors から重みを読み込み、transformers の Gemma4TextDecoderLayer を
-構築して推論に使用する。
+Loads weights from safetensors and builds a Gemma4TextDecoderLayer
+for inference.
 """
 
 from __future__ import annotations
@@ -18,14 +18,14 @@ def build_gemma4_layer(
     weight_file: str,
 ) -> Gemma4TextDecoderLayer:
     """
-    safetensors ファイルから重みを読み込み、Gemma4TextDecoderLayer を構築する。
+    Load weights from a safetensors file and build a Gemma4TextDecoderLayer.
 
     Args:
-        layer_idx: モデル内のレイヤーインデックス (0-59)
-        weight_file: safetensors ファイルへのパス
+        layer_idx: Layer index in the model (0-59)
+        weight_file: Path to the safetensors file
 
     Returns:
-        重み付き Gemma4TextDecoderLayer インスタンス
+        Gemma4TextDecoderLayer instance with loaded weights
     """
     config = AutoConfig.from_pretrained(
         "google/gemma-4-31B-it", trust_remote_code=True,

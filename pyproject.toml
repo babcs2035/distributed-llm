@@ -1,15 +1,15 @@
 # ====================================================================
-# pyproject.toml - 分散LLM推論パイプライン プロジェクト定義
+# pyproject.toml - Distributed LLM Inference Pipeline Project Definition
 # ====================================================================
 #
-# uv + hatch を用いたPythonプロジェクトの定義。
-# PyTorch CPU版は代替インデックスから取得する。
+# Python project definition using uv + hatch.
+# PyTorch CPU version is obtained from an alternate index.
 # ====================================================================
 
 [project]
 name = "distributed-llm"
 version = "0.1.0"
-description = "超多段CPUパイプライン並列 LLM 分散推論システム"
+description = "Multi-stage CPU Pipeline Parallel LLM Distributed Inference System"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -23,7 +23,7 @@ dependencies = [
     "accelerate",
 ]
 
-# PyTorch CPU版は代替インデックスから取得する
+# PyTorch CPU version is obtained from an alternate index
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"

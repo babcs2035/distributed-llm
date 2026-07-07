@@ -1,11 +1,11 @@
 """
-共通ユーティリティモジュール
+Common utility module.
 
-全ツールスクリプトで共有される機能:
-  - config.json からの設定読み込み
-  - hosts.txt の解析
-  - SSH / Rsync コマンド実行
-  - ログ出力のカラー化
+Shared across all tool scripts:
+  - Config loading from config.json
+  - hosts.txt parsing
+  - SSH / Rsync command execution
+  - Colored log output
 """
 
 from __future__ import annotations
@@ -19,51 +19,54 @@ from pathlib import Path
 from typing import Any, TextIO
 
 # ====================================================================
-# カラー出力
+# Color output
 # ====================================================================
 
 
 class Color:
-    """ANSIカラーコード"""
+    """ANSI color codes."""
 
     RED = "\033[0;31m"
     GREEN = "\033[0;32m"
     YELLOW = "\033[0;33m"
     BLUE = "\033[0;34m"
     BOLD = "\033[1m"
+    DIM = "\033[2m"
     NC = "\033[0m"  # No Color
 
     @classmethod
     def disable(cls) -> None:
-        """カラー出力を無効化する（非TTY環境用）"""
+        """Disable color output (for non-TTY environments)."""
 
         cls.RED = ""
         cls.GREEN = ""
         cls.YELLOW = ""
         cls.BLUE = ""
         cls.BOLD = ""
+        cls.DIM = ""
         cls.NC = ""
 
 
-# 非TTY環境ではカラーを無効化
+# Disable colors in non-TTY environments
 if not sys.stdout.isatty():
     Color.disable()
 
 
 # ====================================================================
-# 統一ログ関数
+# Unified logging functions
 # ====================================================================
 
-# レベル名と絵文字のマッピング
-_LOG_LEVELS: dict[str, tuple[str, str]] = {
-    "INFO": ("i", Color.BLUE + "i" + Color.NC),
-    "OK": ("o", Color.GREEN + "✔" + Color.NC),
-    "FAIL": ("!", Color.RED + "✘" + Color.NC),
-    "WARN": ("!", Color.YELLOW + "⚠" + Color.NC),
-    "ERROR": ("!", Color.RED + "✘" + Color.NC),
-    "RESULT": ("*", Color.GREEN + "✔" + Color.NC),
-    "DRY-RUN": (">", Color.BLUE + ">" + Color.NC),
-    "STEP": ("-", Color.BLUE + "-" + Color.NC),
+# Level name to colored tag mapping
+_LOG_LEVELS: dict[str, str] = {
+    "INFO": Color.BLUE + "INFO" + Color.NC,
+    "DEBUG": Color.DIM + "DEBUG" + Color.NC,
+    "OK": Color.GREEN + "OK" + Color.NC,
+    "FAIL": Color.RED + "FAIL" + Color.NC,
+    "WARN": Color.YELLOW + "WARN" + Color.NC,
+    "ERROR": Color.RED + "ERROR" + Color.NC,
+    "RESULT": Color.GREEN + "RESULT" + Color.NC,
+    "DRY-RUN": Color.BLUE + "DRY-RUN" + Color.NC,
+    "STEP": Color.BLUE + "STEP" + Color.NC,
 }
 
 
@@ -75,62 +78,58 @@ def log(
     prefix: str = "  ",
 ) -> None:
     """
-    統一フォーマットでログを出力する。
+    Output a log message in unified format.
 
-    フォーマット:  <prefix>[<emoji> <LEVEL>] <msg>
+    Format:  <prefix>[<LEVEL>] <msg>
 
     Args:
-        level: ログレベル（INFO, OK, FAIL, WARN, ERROR, RESULT, DRY-RUN, STEP）
-        msg: 出力メッセージ
-        file: 出力先（stdout または stderr）
-        prefix: 行頭のインデント文字列
+        level: Log level (INFO, OK, FAIL, WARN, ERROR, RESULT, DRY-RUN, STEP)
+        msg: Message to output
+        file: Output destination (stdout or stderr)
+        prefix: Leading indent string
     """
 
-    if level not in _LOG_LEVELS:
-        tag = level.upper()
-    else:
-        _, tag = _LOG_LEVELS[level]
-
+    tag = _LOG_LEVELS.get(level, level.upper())
     print(f"{prefix}[{tag}] {msg}", file=file)
 
 
 # ====================================================================
-# 後方互換用ログ出力関数
+# Backward-compatible logging functions
 # ====================================================================
 
 
 def log_ok(msg: str, file: TextIO = sys.stdout) -> None:
-    """[OK] プレフィックス付きで成功メッセージを出力する（後方互換）"""
+    """Output a success message with [OK] prefix (backward compatible)."""
 
     log("OK", msg, file=file)
 
 
 def log_fail(msg: str, file: TextIO = sys.stderr) -> None:
-    """[FAIL] プレフィックス付きで失敗メッセージを出力する（後方互換）"""
+    """Output a failure message with [FAIL] prefix (backward compatible)."""
 
     log("FAIL", msg, file=file)
 
 
 def log_warn(msg: str, file: TextIO = sys.stderr) -> None:
-    """[WARN] プレフィックス付きで警告メッセージを出力する（後方互換）"""
+    """Output a warning message with [WARN] prefix (backward compatible)."""
 
     log("WARN", msg, file=file)
 
 
 def log_info(msg: str, file: TextIO = sys.stdout) -> None:
-    """[INFO] プレフィックス付きで情報メッセージを出力する（後方互換）"""
+    """Output an info message with [INFO] prefix (backward compatible)."""
 
     log("INFO", msg, file=file)
 
 
 def log_header(msg: str, file: TextIO = sys.stdout) -> None:
-    """セクション見出しを青色で出力する（後方互換）"""
+    """Output a section header in blue (backward compatible)."""
 
     print(f"\n{Color.BLUE}{msg}{Color.NC}", file=file)
 
 
 def log_timestamp(msg: str, file: TextIO = sys.stdout) -> None:
-    """タイムスタンプ付きログ出力（後方互換）"""
+    """Output a message with timestamp (backward compatible)."""
 
     from datetime import datetime
 
@@ -139,14 +138,14 @@ def log_timestamp(msg: str, file: TextIO = sys.stdout) -> None:
 
 
 # ====================================================================
-# 設定管理
+# Config management
 # ====================================================================
 
 _CONFIG_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def load_config(config_path: str | Path = "config.json") -> dict[str, Any]:
-    """config.json を読み込み、結果をキャッシュする"""
+    """Load config.json and cache the result."""
 
     key = str(Path(config_path).resolve())
     if key in _CONFIG_CACHE:
@@ -163,17 +162,17 @@ def load_config(config_path: str | Path = "config.json") -> dict[str, Any]:
 
 
 # ====================================================================
-# クラスタ設定
+# Cluster configuration
 # ====================================================================
 
 
 @dataclass
 class ClusterConfig:
     """
-    クラスタ設定を管理するデータクラス。
+    Dataclass managing cluster configuration.
 
-    config.json から設定を読み込み、未設定項目は環境変数で補う。
-    環境変数が優先される。
+    Reads settings from config.json, fills unspecified items from environment variables.
+    Environment variables take precedence.
     """
 
     _config: dict[str, Any] = field(default=None)  # type: ignore[assignment]
@@ -197,7 +196,7 @@ class ClusterConfig:
             os.environ.get("HOSTS_FILE")
             or c.get("cluster", {}).get("hosts_file", "hosts.txt")
         )
-        # hosts.txt の行数から自動計算（環境変数で上書き可能）
+        # Auto-computed from hosts.txt line count (overridable via env var)
         self.world_size = (
             os.environ.get("WORLD_SIZE") or str(len(read_hosts(self.hosts_file)))
         )
@@ -210,7 +209,7 @@ class ClusterConfig:
         # --- docker ---
         self.image_name = (
             os.environ.get("IMAGE_NAME")
-            or c.get("docker", {}).get("image_name", "llm-pipeline-image:latest")
+            or c.get("docker", {}).get("image_name", "distributed-llm:latest")
         )
         self.registry_port = (
             os.environ.get("REGISTRY_PORT")
@@ -257,9 +256,9 @@ class ClusterConfig:
 
     @classmethod
     def load(cls, config_path: str | Path = "config.json") -> "ClusterConfig":
-        """指定された config.json パスから設定を読み込んでインスタンスを生成する。"""
+        """Load configuration from the specified config.json path."""
 
-        # _config を直接渡すことで __post_init__ の相対パス問題を回避
+        # Pass _config directly to avoid __post_init__ relative path issues
         cfg = load_config(config_path)
         instance = object.__new__(cls)
         instance._config = cfg
@@ -268,34 +267,34 @@ class ClusterConfig:
 
     @property
     def registry_addr(self) -> str:
-        """Dockerレジストリのアドレス（host:port 形式）"""
+        """Docker registry address (host:port format)."""
 
         return f"{self.master_addr}:{self.registry_port}"
 
     @property
     def target_image(self) -> str:
-        """Dockerイメージの完全なタグ（registry_addr/image_name）"""
+        """Full Docker image tag (registry_addr/image_name)."""
 
         return f"{self.registry_addr}/{self.image_name}"
 
     @property
     def hosts_path(self) -> Path:
-        """hosts.txt のパス"""
+        """Path to hosts.txt."""
 
         return Path(self.hosts_file)
 
 
 # ====================================================================
-# ホストファイル解析
+# Host file parsing
 # ====================================================================
 
 
 def read_hosts(hosts_file: str | Path) -> list[str]:
     """
-    hosts.txt を読み込み、IPアドレスのリストを返す。
+    Read hosts.txt and return a list of IP addresses.
 
-    空行およびコメント行（# で始まる行）は無視する。
-    行の出現順が Rank 番号に対応する。
+    Skips empty lines and comment lines (starting with #).
+    Line order corresponds to Rank number.
     """
 
     path = Path(hosts_file)
@@ -314,15 +313,15 @@ def read_hosts(hosts_file: str | Path) -> list[str]:
 
 def resolve_host_to_ip(host: str) -> str:
     """
-    ホスト名をIPアドレスに解決する。
+    Resolve a hostname to an IP address.
 
-    SSH config（~/.ssh/config）から Hostname エントリを取得し、
-    なければ DNS 解決、失敗すれば元の値を返す。
+    Gets Hostname entry from SSH config (~/.ssh/config),
+    falls back to DNS resolution, returns original value on failure.
     """
 
     import socket
 
-    # 1. SSH config から Hostname を取得
+    # 1. Get Hostname from SSH config
     ssh_config_path = Path.home() / ".ssh" / "config"
     if ssh_config_path.exists():
         current_hosts = None
@@ -334,27 +333,42 @@ def resolve_host_to_ip(host: str) -> str:
             elif line.startswith("Hostname ") and current_hosts and host in current_hosts:
                 return line.split()[1]
 
-    # 2. DNS 解決
+    # 2. DNS resolution
     try:
         return socket.gethostbyname(host)
     except socket.gaierror:
         pass
 
-    # 3. 解決失敗時は元の値を返す
+    # 3. Return original value on resolution failure
     return host
 
 
 # ====================================================================
-# SSH / Rsync コマンド実行
+# SSH / Rsync command execution
 # ====================================================================
 
 SSH_BASE_OPTS = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "ConnectTimeout=10",
     "-o", "BatchMode=yes",
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=~/.ssh/control_masters/%r@%h-%p",
+    "-o", "ControlPersist=600",
 ]
 
-# rsync -e オプション用: SSH_BASE_OPTS を ssh コマンド文字列に変換（引用符なし）
+
+def ensure_ssh_control_master_dir() -> None:
+    """
+    Ensure the SSH ControlMaster socket directory exists.
+
+    ControlMaster requires the directory to exist beforehand.
+    It is not created automatically on first connection, so create it explicitly.
+    """
+
+    ctrl_dir = Path.home() / ".ssh" / "control_masters"
+    ctrl_dir.mkdir(parents=True, exist_ok=True)
+
+# rsync -e option: Convert SSH_BASE_OPTS to ssh command string (no quotes)
 SSH_BASE_OPTS_STR = "ssh " + " ".join(SSH_BASE_OPTS)
 
 
@@ -369,19 +383,19 @@ def ssh_run(
     extra_opts: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """
-    リモートホスト上でSSHコマンドを実行する。
+    Execute an SSH command on a remote host.
 
     Args:
-        user: SSH接続ユーザー
-        host: リモートホストのIPアドレスまたはホスト名
-        command: 実行するコマンド
-        timeout: タイムアウト秒数
-        capture: 標準出力/標準エラーをキャプチャするかどうか
-        check: エラーコードで終了するかどうか
-        extra_opts: SSHオプションの追加
+        user: SSH connection user
+        host: Remote host IP address or hostname
+        command: Command to execute
+        timeout: Timeout in seconds
+        capture: Whether to capture stdout/stderr
+        check: Whether to raise on non-zero exit code
+        extra_opts: Additional SSH options
 
     Returns:
-        subprocess.CompletedProcess: 実行結果
+        subprocess.CompletedProcess: Execution result
     """
 
     opts = SSH_BASE_OPTS.copy()
@@ -401,8 +415,7 @@ def ssh_run(
 
 def _escape_for_remote(command: str) -> str:
     """
-    リモートSSHコマンド内で安全に実行できるよう、コマンド内の
-    シングルクォートをエスケープする。
+    Escape single quotes in a command for safe execution in remote SSH.
     """
 
     return command.replace("'", "'\\''")
@@ -420,33 +433,36 @@ def ssh_via_master(
     extra_opts: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """
-    管理ノードを経由してターゲットノード上でSSHコマンドを実行する。
+    Execute an SSH command on a target node via the management node.
 
-    ローカル → SSH → マスター → SSH → ターゲットノード
+    Uses OpenSSH ProxyJump (-J): local -> master -> target node.
+    Replaces nested SSH to reduce connection overhead.
 
     Args:
-        user: SSH接続ユーザー
-        master_addr: 管理ノードのIPアドレス
-        target_host: ターゲットノードのIPアドレスまたはホスト名
-        command: ターゲットノードで実行するコマンド
-        timeout: タイムアウト秒数
-        capture: 標準出力/標準エラーをキャプチャするかどうか
-        check: エラーコードで終了するかどうか
-        extra_opts: SSHオプションの追加（両サイドに適用）
+        user: SSH connection user
+        master_addr: Management node IP address
+        target_host: Target node IP address or hostname
+        command: Command to execute on the target node
+        timeout: Timeout in seconds
+        capture: Whether to capture stdout/stderr
+        check: Whether to raise on non-zero exit code
+        extra_opts: Additional SSH options
 
     Returns:
-        subprocess.CompletedProcess: 実行結果
+        subprocess.CompletedProcess: Execution result
     """
 
-    inner_opts = SSH_BASE_OPTS.copy()
+    opts = SSH_BASE_OPTS.copy()
     if extra_opts:
-        inner_opts.extend(extra_opts)
+        opts.extend(extra_opts)
 
-    inner_ssh = "ssh " + " ".join(inner_opts)
-    escaped = _escape_for_remote(command)
-    remote_cmd = f"{inner_ssh} {user}@{target_host} '{escaped}'"
-
-    cmd = ["ssh", *SSH_BASE_OPTS, f"{user}@{master_addr}", remote_cmd]
+    # ProxyJump (-J) syntax: single SSH command via master
+    cmd = [
+        "ssh", *opts,
+        "-J", f"{user}@{master_addr}",
+        f"{user}@{target_host}",
+        command,
+    ]
 
     return subprocess.run(
         cmd,
@@ -466,20 +482,19 @@ def rsync_dir(
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str]:
     """
-    ローカルディレクトリをリモートホストにRsyncで転送する（再帰）。
+    Transfer a local directory to a remote host via rsync (recursive).
 
-    rsync の進捗表示（-P）をリアルタイムで出力し、
-    完了後に終了コードを返す。
+    Streams rsync progress (-P) in real time and returns exit code on completion.
 
     Args:
-        user: SSH接続ユーザー
-        host: リモートホストのIPアドレスまたはホスト名
-        local_dir: 転送元のローカルディレクトリ
-        remote_path: 転送先のリモートパス
-        timeout: タイムアウト秒数
+        user: SSH connection user
+        host: Remote host IP address or hostname
+        local_dir: Local source directory
+        remote_path: Remote destination path
+        timeout: Timeout in seconds
 
     Returns:
-        subprocess.CompletedProcess: 実行結果
+        subprocess.CompletedProcess: Execution result
     """
 
     cmd = [
@@ -521,17 +536,17 @@ def run_local(
     timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """
-    ローカルでコマンドを実行する。
+    Execute a command locally.
 
     Args:
-        command: 実行するコマンド（文字列またはリスト）
-        check: エラーコードで終了するかどうか
-        capture: 標準出力/標準エラーをキャプチャするかどうか
-        shell: シェルとして実行するかどうか
-        timeout: タイムアウト秒数
+        command: Command to execute (string or list)
+        check: Whether to raise on non-zero exit code
+        capture: Whether to capture stdout/stderr
+        shell: Whether to run as a shell command
+        timeout: Timeout in seconds
 
     Returns:
-        subprocess.CompletedProcess: 実行結果
+        subprocess.CompletedProcess: Execution result
     """
 
     return subprocess.run(
@@ -553,26 +568,25 @@ def ensure_hosts_entry(
     timeout: int = 10,
 ) -> subprocess.CompletedProcess[str]:
     """
-    ターゲットノードの /etc/hosts にエントリが存在することを確認・追加する。
+    Check and add an entry to /etc/hosts on the target node.
 
-    マスターノード経由でターゲットノードにSSHし、
-    /etc/hosts にマスターのホスト名が含まれていれば何もしない。
-    含まれていなければ、渡されたエントリを追記する。
+    SSHes to the target node via the master node and checks if
+    the master's hostname is in /etc/hosts. If present, does nothing.
+    Otherwise, appends the given entry.
 
     Args:
-        user: SSH接続ユーザー
-        master_addr: 管理ノードのアドレス（SSH経由）
-        target_host: ターゲットノードのアドレス
-        hosts_entry: /etc/hosts に追加する行（例: "192.168.1.1 master-hostname"）
-        timeout: タイムアウト秒数
+        user: SSH connection user
+        master_addr: Management node address (via SSH)
+        target_host: Target node address
+        hosts_entry: Line to add to /etc/hosts (e.g., "192.168.1.1 master-hostname")
+        timeout: Timeout in seconds
 
     Returns:
-        subprocess.CompletedProcess: 実行結果
+        subprocess.CompletedProcess: Execution result
     """
 
-    # /etc/hosts に存在確認。なければ sudo tee で追記
-    # hosts_entry は "IP hostname" 形式のみで構成されるため、
-    # シングルクォート内で安全に扱える
+    # Check /etc/hosts for existence. If missing, append via sudo tee.
+    # hosts_entry contains only "IP hostname" format, so safe within single quotes.
     check_cmd = (
         f"grep -q '{master_addr}' /etc/hosts || "
         f"printf '%s\\n' '{hosts_entry}' | sudo tee -a /etc/hosts >/dev/null"
@@ -589,34 +603,39 @@ def configure_insecure_registry(
     timeout: int = 30,
 ) -> subprocess.CompletedProcess[str]:
     """
-    ターゲットノードの Docker デーモンに insecure-registries を設定する。
+    Configure insecure-registries on the target node's Docker daemon.
 
-    既存の /etc/docker/daemon.json を読み取り、
-    insecure-registries に registry_addr がなければ追加し、Docker を再起動する。
-    既存の Docker 設定は保持される。
+    Reads existing /etc/docker/daemon.json, adds registry_addr to
+    insecure-registries if missing, and restarts Docker.
+    Existing Docker configuration is preserved.
 
     Args:
-        user: SSH接続ユーザー
-        master_addr: 管理ノードのアドレス（SSH経由）
-        target_host: ターゲットノードのアドレス
-        registry_addr: insecure-registries に追加するレジストリアドレス（例: "wafl-ctrl1:5000"）
-        timeout: タイムアウト秒数
+        user: SSH connection user
+        master_addr: Management node address (via SSH)
+        target_host: Target node address
+        registry_addr: Registry address to add to insecure-registries (e.g., "wafl-ctrl1:5000")
+        timeout: Timeout in seconds
 
     Returns:
-        subprocess.CompletedProcess: 実行結果
+        subprocess.CompletedProcess: Execution result
     """
 
     import base64
 
-    # base64 エンコーディングで Python コードを渡す（引用符の問題を完全に回避）
+    # Pass Python code via base64 encoding to fully avoid quote issues.
+    # Skip Docker restart if already registered in insecure-registries.
     python_code = (
         "import json, os\n"
         'd = json.load(open("/etc/docker/daemon.json")) if os.path.exists("/etc/docker/daemon.json") else {}\n'
         'r = "' + registry_addr + '"\n'
+        "changed = False\n"
         'if r not in d.get("insecure-registries", []):\n'
         '    d.setdefault("insecure-registries", []).append(r)\n'
-        'json.dump(d, open("/etc/docker/daemon.json", "w"), indent=2)\n'
-        'os.system("sudo systemctl restart docker")'
+        "    changed = True\n"
+        'if changed:\n'
+        '    json.dump(d, open("/etc/docker/daemon.json", "w"), indent=2)\n'
+        '    os.system("sudo systemctl restart docker")\n'
+        'print("changed" if changed else "already_configured")'
     )
     encoded = base64.b64encode(python_code.encode()).decode()
     cmd = f"sudo python3 -c 'import base64; exec(base64.b64decode(\"{encoded}\").decode())'"
@@ -634,19 +653,18 @@ def clean_unassigned_layers(
     timeout: int = 30,
 ) -> subprocess.CompletedProcess[str]:
     """
-    ターゲットノードの /models から不要なレイヤーファイルを削除する。
+    Remove unassigned layer files from /models on the target node.
 
-    assigned_layers に含まれない layer_N.{ext} ファイルを削除し、
-    embed_tokens と lm_head は常に保持する。
-    base64エンコーディングされたPythonコードで安全に実行する。
+    Deletes layer_N.{ext} files not in assigned_layers.
+    Always keeps embed_tokens and lm_head.
+    Executes safely via base64-encoded Python code.
     """
     import base64
 
     ext = "safetensors" if weight_format == "safetensors" else "pt"
     needed = str(set(str(i) for i in assigned_layers))
 
-    # base64エンコーディングされたPythonコード
-    # ネストされたシングルクォート問題を避けるため
+    # Base64-encoded Python code to avoid nested single-quote issues
     lines = [
         "import os, glob, re",
         'ext = "' + ext + '"',
@@ -665,7 +683,7 @@ def clean_unassigned_layers(
 
 
 def require_root() -> None:
-    """root権限を要求する。非rootの場合はエラー終了する"""
+    """Require root privileges. Exit with error if not running as root."""
 
     if os.geteuid() != 0:
         print(

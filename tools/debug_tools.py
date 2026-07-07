@@ -1,12 +1,12 @@
 """
-debug_tools.py - デバッグ・トラブルシューティングツール
+debug_tools.py - Debug and troubleshooting tools
 
-使用法:
-  uv run python tools/debug_tools.py ssh    # SSH接続テスト
-  uv run python tools/debug_tools.py mtu    # MTU設定確認
-  uv run python tools/debug_tools.py models # モデル重み配置状態確認
-  uv run python tools/debug_tools.py ports  # ポート開放確認
-  uv run python tools/debug_tools.py temp   # CPU温度確認
+Usage:
+  uv run python tools/debug_tools.py ssh    # Test SSH connections
+  uv run python tools/debug_tools.py mtu    # Check MTU settings
+  uv run python tools/debug_tools.py models # Check model weight deployment
+  uv run python tools/debug_tools.py ports  # Check port availability
+  uv run python tools/debug_tools.py temp   # Check CPU temperature
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from common import ClusterConfig, log, read_hosts, run_local, ssh_run, ssh_via_m
 
 
 def debug_ssh(config: ClusterConfig) -> None:
-    """全ノードへのSSH接続テストを実行する"""
+    """Test SSH connections to all nodes."""
 
     log("INFO", "Testing SSH connection to all nodes...")
 
@@ -42,7 +42,7 @@ def debug_ssh(config: ClusterConfig) -> None:
 
 
 def debug_mtu(config: ClusterConfig) -> None:
-    """全ノードのMTU設定を確認する"""
+    """Check MTU settings on all nodes."""
 
     log("INFO", "Checking MTU settings on all nodes...")
 
@@ -61,7 +61,7 @@ def debug_mtu(config: ClusterConfig) -> None:
 
 
 def debug_models(config: ClusterConfig) -> None:
-    """全ノードのモデル重み配置状態を確認する"""
+    """Check model weight deployment on all nodes."""
 
     log("INFO", "Checking model weight deployment on all nodes...")
 
@@ -80,23 +80,24 @@ def debug_models(config: ClusterConfig) -> None:
 
 
 def debug_ports(config: ClusterConfig) -> None:
-    """管理サーバの必要ポートの開放状態を確認する"""
+    """Check port availability on the management server."""
 
     log("INFO", "Checking port status on management server...")
 
-    log("INFO", f"PyTorch master port ({config.master_port})")
-    result = run_local(
-        f"ss -tlnp | grep ':{config.master_port}'",
-        capture=True, check=False, shell=True,
-    )
-    log("INFO", result.stdout.strip() if result.stdout else "  Not listening")
-
-    log("INFO", f"Docker registry port ({config.registry_port})")
-    result = run_local(
-        f"ss -tlnp | grep ':{config.registry_port}'",
-        capture=True, check=False, shell=True,
-    )
-    log("INFO", result.stdout.strip() if result.stdout else "  Not listening")
+    apps = [
+        ("PyTorch master", config.master_port),
+        ("Docker registry", config.registry_port),
+        ("Signal socket", 8081),
+        ("HTTP predict", 8082),
+        ("Relay ACK", 8083),
+    ]
+    for name, port in apps:
+        log("INFO", f"Port {port} ({name})")
+        result = run_local(
+            f"ss -tlnp | grep ':{port}'",
+            capture=True, check=False, shell=True,
+        )
+        log("INFO", result.stdout.strip() if result.stdout else "  Not listening")
 
     log("INFO", "Firewall status")
     result = run_local("sudo ufw status 2>/dev/null", capture=True, check=False, shell=True)
@@ -111,7 +112,7 @@ def debug_ports(config: ClusterConfig) -> None:
 
 
 def debug_temp(config: ClusterConfig) -> None:
-    """全ノードのCPU温度を確認する（サーマルスロットリング検出）"""
+    """Check CPU temperature on all nodes (thermal throttling detection)."""
 
     log("INFO", "Checking CPU temperature on all nodes...")
 
@@ -137,7 +138,7 @@ def debug_temp(config: ClusterConfig) -> None:
 
 
 def main() -> None:
-    """デバッグ・トラブルシューティングツールを実行する"""
+    """Run debug and troubleshooting tools."""
 
     parser = argparse.ArgumentParser(description="Debug and troubleshooting tools")
     parser.add_argument(

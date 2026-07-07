@@ -1,10 +1,10 @@
 """
-プライベートDockerレジストリ構築スクリプト
+Private Docker registry setup script.
 
-管理サーバ上で実行し、HTTP（TLSなし）の Docker Registry v2 を起動する。
-各ノードは SSH トンネル経由でイメージにアクセスする。
+Runs on the management server to start an HTTP (no TLS) Docker Registry v2.
+Nodes access images via SSH tunnel.
 
-使用法:
+Usage:
   uv run python tools/setup_registry.py
 """
 
@@ -17,10 +17,10 @@ from common import ClusterConfig, log, ssh_run
 
 def start_registry(config: ClusterConfig) -> None:
     """
-    Docker Registry v2 を管理サーバ上で起動する（HTTP / TLSなし）。
+    Start Docker Registry v2 on the management server (HTTP / no TLS).
 
-    既存のコンテナがあれば停止・削除してから新規起動する。
-    データは /var/lib/registry に永続化する。
+    Stops and removes existing container if present, then starts a new one.
+    Data persists at /var/lib/registry.
     """
 
     log("INFO", "Starting Docker Registry v2...")
@@ -29,7 +29,7 @@ def start_registry(config: ClusterConfig) -> None:
     master = config.master_addr
     user = config.ssh_user
 
-    # 既存のレジストリコンテナのクリーンアップ
+    # Clean up existing registry container
     result = ssh_run(
         user, master,
         "docker ps -a --format '{{.Names}}'",
@@ -58,7 +58,7 @@ def start_registry(config: ClusterConfig) -> None:
 
 
 def main() -> None:
-    """Dockerレジストリを管理サーバ上に構築する"""
+    """Set up a Docker registry on the management server."""
 
     config = ClusterConfig()
 

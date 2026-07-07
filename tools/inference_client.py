@@ -1,11 +1,11 @@
 """
-管理ノードから分散LLMパイプラインに推論リクエストを送信するクライアント。
+Client to send inference requests to the distributed LLM pipeline from the management node.
 
-SSHトンネル経由で管理ノードの8080ポートにアクセスする。
+Accesses port 8080 on the management node via SSH tunnel.
 
-使用法:
-  uv run python tools/inference_client.py "こんにちは、世界"
-  echo '{"prompt": "テスト"}' | uv run python tools/inference_client.py --stdin
+Usage:
+  uv run python tools/inference_client.py "Hello, world"
+  echo '{"prompt": "test"}' | uv run python tools/inference_client.py --stdin
 """
 
 import argparse
@@ -25,7 +25,7 @@ TIMEOUT_SECONDS = 300
 
 
 def send_request(host: str, port: int, prompt: str) -> str:
-    """SSHトンネル経由でパイプラインに推論リクエストを送信し、結果を返す。"""
+    """Send an inference request to the pipeline via SSH tunnel and return the result."""
 
     payload = json.dumps({"prompt": prompt}).encode("utf-8")
     url = f"http://127.0.0.1:{port}/predict"
@@ -37,11 +37,11 @@ def send_request(host: str, port: int, prompt: str) -> str:
         method="POST",
     )
 
-    print(f"[i] Sending request to {url} ...", flush=True)
+    print(f"[INFO] Sending request to {url}...", flush=True)
     with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
         if resp.status != 200:
             body = resp.read().decode()
-            print(f"[x] Error {resp.status}: {body}", file=sys.stderr)
+            print(f"[ERROR] HTTP {resp.status}: {body}", file=sys.stderr)
             sys.exit(1)
         return json.loads(resp.read().decode())["result"]
 
@@ -67,10 +67,10 @@ def main() -> None:
         sys.exit(1)
 
     if not prompt:
-        print("[x] Error: empty prompt", file=sys.stderr)
+        print("[ERROR] Empty prompt", file=sys.stderr)
         sys.exit(1)
 
-    # SSHトンネル確立
+    # Establish SSH tunnel
     tunnel = subprocess.Popen(
         [
             "ssh",
@@ -87,7 +87,7 @@ def main() -> None:
     )
 
     try:
-        # トンネル確立を待つ
+        # Wait for tunnel to establish
         for _ in range(30):
             time.sleep(0.5)
             import socket
@@ -100,13 +100,13 @@ def main() -> None:
             finally:
                 s.close()
         else:
-            print(f"[x] Error: failed to establish SSH tunnel to {args.host}:{args.port}", file=sys.stderr)
+            print(f"[ERROR] Failed to establish SSH tunnel to {args.host}:{args.port}", file=sys.stderr)
             sys.exit(1)
 
         result = send_request("127.0.0.1", args.port, prompt)
-        print(f"[result] {result}", flush=True)
+        print(f"[RESULT] {result}", flush=True)
     except Exception:
-        print(f"[x] Error: {sys.exc_info()[1]}", file=sys.stderr)
+        print(f"[ERROR] {sys.exc_info()[1]}", file=sys.stderr)
         sys.exit(1)
     finally:
         tunnel.terminate()

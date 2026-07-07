@@ -1,15 +1,15 @@
 """
-分散LLM推論クラスタ ヘルスチェックスクリプト
+Distributed LLM inference cluster health check script.
 
-全ノードの以下を検証する:
-  1. SSH接続性
-  2. Dockerデーモンの稼働状態
-  3. llm-nodeコンテナの実行状態
-  4. モデル重みの存在確認
-  5. ネットワークMTU整合性
-  6. CPU温度（サーマルスロットリング検出）
+Validates the following on all nodes:
+  1. SSH connectivity
+  2. Docker daemon status
+  3. distributed-llm container running state
+  4. Model weight presence
+  5. Network MTU consistency
+  6. CPU temperature (thermal throttling detection)
 
-使用法:
+Usage:
   uv run python tools/healthcheck.py [--verbose]
 """
 
@@ -36,11 +36,11 @@ from common import (
 
 
 def check_master(config: ClusterConfig) -> None:
-    """管理サーバのチェックを実行する"""
+    """Check the management server."""
 
     log_header(f"=== Management Server ({config.master_addr}) ===")
 
-    # Dockerレジストリ（HTTP）— ローカルポートフォワード → SSH 経由
+    # Docker registry (HTTP) -- local port forward -> via SSH
     try:
         result = run_local(
             ["curl", "-s", f"http://localhost:{config.registry_port}/v2/_catalog"],
@@ -49,7 +49,7 @@ def check_master(config: ClusterConfig) -> None:
         if result.returncode == 0 and "repositories" in result.stdout:
             log("OK", f"Docker registry (port {config.registry_port}) responding")
         else:
-            # ローカルポートフォワードがない場合はSSH経由でチェック
+            # Check via SSH if local port forward is unavailable
             result = run_local(
                 f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
                 f"{config.ssh_user}@{config.master_addr} "
@@ -63,7 +63,7 @@ def check_master(config: ClusterConfig) -> None:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         log_fail("Cannot connect to Docker registry")
 
-    # PyTorch分散マスターポート — SSH 経由で wafl-ctrl1 上でチェック
+    # PyTorch distributed master port -- check on wafl-ctrl1 via SSH
     result = run_local(
         f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
         f"{config.ssh_user}@{config.master_addr} "
@@ -84,24 +84,24 @@ def check_node(
     verbose: bool = False,
 ) -> bool:
     """
-    単一ノードのヘルスチェックを実行する。
+    Run health check on a single node.
 
-    検証項目:
-      1. SSH接続性
-      2. Dockerデーモンの稼働
-      3. llm-nodeコンテナの状態
-      4. モデル重みの存在
-      5. MTU設定
-      6. CPU温度（verbose時のみ）
+    Checks:
+      1. SSH connectivity
+      2. Docker daemon running
+      3. distributed-llm container status
+      4. Model weight presence
+      5. MTU setting
+      6. CPU temperature (verbose only)
 
     Returns:
-        True: 全チェック正常, False: 何らかの異常あり
+        True: All checks passed, False: Some check failed
     """
 
     log_header(f"--- Rank {rank} ({ip}) ---")
     node_healthy = True
 
-    # 1. SSH接続性
+    # 1. SSH connectivity
     result = ssh_via_master(
         config.ssh_user, config.master_addr, ip, "true",
         timeout=10,
@@ -112,7 +112,7 @@ def check_node(
         return False
     log("OK", "SSH connection OK")
 
-    # 2. Dockerデーモン
+    # 2. Docker daemon
     result = ssh_via_master(config.ssh_user, config.master_addr, ip, "docker info >/dev/null 2>&1")
     if result.returncode == 0:
         log("OK", "Docker daemon running")
@@ -120,32 +120,32 @@ def check_node(
         log("FAIL", "Docker daemon stopped")
         node_healthy = False
 
-    # 3. llm-nodeコンテナ
+    # 3. distributed-llm container
     result = ssh_via_master(
         config.ssh_user, config.master_addr, ip,
-        "docker inspect -f '{{.State.Status}}' llm-node 2>/dev/null",
+        "docker inspect -f '{{.State.Status}}' distributed-llm 2>/dev/null",
     )
     container_status = (result.stdout or "").strip() if result.returncode == 0 else "not_found"
 
     if container_status == "running":
-        log("OK", "llm-node container: running")
+        log("OK", "distributed-llm container: running")
         if verbose:
             log_result = ssh_via_master(
                 config.ssh_user, config.master_addr, ip,
-                "docker logs --tail 3 llm-node 2>&1",
+                "docker logs --tail 3 distributed-llm 2>&1",
             )
             if log_result.stdout:
                 log("INFO", f"Latest logs: {log_result.stdout.strip()}")
     elif container_status == "not_found":
-        log("WARN", "llm-node container: not created")
+        log("WARN", "distributed-llm container: not created")
         node_healthy = False
     else:
-        log("FAIL", f"llm-node container: {container_status}")
+        log("FAIL", f"distributed-llm container: {container_status}")
         node_healthy = False
 
-    # 4. モデル重みの存在確認
-    # Rank 0 はレイヤー担当なし（TCPStoreのみ）→ embed_tokens + lm_head のみ
-    # Rank 1+ はパイプライン並列化で異なるレイヤーを持つ → layer_*.safetensors も必要
+    # 4. Model weight presence check
+    # Rank 0 has no layer assignment (TCPStore only) -> needs embed_tokens + lm_head only
+    # Rank 1+ has different layers for pipeline parallelism -> also needs layer_*.safetensors
     if rank == 0:
         model_check = (
             f"test -f {config.model_mount_path}/embed_tokens.safetensors && "
@@ -171,7 +171,7 @@ def check_node(
         log("FAIL", f"Model weights not deployed: {config.model_mount_path}")
         node_healthy = False
 
-    # 5. MTU確認
+    # 5. MTU check
     result = ssh_via_master(
         config.ssh_user, config.master_addr, ip,
         "ip -o link show $(ip -o -4 route show to default | awk '{print $5}') 2>/dev/null"
@@ -183,7 +183,7 @@ def check_node(
     else:
         log("WARN", f"MTU: {mtu} (1500 or 9000 recommended)")
 
-    # 6. CPU温度確認（verbose時のみ）
+    # 6. CPU temperature check (verbose only)
     if verbose:
         result = ssh_via_master(
             config.ssh_user, config.master_addr, ip,
@@ -201,7 +201,7 @@ def check_node(
 
 
 def main() -> None:
-    """全ノードのヘルスチェックを実行する"""
+    """Run health checks on all nodes."""
 
     parser = argparse.ArgumentParser(description="Distributed LLM cluster health check")
     parser.add_argument(
@@ -219,10 +219,10 @@ def main() -> None:
     log("INFO", f"Distributed LLM Cluster Health Check ({now})")
     log("STEP", "=" * 68)
 
-    # 管理サーバチェック
+    # Management server check
     check_master(config)
 
-    # 全ノードチェック
+    # All nodes check
     hosts = read_hosts(config.hosts_file)
     healthy_count = 0
     unhealthy_nodes: list[tuple[int, str]] = []
@@ -233,7 +233,7 @@ def main() -> None:
         else:
             unhealthy_nodes.append((rank, ip))
 
-    # サマリー
+    # Summary
     total = len(hosts)
     unhealthy_count = len(unhealthy_nodes)
 

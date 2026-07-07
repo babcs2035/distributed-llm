@@ -1,14 +1,14 @@
 """
-split_model.py - Hugging Face モデルをパイプライン並列用に分割
+split_model.py - Split Hugging Face models for pipeline parallelism.
 
-config.json からモデル名を読み込み、Hugging Face からダウンロードしたモデルを
-パイプライン並列推論用に各トランスフォーマーレイヤーごとに分割する。
+Reads the model name from config.json, downloads the model from Hugging Face,
+and splits it by transformer layer for pipeline parallel inference.
 
-使用法:
-  uv run python tools/split_model.py                    # 全レイヤーを分割
-  uv run python tools/split_model.py --output-dir DIR   # 出力ディレクトリ指定
-  uv run python tools/split_model.py --format pt        # PyTorch 形式で出力
-  uv run python tools/split_model.py --dry-run          # 分割計画のみ表示
+Usage:
+  uv run python tools/split_model.py                    # Split all layers
+  uv run python tools/split_model.py --output-dir DIR   # Specify output directory
+  uv run python tools/split_model.py --format pt        # Output in PyTorch format
+  uv run python tools/split_model.py --dry-run          # Show split plan only
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Any
 try:
     from transformers import AutoConfig, AutoModelForCausalLM
 except ImportError:
-    print("ERROR ! transformers | pip install transformers safetensors", file=sys.stderr)
+    print("[ERROR] Missing dependency: install transformers and safetensors", file=sys.stderr)
     sys.exit(1)
 
 import torch
@@ -38,7 +38,7 @@ from common import log
 
 
 def load_config(config_path: str = "config.json") -> dict[str, Any]:
-    """config.json を読み込む"""
+    """Load config.json."""
 
     path = Path(config_path)
     if not path.exists():
@@ -49,11 +49,11 @@ def load_config(config_path: str = "config.json") -> dict[str, Any]:
 
 def get_model_specs(model_name: str, overrides: dict[str, Any] | None, *, dry_run: bool = False) -> dict[str, Any]:
     """
-    Hugging Face からモデル仕様を取得する。
+    Get model specs from Hugging Face.
 
-    overrides で指定された値があればそれを優先し、
-    なければ AutoConfig から自動取得する。
-    dry_run=True の場合は HF にアクセスせずにデフォルト値を使用する。
+    Prioritizes values specified in overrides,
+    otherwise auto-fetches via AutoConfig.
+    If dry_run=True, uses default values without accessing HF.
     """
 
     num_hidden_layers = overrides.get("num_hidden_layers")
@@ -78,23 +78,23 @@ def get_model_specs(model_name: str, overrides: dict[str, Any] | None, *, dry_ru
 
 def _resolve_num_hidden_layers(config: Any, model_name: str) -> int:
     """
-    config オブジェクトから num_hidden_layers を堅牢に取得する。
+    Robustly extract num_hidden_layers from a config object.
 
-    異なるアーキテクチャで異なる属性名を使う可能性があるため、
-    複数の候補を試す。また、`text_config` のようなネストされた
-    config 内の値も再帰的に探索する。
+    Tries multiple candidate attribute names since different architectures
+    may use different names. Also recursively searches nested configs
+    like `text_config`.
     """
 
     candidates = ["num_hidden_layers", "num_layers", "n_layers"]
 
-    # 1. トップレベルの属性を検索
+    # 1. Search top-level attributes
     for attr in candidates:
         if hasattr(config, attr):
             value = getattr(config, attr)
             log("INFO", f"Found num_hidden_layers via '{attr}': {value}")
             return int(value)
 
-    # 2. config.__dict__ から layer 関連のキーを検索
+    # 2. Search for layer-related keys in config.__dict__
     for key in config.__dict__:
         if "layer" in key.lower() and "hidden" in key.lower():
             value = config.__dict__[key]
@@ -102,7 +102,7 @@ def _resolve_num_hidden_layers(config: Any, model_name: str) -> int:
                 log("WARN", f"Inferred num_hidden_layers from '{key}': {value}")
                 return int(value)
 
-    # 3. ネストされた config (text_config / vision_config / audio_config) を再帰的に検索
+    # 3. Recursively search nested configs (text_config / vision_config / audio_config)
     for key in config.__dict__:
         nested = getattr(config, key, None)
         if nested is not None and hasattr(nested, "__dict__"):
@@ -120,11 +120,11 @@ def _resolve_num_hidden_layers(config: Any, model_name: str) -> int:
 
 
 def detect_layer_prefix(weights: dict[str, Any]) -> str:
-    """重み辞書からレイヤープレフィックスを自動検出する。
+    """Automatically detect the layer prefix from the weight dictionary.
 
-    候補として 'model.layers.', 'model.language_model.layers.',
-    'model.vision_tower.encoder.layers.' 等をスキャンし、
-    最も多くのレイヤー番号を含むプレフィックスを返す。
+    Scans candidates like 'model.layers.', 'model.language_model.layers.',
+    'model.vision_tower.encoder.layers.' and returns the prefix
+    with the most layer indices.
     """
 
     candidates = [
@@ -153,7 +153,7 @@ def detect_layer_prefix(weights: dict[str, Any]) -> str:
 
 
 def detect_embed_key(weights: dict[str, Any]) -> str | None:
-    """重み辞書から embed_tokens のキーを自動検出する"""
+    """Automatically detect the embed_tokens key from the weight dictionary."""
 
     candidates = [
         "model.language_model.embed_tokens.weight",
@@ -168,7 +168,7 @@ def detect_embed_key(weights: dict[str, Any]) -> str | None:
 
 
 def get_layer_weight_keys(weights: dict[str, Any], layer_prefix: str) -> set[int]:
-    """重み辞書からレイヤー番号のセットを抽出する"""
+    """Extract layer number set from the weight dictionary."""
 
     layers: set[int] = set()
     for key in weights:
@@ -184,9 +184,9 @@ def get_layer_weight_keys(weights: dict[str, Any], layer_prefix: str) -> set[int
 
 def _download_model(model_name: str) -> str:
     """
-    Hugging Face からモデルをダウンロードし、ローカルキャッシュのパスを返す。
+    Download model from Hugging Face and return the local cache path.
 
-    既にキャッシュに存在する場合は再ダウンロードしない。
+    Skips re-download if already cached.
     """
 
     log("INFO", f"Downloading/loading model: {model_name}")
@@ -199,7 +199,7 @@ def _download_model(model_name: str) -> str:
 
 
 def _is_layer_complete(output_dir: Path, i: int, fmt: str) -> bool:
-    """レイヤー番号 i の分割ファイルが既に存在するか判定する"""
+    """Check if the split file for layer index i already exists."""
 
     fname = f"layer_{i}.{'safetensors' if fmt == 'safetensors' else 'pt'}"
     return (output_dir / fname).exists()
@@ -215,20 +215,20 @@ def split_model(
     layer_prefix: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
-    モデルをレイヤーごとに分割して保存する。
+    Split and save the model by layer.
 
-    既存のレイヤーファイルはスキップし、中断から再開可能。
+    Skips existing layer files and supports resuming from interruption.
 
     Args:
-        model_name: Hugging Face のモデル名
-        output_dir: 出力ディレクトリ
-        weight_format: 出力形式（'safetensors' または 'pt'）
-        specs: モデル仕様（num_hidden_layers）
-        dry_run: 実際の分割を行わず計画のみを表示するかどうか
-        layer_prefix: レイヤープレフィックス（None の場合は自動検出）
+        model_name: Hugging Face model name
+        output_dir: Output directory
+        weight_format: Output format ('safetensors' or 'pt')
+        specs: Model specs (num_hidden_layers)
+        dry_run: Show split plan only without actual splitting
+        layer_prefix: Layer prefix (auto-detected if None)
 
     Returns:
-        layer_info: 各レイヤーのファイル情報辞書
+        layer_info: File info dictionary for each layer
     """
 
     num_layers = specs["num_hidden_layers"]
@@ -246,17 +246,17 @@ def split_model(
         log("DRY-RUN", f"lm_head.{ext}")
         return {}
 
-    # 出力ディレクトリを事前に作成
+    # Create output directory in advance
     output_dir.mkdir(parents=True, exist_ok=True)
     ext = 'safetensors' if weight_format == 'safetensors' else 'pt'
 
-    # 既存の分割情報をロード
+    # Load existing split info
     info_path = output_dir / "split_info.json"
     existing_info: dict[str, Any] = {}
     if info_path.exists():
         existing_info = json.loads(info_path.read_text())
 
-    # 全レイヤーが既に完了している場合は何もしない
+    # Do nothing if all layers are already complete
     all_complete = True
     for i in range(num_layers):
         if not _is_layer_complete(output_dir, i, weight_format) or f"layer_{i}" not in existing_info:
@@ -268,7 +268,7 @@ def split_model(
         info_path.write_text(json.dumps(existing_info, indent=2, ensure_ascii=False))
         return existing_info
 
-    # Hugging Face からモデルをダウンロード（キャッシュ已有れば再利用）
+    # Download model from Hugging Face (reuse if already cached)
     local_path = _download_model(model_name)
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -280,7 +280,7 @@ def split_model(
 
     all_weights = model.state_dict()
 
-    # レイヤープレフィックスの自動検出
+    # Auto-detect layer prefix
     if layer_prefix is None:
         layer_prefix = detect_layer_prefix(all_weights)
 
@@ -292,7 +292,7 @@ def split_model(
         max_idx = max(layer_indices)
         log("INFO", f"Layer range: {min(layer_indices)}-{max_idx}")
 
-    # 既存のレイヤーをスキップ
+    # Skip existing layers
     skipped = 0
     layer_info: dict[str, dict[str, Any]] = {}
 
@@ -327,7 +327,7 @@ def split_model(
     if skipped > 0:
         log("INFO", f"Skipped existing layers: {skipped}/{num_layers}")
 
-    # 特殊レイヤー
+    # Special layers (embed_tokens, lm_head, norm)
     embed_key = detect_embed_key(all_weights)
     if embed_key is not None:
         fname = f"embed_tokens.{ext}"
@@ -356,7 +356,7 @@ def split_model(
             log("INFO", f"Skip existing: {fname}")
         layer_info["lm_head"] = {"file": fname, "keys": [lm_head_key]}
 
-    # final norm (Gemma-4: model.language_model.norm.weight)
+    # Final norm (Gemma-4: model.language_model.norm.weight)
     norm_key = "model.language_model.norm.weight"
     if norm_key in all_weights:
         fname = f"norm.{ext}"
@@ -371,7 +371,7 @@ def split_model(
             log("INFO", f"Skip existing: {fname}")
         layer_info["norm"] = {"file": fname, "keys": [norm_key]}
 
-    # 分割情報を保存
+    # Save split info
     info_path.write_text(json.dumps(layer_info, indent=2, ensure_ascii=False))
     log("INFO", f"Split info saved: {info_path}")
 
@@ -379,7 +379,7 @@ def split_model(
 
 
 def main() -> None:
-    """Hugging Face モデルをダウンロード・分割する"""
+    """Download and split Hugging Face model."""
 
     parser = argparse.ArgumentParser(description="Split HF model for pipeline parallelism")
     parser.add_argument(
@@ -416,10 +416,10 @@ def main() -> None:
     log("INFO", "Hugging Face Model Split Tool")
     log("STEP", "=" * 60)
 
-    # モデル仕様取得
+    # Get model specs
     specs = get_model_specs(model_name, overrides, dry_run=args.dry_run)
 
-    # モデル分割
+    # Split model
     split_model(
         model_name=model_name,
         output_dir=output_dir,
