@@ -43,7 +43,10 @@ _EMPTY_EMBED_STATS: dict[str, float | None] = {
 # ====================================================================
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_RANK0_LINE_RE = re.compile(r"^\[R0 \w+\] (.*)$")
+# 任意 rank のログ行プレフィックス．`pipeline_inference.py` の `_log`（print("[R{rank} {tag}] {msg}")）
+# が出す本物のレコードは必ずこの形式で始まる．マッチしない行は，直前レコードの本文に埋め込まれた
+# 生の改行（例: 複数行 RESULT の継続行）とみなす（下記 `_extract_rank0_messages` 参照）．
+_LOG_LINE_RE = re.compile(r"^\[R(\d+) (\w+)\] (.*)$")
 _PROMPT_START_RE = re.compile(r"^Rank 0: prompt='")
 _PROMPT_TOKENS_EMBED_RE = re.compile(
     r"^Rank 0: prompt tokens=(\d+),.*mean=([-\d.eE]+) std=([-\d.eE]+) "
@@ -52,19 +55,43 @@ _PROMPT_TOKENS_EMBED_RE = re.compile(
 _STEP_DONE_RE = re.compile(r"^Rank 0: step (\d+) done token=(\d+) dt=([\d.]+)s$")
 _DECODING_RE = re.compile(r"^Rank 0: decoding (\d+) generated tokens \(prompt=(\d+)\)")
 _DECODED_RE = re.compile(r"^Rank 0: decoded in ([\d.]+)s:")
-_RESULT_RE = re.compile(r"^Request response: '(.*)$")
+# RESULT 本文は改行を含み得る（`_log` は改行をエスケープせず生のまま print するため）．
+# `_extract_rank0_messages` で継続行を `\n` 連結済みの 1 論理メッセージを渡す前提で，
+# re.DOTALL により `.` を改行にもマッチさせ，全文を group(1) で捕捉する．
+_RESULT_RE = re.compile(r"^Request response: '(.*)$", re.DOTALL)
 
 
 def _extract_rank0_messages(log_text: str) -> list[str]:
-    """ANSI 除去後，rank0（`[R0 LEVEL] ...`）行のメッセージ部分のみを順序を保って抽出する．"""
+    """ANSI 除去後，継続行を結合した rank0（`[R0 LEVEL] ...`）論理メッセージを順序を保って抽出する．
 
-    messages: list[str] = []
+    `[R{rank} LEVEL] ...` に一致する行を新しい論理レコードの開始とみなし，一致しない行は
+    直前レコードの本文へ `\n` で連結する継続行として扱う（RESULT 等の応答本文に埋め込まれた
+    生の改行が，プレフィックス無しの物理行として出力されるため）．先頭プレフィックスより前に
+    現れる行や，現在レコードが無い状態の継続行は捨てる．全レコードを構築した後，rank0（`R0`）の
+    レコードのみを本文（結合済み）で返す．
+    """
+
+    records: list[tuple[int, str]] = []
+    current_rank: int | None = None
+    current_lines: list[str] = []
+
+    def _flush_current_record() -> None:
+        if current_rank is not None:
+            records.append((current_rank, "\n".join(current_lines)))
+
     for raw_line in log_text.splitlines():
         clean_line = _ANSI_RE.sub("", raw_line)
-        match = _RANK0_LINE_RE.match(clean_line)
+        match = _LOG_LINE_RE.match(clean_line)
         if match:
-            messages.append(match.group(1))
-    return messages
+            _flush_current_record()
+            current_rank = int(match.group(1))
+            current_lines = [match.group(3)]
+        elif current_rank is not None:
+            current_lines.append(clean_line)
+        # else: 先頭プレフィックスより前の行は継続先レコードが無いため捨てる．
+    _flush_current_record()
+
+    return [text for rank, text in records if rank == 0]
 
 
 def _split_into_blocks(messages: list[str]) -> list[list[str]]:
@@ -83,7 +110,12 @@ def _split_into_blocks(messages: list[str]) -> list[list[str]]:
 
 
 def _extract_result_text(block: list[str]) -> str | None:
-    """ブロック内の `[R0 RESULT] Request response: '...'` 行から応答テキスト（先頭 100 文字）を取り出す．"""
+    """ブロック内の `[R0 RESULT] Request response: '...'` メッセージから応答テキストを取り出す．
+
+    ログ本文は `pipeline_inference.py` 側で先頭 100 文字に truncate 済み（`result[:100]`）．
+    応答が複数行の場合，継続行は `_extract_rank0_messages` で `\n` 連結済みのため，
+    `_RESULT_RE`（`re.DOTALL`）で全文を 1 回のマッチとして捕捉できる．
+    """
 
     for msg in reversed(block):
         match = _RESULT_RE.match(msg)
@@ -101,8 +133,15 @@ def _select_relevant_block(
     """複数ブロックの中から今回の実行に対応するブロックを選ぶ．
 
     既定では末尾（最新）のブロックを採用する．`predict_result` が与えられた場合は，
-    RESULT 行の先頭 100 文字が `predict_result` の先頭と一致するブロックを優先する
-    （防御的照合．並行実行の断片が末尾に混入していても取り違えないため）．
+    RESULT 行のスニペット（ログ側は先頭 100 文字で truncate 済み）で predict_result が
+    始まる（前方一致）ブロックを優先する（防御的照合．並行実行の断片が末尾に混入していても
+    取り違えないため）．
+
+    両辺は比較前に `.strip()` する．SSH 経路（`predict.py` の `send_prompt_ssh` は
+    `.stdout.strip()` 済み）と HTTP 経路（`send_prompt_http` は未 strip）とで
+    predict_result の前後空白の有無が非対称なため，照合側で吸収する．完全一致（`==`）ではなく
+    前方一致にするのは，ログ側スニペットが 100 文字で truncate されており，predict_result
+    全文の方が長く続き得るため．
     """
 
     warnings: list[str] = []
@@ -113,9 +152,16 @@ def _select_relevant_block(
     if predict_result is None:
         return latest_block, warnings
 
-    expected_prefix = predict_result[:100]
+    predict_norm = predict_result.strip()
     for block in reversed(blocks):
-        if _extract_result_text(block) == expected_prefix:
+        snippet = _extract_result_text(block)
+        if snippet is None:
+            continue
+        snippet_norm = snippet.strip()
+        if not snippet_norm:
+            # 空スニペット（照合材料が無い）は誤って全ブロックに一致してしまうため対象外とする．
+            continue
+        if predict_norm.startswith(snippet_norm):
             if block is not latest_block:
                 warnings.append(
                     "RESULT text of the latest block did not match the predict "

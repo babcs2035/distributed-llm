@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from collect_results import (
+    _extract_rank0_messages,
     _extract_result_text,
     _percentile,
     _select_relevant_block,
@@ -161,6 +162,150 @@ def test_extract_result_text_returns_none_when_no_result_line() -> None:
 
     block = ["Rank 0: prompt='A'", "Rank 0: step 0 done token=1 dt=0.1s"]
     assert _extract_result_text(block) is None
+
+
+# ====================================================================
+# 複数行 RESULT 対応（Iteration 2: T1〜T6）
+# ====================================================================
+
+
+def test_extract_rank0_messages_joins_continuation_lines_into_one_record() -> None:
+    """T1: プレフィックス行＋継続行（プレフィックス無し）が 1 論理レコードへ `\n` 連結される．
+
+    先頭プレフィックスより前に現れる行（継続先レコードが無い状態の継続行）は捨てられる．
+    """
+
+    log_text = (
+        "orphan continuation line before any prefix\n"
+        "[R0 RESULT] Request response: 'Hello! How can I help you today?\n"
+        "thought\n"
+        "'\n"
+    )
+
+    messages = _extract_rank0_messages(log_text)
+
+    assert messages == [
+        "Request response: 'Hello! How can I help you today?\nthought\n'"
+    ]
+
+
+def test_extract_result_text_restores_multiline_body_and_strips_closing_quote() -> None:
+    """T2: 複数行本文（例: Iteration 1 の実観測に類似したケース）を先頭行だけでなく全文で復元する．"""
+
+    block = [
+        "Rank 0: prompt='Hello!'",
+        "Request response: 'Hello! How can I help you today?\nthought\n'",
+    ]
+
+    assert _extract_result_text(block) == "Hello! How can I help you today?\nthought\n"
+
+
+def test_extract_result_text_does_not_break_on_apostrophe_inside_multiline_body() -> None:
+    """T2 補足: 応答本文に `'`（例: `I'm`）が含まれても，DOTALL greedy マッチが途中で切れない（回帰）．"""
+
+    block = ["Request response: 'I'm fine\nthanks\nfor asking'"]
+
+    assert _extract_result_text(block) == "I'm fine\nthanks\nfor asking"
+
+
+def test_parse_rank0_log_multiline_result_matches_without_fallback_warning() -> None:
+    """T3: Iteration 1 で実際に観測された複数行 RESULT を再現し，フォールバック警告が出ないことを確認する．
+
+    修正前は `_extract_rank0_messages` が継続行（`thought`）を捨て，`_select_relevant_block` の
+    `==` 照合が改行差で必ず失敗してフォールバック警告
+    （`no block's RESULT text matched the predict result prefix; used the latest block as a fallback`）
+    を出していた（journal.md Iteration 1「実験」参照）．この回帰が再発しないことを守る．
+    """
+
+    log_text = (
+        "[R0 INFO] Rank 0: prompt='Hello!'\n"
+        "[R0 INFO] Rank 0: prompt tokens=15, embedding shape=torch.Size([1, 15, 4096]) "
+        "mean=0.004217 std=1.108908 min=-15.312500 max=16.875000\n"
+        "[R0 INFO] Rank 0: step 0 done token=101 dt=26.012s\n"
+        "[R0 INFO] Rank 0: step 1 done token=102 dt=7.015s\n"
+        "[R0 INFO] Rank 0: decoding 15 generated tokens (prompt=15)...\n"
+        "[R0 INFO] Rank 0: decoded in 0.000s: 'ok'\n"
+        "[R0 RESULT] Request response: 'Hello! How can I help you today?\n"
+        "thought\n"
+        "'\n"
+    )
+    # send_prompt_ssh（predict.py）は .stdout.strip() 済みの戻り値を返す（末尾改行無し）．
+    predict_result = "Hello! How can I help you today?\nthought"
+
+    parsed = parse_rank0_log(log_text, predict_result=predict_result)
+
+    assert parsed.parse_ok is True
+    assert parsed.parse_warnings == []
+    assert parsed.result_text_snippet == "Hello! How can I help you today?\nthought\n"
+
+
+def test_select_relevant_block_matches_both_ssh_stripped_and_http_unstripped_predict_result() -> None:
+    """T4: SSH 経路（strip 済み）と HTTP 経路（末尾改行未 strip）の両方で照合が成功する．"""
+
+    block = [
+        "Rank 0: prompt='Hello!'",
+        "Request response: 'Hello! How can I help you today?\nthought\n'",
+    ]
+
+    ssh_style_result = "Hello! How can I help you today?\nthought"  # strip 済み
+    http_style_result = "Hello! How can I help you today?\nthought\n"  # 末尾改行未 strip
+
+    ssh_block, ssh_warnings = _select_relevant_block([block], predict_result=ssh_style_result)
+    http_block, http_warnings = _select_relevant_block([block], predict_result=http_style_result)
+
+    assert ssh_block == block and ssh_warnings == []
+    assert http_block == block and http_warnings == []
+
+
+def test_select_relevant_block_picks_earlier_block_when_correct_block_is_not_latest() -> None:
+    """T5: 正しいブロックが「最新」ではない順序で並んでいても，取り違えずに選択される．
+
+    ②（レバー掃引で複数 run が同一コンテナに連続する）で別 run 指標を誤レバーに紐付ける
+    リスクが無いことの検証．
+    """
+
+    matching_older_block = [
+        "Rank 0: prompt='Hi'",
+        "Rank 0: step 0 done token=1 dt=0.1s",
+        "Request response: 'Hello! How can I help you today?\nthought\n'",
+    ]
+    unrelated_newer_block = [
+        "Rank 0: prompt='Something else'",
+        "Rank 0: step 0 done token=9 dt=0.2s",
+        "Request response: 'Different response\n'",
+    ]
+    predict_result = "Hello! How can I help you today?\nthought"
+
+    block, warnings = _select_relevant_block(
+        [matching_older_block, unrelated_newer_block], predict_result=predict_result,
+    )
+
+    assert block == matching_older_block
+    assert any("used an earlier block" in w for w in warnings)
+
+
+def test_select_relevant_block_empty_snippet_guard_does_not_vacuously_match_latest() -> None:
+    """T6: 空スニペット（RESULT が空文字）に対する防御ガードが機能し，誤って前方一致しない．
+
+    ガードが無い場合，空文字は任意の文字列の `startswith` として常に真になり，latest ブロック
+    （RESULT 空）が「一致ブロック」として即座に採用されてしまう（正しいブロックを取り違える）．
+    """
+
+    matching_older_block = [
+        "Rank 0: prompt='A'",
+        "Request response: 'Hello'",
+    ]
+    empty_result_latest_block = [
+        "Rank 0: prompt='B'",
+        "Request response: ''",
+    ]
+
+    block, warnings = _select_relevant_block(
+        [matching_older_block, empty_result_latest_block], predict_result="Hello",
+    )
+
+    assert block == matching_older_block
+    assert any("used an earlier block" in w for w in warnings)
 
 
 # ====================================================================

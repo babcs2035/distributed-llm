@@ -6,6 +6,559 @@ research-cycle が読み書きする実験ジャーナル．**新しいイテレ
 
 ---
 
+## Iteration 2
+
+### 考察・次計画 (Iter2)
+
+**担当**: 考察・次計画 subagent（2026-07-18）．分析(解釈) の結論（本ブロック `### 分析(解釈) (Iter2)`）を受け，
+本イテレーションの単一レバー「RESULT 複数行対応による照合ロジックの頑健化」の採否を確定し，次イテレーションの
+方向を決めた．実機への新規接続・実行はしていない（記録の読み取りとコミット操作のみ）．
+
+**1. 採否判定: 採用（adopt）**
+
+- **判定根拠**: 計画 §4 の成功条件 5 件をすべて機械的に充足している（分析(解釈) §1 の検証表）．具体的には，
+  (1) pytest 30 passed（既存 23 + 新規 7，failed/error 0，実験フェーズが独立再実行で再現），
+  (2) T3 で `parse_warnings == []`（Iter1 実観測の複数行 RESULT でフォールバック警告が消える），
+  (3) T5 で正ブロック選択（最新でない並びでも取り違えない），(4) `py_compile` 構文健全，
+  (5) スコープ厳守（`tools/collect_results.py`／`tests/test_collect_results.py` の 2 コードファイルのみ）．
+- **追加反復の要否**: 不要．本イテレーションはパース純関数に閉じたコード修正のみで判定が決定的（測定ノイズ無し）で
+  あり，1 回の独立再実行で確定済み．追加反復で得られる情報は無い．
+- **このレバーの収束状況**: 「照合ロジックの頑健化」というレバー（Iter1 で採用した結果永続化基盤の信頼性を高める
+  延長線）について，Iter1 分析(解釈) が指摘した高リスク（複数行 RESULT による弁別機構の常時無効化）は，根源(T3)・
+  実作動(T5)・抜け穴(T4/T6) をカバーする回帰テストで**単体テストレベルでは解消**した．collect_results.py に閉じた
+  頑健化として本レバーは**やり切った（このファイル内でこれ以上動かす対象は無い）**と判断する．
+
+**2. 残存リスク（次イテレーション以降へ引き継ぐ）**
+
+- **実機 end-to-end 未検証（最大の残存点）**: 妥当性は「調査・実験フェーズが読み取った実ログ形式を T3 が忠実に
+  再現している」ことに依存する．実機で「フォールバック警告が実際に消える」ことの最終確認は，②の最初の承認済み
+  実 run に畳み込む方針（本イテレーションでは未実施）．次に実機を叩く際の要確認点は分析(解釈) §3 に列挙済み．
+- **`docker logs -t` 前提**: 継続行結合方式は継続行が素の本文であることに依存する．将来 `-t`（タイムスタンプ）を
+  足すと方式が壊れる（設計上のトレードオフとして残す）．
+- **未着手項目**: (b) levers 記録の堅牢化（P1，未解決），(c) レバー値あたり n≥3〜5 反復，(d) 主指標 ITL/TTFT の採用．
+  (c)(d) は②の実験設計条件で②内で担保するが，(b) は②の妥当性に直結する独立の欠陥である（下記 3）．
+
+**3. 次に振るレバーの決定: Iteration 3 = backlog B3 の P1（levers 記録の堅牢化）を先行**
+
+- **決定**: research_frontier②（マイクロバッチ数・stagger interval のスループット感度分析）へ直行せず，
+  **Iteration 3 として P1（levers 記録の堅牢化）を先に挟む**．分析(解釈) §4 の推奨を採用する．
+- **根拠**: ②の本題は `NUM_MICRO_BATCHES`／`STAGGER_INTERVAL` を実際に振ることであり，「振ったレバー値が正しく
+  記録されること自体」が比較の大前提である．本イテレーションで (a) 取り違え（RESULT 複数行照合）は解消したが，
+  (b) levers 記録は今も収集ツール実行時の env/config 由来で「コンテナ起動時 env と収集時 env の一致」を暗黙仮定して
+  いる．②で env が不一致になると，取り違えを直しても別経路で「どの run がどのレバー値だったか」が汚染され，比較の
+  妥当性が根本から崩れる．頑健化の順序として (a)→(b)→② が筋が通る（片方だけ直して掃引に入ると結論が別要因で汚れる）．
+- **P1 の実装方針（B3 記載）**: `pipeline_inference.py` 起動時に有効な実行設定（levers）を 1 行 INFO ログで出力し，
+  収集側（`collect_results.py`）がそのログ行から levers を確定する．これにより env 由来の暗黙仮定を排除する．
+- **可逆性**: 掃引前の頑健化順序の選択であり可逆．backlog に `[auto-decided]` として記録した（自動判断とした）．
+
+**4. 要人間判断（オーケストレータへの申し送り）**
+
+- P1 は Iter1・Iter2 の「`collect_results.py` に閉じた・非侵襲・クラスタ非接触」という性質とは異なり，
+  **ホットパス（`pipeline_inference.py`）改変・再デプロイを伴う**（Iter1 考察・次計画で明記済み）．起動時 1 行 INFO
+  追加自体は graph-break リスクの低い変更だが，動作確認には `mise run deploy`（再デプロイ）＋推論実行が必要になる
+  可能性が高い．
+- したがって **Iteration 3 のフェーズ4（実験）へ進む前に，backlog B1 の合意（実機への deploy/推論実行を伴う実験の
+  前に必ず一度 Slack で確認を仰ぐ）に基づく人間確認が必須**である．Iteration 3 のフェーズ1〜3（調査・計画・実装）は
+  コードのみで進められるが，フェーズ4の直前でオーケストレータが人間確認を挟むこと．この点を，state.json の status は
+  `running`（次レバーは確定済み）としつつ，実験フェーズ手前でのブロックが必要になる旨として明示的に申し送る．
+
+---
+
+### 分析(解釈) (Iter2)
+
+**担当**: 分析(解釈) subagent（2026-07-18）．`## Iteration 2` の全ブロック（調査・計画・実装・実験）を読み，
+計画フェーズが定めた成功条件（`### 計画 (Iter2)` §4 の 1〜5）に照らした成否判定，Iter1 分析(解釈)が指摘した
+高リスクの低減度，残存リスク，次イテレーション方針を解釈した．実機への新規接続・実行はしていない（記録の読み取りのみ）．
+
+**前提（判定の枠組み）**: 本イテレーションはパース純関数に閉じたコード修正のみで，判定はすべて**決定的**
+（測定ノイズを伴わない単体テストの pass/fail・`git diff --name-only` の集合一致）である．したがって Iter1 で
+問題になった「n が小さくノイズ幅が未知」という論点は本イテレーションには当てはまらず，ノイズ/信号の切り分けは
+不要（ばらつきの概念が該当しない）．評価はテストの**具体的な検証内容とカバレッジの範囲**で行う．
+
+**1. 成否判定（計画 §4 の成功条件 1〜5 の機械的検証）**
+
+| # | 成功条件（計画 §4） | 実装・実験フェーズの記録 | 判定 |
+|---|---|---|---|
+| 1 | pytest green・既存 23 件 pass のまま・新規 6 件以上 pass（計 29 件以上・failed/error 0） | 実装フェーズ 30 passed，実験フェーズが独立再実行で 30 passed を再現（FAILED/ERROR 0） | 満たす |
+| 2 | T3 で `parse_warnings == []`（Iter1 実観測の複数行 RESULT でフォールバックが消える） | 実験フェーズが T3 本文（`tests/test_collect_results.py:211-239`）を直接確認し `assert parsed.parse_warnings == []` の存在と PASSED を確認 | 満たす |
+| 3 | T5 で正しいブロック選択（`used an earlier block` 警告・取り違えない） | `test_select_relevant_block_picks_earlier_block_when_correct_block_is_not_latest` PASSED を実験フェーズが確認 | 満たす |
+| 4 | `py_compile` で構文健全性（lint/型は未導入） | 実装フェーズが `py_compile` エラー無しを確認 | 満たす |
+| 5 | スコープ厳守（変更が `collect_results.py` と `test_collect_results.py` の 2 ファイルのみ） | 実験フェーズが `git status --short` で 2 コード変更ファイルのみ・新規 `.log` 無しを確認（journal/state 更新は運用上のもの） | 満たす |
+
+- 成功条件 5 件すべてを充足．新規テストは計画の T1〜T6（最低 6 件）に対し**7 件**（T2 に応答本文中の `'` を含む
+  DOTALL greedy 回帰を 1 件追加），合計 30 件が pass．「29 件以上」の下限を 1 件上回る．
+- **判定: 採用相当（コードレベルの完了条件をすべて満たす）**．修正が純関数に閉じ・判定が決定的であるため，
+  この結論に追加反復は不要（1 回の独立再実行で確定済み）．
+
+**2. Iter1 分析(解釈)が指摘した高リスクの低減度**
+
+Iter1 分析(解釈)（`### 分析(解釈) (Iter1)` §2・§3）は，②着手前の高リスクとして「複数行 RESULT により防御的照合
+（`predict_result[:100]` とログ RESULT テキストの `==`）が常時失敗し，弁別機構が事実上無効化 → ②の複数 run 連続実行で
+**別 run の指標を誤ったレバー値へ紐付ける（correctness を直接損なう高リスク）**」を挙げていた．今回の修正の低減度を，
+(a) テストカバレッジと (b) 実ログ形式の理解の正確さの両面で評価する．
+
+- **(a) テストカバレッジ**: 弁別機構が復活するには修正 3 点（継続行結合・DOTALL・両辺 strip＋前方一致）が
+  連動する必要がある（調査フェーズの指摘）．対応する回帰テストが個別に存在する:
+  - T3 が「複数行 RESULT でフォールバック警告が消える（`parse_warnings == []`）」ことを直接 assert
+    ＝弁別機構が常時失敗する根源を潰したことの検証．
+  - T5 が「正ブロックが最新でない並びで取り違えず選択」＝**②で顕在化する取り違えの実作動**を直接検証
+    （Iter1 が「複数ブロックが並ぶ②で初めて実害になる」と述べた当該ケース）．
+  - T4（SSH strip 済み／HTTP 未 strip の両経路で一致）・T6（空スニペットの vacuous match ガード）が，
+    Iter1 が「複数行だけでなく predict 側正規化差も効く」と指摘した strip 差・空一致の抜け穴を閉じる．
+  → Iter1 が挙げた失敗要因（複数行・SSH/HTTP strip 差・100 文字 truncate 差・vacuous match）が個別ケースで
+    カバーされており，弁別機構の復活は回帰テストで守られている．
+- **(b) 実ログ形式の理解の正確さ**: T3 の入力は，実験(Iter1) が rank0 の生 `docker logs` を直接確認して記録した
+  実観測形式（`[R0 RESULT] Request response: 'Hello! How can I help you today?`／改行／`thought`／改行／`'`＝先頭行のみ
+  プレフィックス・継続行はプレフィックス無し）を忠実に再現している．継続行結合方式の前提（本物のレコードは
+  `_log`（`pipeline_inference.py:180-192`）が必ず `[R\d+ \w+]` 始まりで出す・RESULT は `print` 1 回で埋め込み改行込み
+  まるごと出るため継続行が先頭直後に連続し別レコードが割り込まない）も，調査フェーズがコード出典付きで確認済み．
+  → 実ログ形式の理解は実観測とコード読解の両方に裏付けられており，T3 の再現は「机上の想定」ではなく実測に忠実．
+- **結論**: Iter1 が指摘した「複数行 RESULT による弁別機構の常時無効化」という高リスクは，**単体テストレベルでは
+  解消された**と言える（根源 T3・実作動 T5・抜け穴 T4/T6 をカバー）．ただし後述のとおり実機 end-to-end での
+  最終確認は未了である．
+
+**3. 残存リスクと end-to-end 未検証の意味**
+
+- **実機 end-to-end 未検証（最大の残存点）**: 今回の妥当性は「調査・実験フェーズが読み取った実ログ形式を
+  T3 が忠実に再現している」ことに依存する．計画 §5・実装の申し送りどおり，実機で「フォールバック警告が実際に
+  消える」ことの最終確認は②の最初の承認済み実 run に畳み込む方針であり，本イテレーションでは未実施．
+  → **次に実機で①/②を叩く際に注意深く見るべき点**:
+  1. 複数行応答が返る run で `parse_warnings` が実際に空になるか（T3 の実機再現）．
+  2. 複数 run を連続送信したとき，`run_id` と `result_text` の対応が保たれ，正しいブロックが選ばれるか
+     （T5 の実機再現＝取り違え防止の本番作動）．
+  3. `--since` 窓の粒度（秒未満の連投で同一窓に複数ブロックが残らないか．残る場合こそ弁別機構が試される）．
+  4. rank0 コンテナのログに他 rank 行や想定外プレフィックスの割り込みが無いか（継続行結合の前提の実地確認）．
+- **`docker logs -t` 前提**: 現状 `collect_rank0_log` は `-t`（タイムスタンプ）を付けておらず継続行が素の本文で
+  あることが継続行結合方式の前提．将来 `-t` を足すと継続行にも時刻プレフィックスが付き方式が壊れる（調査・実装が
+  申し送り済み）．②以降でブロック分離を時刻で堅くしたくなった場合の設計上のトレードオフとして残る．
+- **今回の修正の対象外で未解決の項目（Iter1 分析(解釈) §3 の 4 条件のうち残り 3 つ）**:
+  - **(b) levers 記録の堅牢化**: 未着手．`levers` は今も収集ツール実行時の env/config 由来で，「コンテナ起動時 env と
+    収集時 env の一致」を暗黙仮定する．②は `NUM_MICRO_BATCHES`／`STAGGER_INTERVAL` を実際に振るため，この仮定が
+    崩れると**記録レバーが実レバーと食い違い，比較の妥当性が根本から崩れる**（P1 の対象）．
+  - **(c) レバー値あたり n≥3〜5 反復でノイズ幅確立**・**(d) truncation に強い主指標 ITL/TTFT の採用**: いずれも
+    ②の実験設計条件であり，本イテレーション（コード修正）の対象外．②着手時に満たすべき前提として引き続き有効．
+  - loop-detection truncation・繰り返しパターン検出はモデル/推論エンジン側の挙動で，収集ツールの範囲外（Iter1 で確認済み）．
+
+**4. 次イテレーションへの示唆（②直行か Iteration 3=P1 先行か）**
+
+backlog B3 に残る 2 択（Iteration 3=P1「levers 記録堅牢化」を先に挟む ／ research_frontier②「レバー掃引」へ直行）を，
+Iter1 分析(解釈) §3 が挙げた②着手前の 4 条件の充足状況から判断する．
+
+- (a) RESULT 複数行照合の修正 → **本イテレーションで解消**（上記 1・2）．
+- (b) levers 記録の堅牢化 → **未解決**（上記 3）．
+- (c) n≥3〜5 反復・(d) 主指標 ITL/TTFT → ②の実験設計条件（②内で担保）．
+
+**示唆: ②へ直行せず，Iteration 3 として P1（levers 記録堅牢化）を先に挟むことを推奨する．** 理由:
+
+- ②の本題は `NUM_MICRO_BATCHES`／`STAGGER_INTERVAL` を実際に振ることであり，**振ったレバー値が正しく記録される
+  こと自体が比較の大前提**である．(a) の取り違えを直しても，(b) が未解決だと env 不一致という別経路で「どの run が
+  どのレバー値だったか」が汚染され得る．Iter1 分析(解釈) が (b) を「②の妥当性に直結する」と明記しており，
+  頑健化の順序として (a)→(b)→② が筋が通る（片方だけ直して掃引に入ると結論が別要因で汚れる）．
+- P1 はホットパス外の起動時 1 行 INFO 追加で graph-break リスクは低いが，`pipeline_inference.py` 改変・**再デプロイを
+  伴う**ため，②同様に実機接続（B1 の人間確認）が必要になる点は Iteration 3 の性質として reflector へ申し送る．
+- **代替（②直行）の余地**: 「env 一致を毎 run 検証する軽量策＋run 厳密直列化＋狭い since 窓＋n≥3＋主指標 ITL/TTFT」を
+  運用規約として固めれば②直行も不可能ではない（B3 の別案）．ただし運用規約依存で堅牢性は P1 実装に劣り，
+  levers 誤記録の検出はできない．P1 先行を推奨とし，②直行は「実機接続コストを一度に払いたい」場合の次善とする．
+- なお②・P1 いずれも実機接続（deploy/掃引 run）を伴うため，Iter1・Iter2 の「コードのみ」フェーズとは性質が変わり，
+  B1 に基づく人間確認が必須になる．これは reflector が次計画を確定する際の分岐点として重要．
+
+**次フェーズ（考察・次計画 reflector）への結論（採用/棄却/追加反復/レバー収束の材料）**
+
+- **採用（adopt）が妥当**: 計画 §4 の成功条件 5 件をすべて機械的に充足（30 件 pass・T3 で `parse_warnings==[]`・
+  T5 で取り違え回避・スコープ 2 ファイル厳守）．判定は決定的で**追加反復は不要**．
+- **リスク低減**: Iter1 が指摘した「複数行 RESULT による弁別機構の常時無効化（②の取り違え高リスク）」は，根源(T3)・
+  実作動(T5)・抜け穴(T4/T6) をカバーする回帰テストで**単体テストレベルでは解消**．実ログ形式の再現も実観測に忠実．
+- **残存リスク**: 実機 end-to-end 未検証（②の初 run で T3/T5 の実機再現を要確認），`docker logs -t` 前提，および
+  (b) levers 記録堅牢化・(c) n≥3 反復・(d) 主指標 ITL/TTFT が未解決（今回の対象外）．
+- **次イテレーション**: ②へ直行せず **Iteration 3=P1（levers 記録堅牢化）を先に挟むことを推奨**（(a) は解消したが
+  (b) が②の妥当性に直結・未解決のため）．②・P1 いずれも実機接続を伴い B1 の人間確認が必要になる点を申し送る．
+
+---
+
+### 実験 (Iter2)
+
+**担当**: 実験フェーズ subagent（2026-07-18）．計画フェーズの判断（本ブロック下 `### 計画 (Iter2)` §5）
+どおり，本イテレーションは**実機クラスタへの接続・deploy/推論実行を伴わないコードレベル検証**として実施した．
+実装フェーズが報告した結果（30 件 pass）の独立した再現確認と，スコープ・テスト内容の事実確認のみを行った．
+
+**1. 独立実行によるテスト結果の再現確認**
+
+```
+uv run pytest tests/test_collect_results.py -v
+============================== 30 passed in 0.04s ==============================
+```
+
+実装フェーズの報告（30 件 pass，failed/error 0）と一致した．全 30 件のテスト名を `-v` 出力で確認し，
+`FAILED`/`ERROR` は 0 件．
+
+**2. スコープ確認（`git diff --name-only`）**
+
+```
+git status --short
+ M .claude/research/journal.md
+ M .claude/research/state.json
+ M tests/test_collect_results.py
+ M tools/collect_results.py
+?? .claude/research/agent.json
+```
+
+コード変更ファイルは `tools/collect_results.py` と `tests/test_collect_results.py` の 2 ファイルのみ
+（`git diff --stat` で `tools/collect_results.py` は 70 行変更・`tests/test_collect_results.py` は 145 行追加
+のみで削除 0，新規テスト追記であることと整合）．`.claude/research/journal.md`／`state.json` の変更は
+research-cycle の各フェーズが自身の記録を追記する運用上の更新であり，実装スコープ（`pipeline_inference.py`／
+`tools/predict.py`／`tools/common.py`／`mise.toml`／JSONL スキーマ）には含まれない．`git status` に新規
+`.log` ファイルは現れず，`.gitignore` の `*.log` トラップ回避も維持されていることを確認した．
+
+**3. Iteration 1 で観測された複数行 RESULT ケース（T3 等）の動作確認**
+
+`-v` 出力から，複数行 RESULT に関連するテストが全て個別に PASSED であることを確認した．
+
+- `test_extract_rank0_messages_joins_continuation_lines_into_one_record` — PASSED
+- `test_extract_result_text_restores_multiline_body_and_strips_closing_quote` — PASSED
+- `test_extract_result_text_does_not_break_on_apostrophe_inside_multiline_body` — PASSED
+- `test_parse_rank0_log_multiline_result_matches_without_fallback_warning`（T3，Iteration 1 実験で実際に
+  観測された `"Hello! How can I help you today?\nthought"` 複数行応答を再現）— PASSED
+- `test_select_relevant_block_matches_both_ssh_stripped_and_http_unstripped_predict_result`（T4）— PASSED
+- `test_select_relevant_block_picks_earlier_block_when_correct_block_is_not_latest`（T5）— PASSED
+- `test_select_relevant_block_empty_snippet_guard_does_not_vacuously_match_latest`（T6）— PASSED
+
+該当テストの本文（`tests/test_collect_results.py:211-239`）を直接確認し，T3 は
+`assert parsed.parse_warnings == []` を明示的に検証していることを確認した．これは Iteration 1 実験の
+「実験 (Iter1)」ブロックで実際に観測された警告
+（`no block's RESULT text matched the predict result prefix; used the latest block as a fallback`）が，
+同一の複数行入力（`"Hello! How can I help you today?\nthought\n"`）に対して修正後は再現しないことをコード
+レベルで確認するものであり，実装フェーズの主張と整合する．
+
+**実行環境の注記**
+
+`uv run` 実行時に `VIRTUAL_ENV=/mnt/data-raid/ktakahashi/workspace/WAFL-PEFT/.venv does not match the project
+environment path .venv` という warning が出たが，`uv` は自動的に `distributed-llm/.venv` を使用しており
+（pytest の `rootdir`/実行 python パスから確認），テスト結果には影響していない．
+
+**申し送り（分析フェーズへ）**
+
+- 本フェーズは実機接続・deploy/推論実行を一切行っていない．コードレベル検証（独立再実行によるテスト再現，
+  スコープ確認，T3〜T6 の個別確認）のみで完結した．
+- 数値の良否判定（採用/不採用の結論）は行っていない．分析フェーズで，計画フェーズの成功条件（本ブロック
+  「計画 (Iter2)」§4 の 1〜5）に照らした判定を行うこと．
+
+---
+
+### 実装 (Iter2)
+
+**担当**: 実装フェーズ subagent（2026-07-18）．計画フェーズ（本ブロック直下 `### 計画 (Iter2)`）が確定した
+単一レバー「RESULT 複数行対応による照合ロジックの頑健化」を，`tools/collect_results.py` と
+`tests/test_collect_results.py` の 2 ファイルのみに最小差分で反映した．実機クラスタへの接続・
+`deploy`/`predict:demo` 実行は行っていない．
+
+**変更内容（`tools/collect_results.py`，計画どおり 3 点一体）**
+
+- **`_extract_rank0_messages`（継続行結合方式へ置換）**: `_RANK0_LINE_RE`（`^\[R0 \w+\] (.*)$`）を廃止し，
+  任意 rank に一致する新設 `_LOG_LINE_RE = re.compile(r"^\[R(\d+) (\w+)\] (.*)$")` を導入．各物理行を
+  ANSI 除去後にこの正規表現へ通し，マッチ＝新しい論理レコード開始（rank・本文を記録），非マッチかつ
+  現在レコードが存在する場合のみ本文へ `"\n" + clean_line` を連結する継続行として扱う（現在レコードが
+  無い状態の継続行，および先頭プレフィックスより前の行は捨てる）．全レコード構築後，rank0（`R0`）の
+  レコードのみを順序保持で返す．
+- **`_RESULT_RE` に `re.DOTALL` を付与**: `re.compile(r"^Request response: '(.*)$", re.DOTALL)`．
+  継続行結合済みの 1 論理メッセージに対し，複数行本文でも全文を 1 回のマッチで捕捉できる．
+  `_extract_result_text` の末尾 `'` 除去ロジックは変更していない（複数行でも閉じ `'` は論理メッセージ
+  末尾に来るため `endswith("'")` が成立し，そのまま機能する）．
+- **`_select_relevant_block` の照合を「両辺 strip＋前方一致」へ緩和**: `expected_prefix =
+  predict_result[:100]` と `==` の完全一致を廃止し，`predict_norm = predict_result.strip()` と
+  `snippet_norm = _extract_result_text(block).strip()` を用いた `predict_norm.startswith(snippet_norm)`
+  による前方一致へ変更．`snippet` が `None` または `snippet.strip() == ""`（空スニペット）の場合は
+  照合対象からスキップするガードを追加した（空文字列は任意の文字列と `startswith` が真になり誤って
+  latest ブロックへ vacuously マッチしてしまうため）．一致ブロックが最新でないときの警告
+  （`used an earlier block ...`）と，全不一致時のフォールバック警告（`used the latest block as a
+  fallback`）の文言・挙動は計画どおり維持した．
+
+**追加テスト（`tests/test_collect_results.py`，計画の T1〜T6 に加え回帰ケースを 1 件追加，計 7 件）**
+
+- T1 `test_extract_rank0_messages_joins_continuation_lines_into_one_record`: プレフィックス行＋継続行の
+  結合と，先頭プレフィックス前の孤立継続行が捨てられることを確認．
+- T2 `test_extract_result_text_restores_multiline_body_and_strips_closing_quote`: 複数行 RESULT 本文が
+  先頭行のみでなく全文で復元され，閉じ `'` が除去されることを確認．
+- T2 補足（計画外の追加）`test_extract_result_text_does_not_break_on_apostrophe_inside_multiline_body`:
+  応答本文中の `'`（`I'm`）で DOTALL greedy マッチが途中で切れないことの回帰テスト（計画の調査フェーズが
+  懸念していた non-greedy 対案の失敗パターンを greedy 版が正しく回避できることを裏付ける）．
+- T3 `test_parse_rank0_log_multiline_result_matches_without_fallback_warning`: Iteration 1 実験で実際に
+  観測された複数行 RESULT（`"Hello! How can I help you today?\nthought"`）を再現し，`parse_ok is True`
+  かつ `parse_warnings == []`（フォールバック警告が出ない）ことを確認．
+- T4 `test_select_relevant_block_matches_both_ssh_stripped_and_http_unstripped_predict_result`: SSH 経路
+  （strip 済み）・HTTP 経路（末尾改行未 strip）の両方の `predict_result` で同一ブロックに警告無く一致
+  することを確認．
+- T5 `test_select_relevant_block_picks_earlier_block_when_correct_block_is_not_latest`: 正しいブロックが
+  最新でない順序で並んでいても取り違えず選択され，`used an earlier block` 警告が出ることを確認．
+- T6 `test_select_relevant_block_empty_snippet_guard_does_not_vacuously_match_latest`: RESULT が空文字の
+  ブロックが latest 位置にあっても，空スニペットガードにより vacuous match（誤って latest を採用）が
+  起きず，正しい過去ブロックが選ばれることを確認．
+
+すべて既存フィクスチャ（`tests/fixtures/rank0_sample.log`，非改変）に頼らず，複数行ケースはテストモジュール
+内のインライン文字列で与えた．新規 `.log` フィクスチャファイルは作成していない．
+
+**テスト結果**
+
+```
+uv run pytest tests/test_collect_results.py -v
+============================== 30 passed in 0.08s ==============================
+```
+
+既存 23 件は全て pass のまま，新規 7 件（成功条件の「最低 6 件」を超過）も pass．failed/error 0．
+T3 で `parse_warnings == []` を確認し，T5 で正しいブロックが選択されることを確認した（成功条件 2・3 を充足）．
+lint/型チェッカーはこのリポジトリに未導入（Iteration 1 で確認済み，変更無し）のため，
+`uv run python -m py_compile tools/collect_results.py tests/test_collect_results.py` で構文健全性を確認した
+（エラー無し）．
+
+**スコープ確認**
+
+`git diff --name-only` で変更ファイルが `tools/collect_results.py` と `tests/test_collect_results.py` の
+2 ファイルのみであることを確認した（`pipeline_inference.py` / `tools/predict.py` / `tools/common.py` /
+`mise.toml` / JSONL スキーマは非改変）．`git status` に新規 `.log` ファイルが現れないことも確認した
+（`.gitignore` の `*.log` トラップ回避，計画どおり）．
+
+**計画からの差異（理由付き）**
+
+- 計画で列挙された T1〜T6（最低 6 件）に加え，T2 の回帰ケース（応答本文中の `'` を含むケースで
+  DOTALL greedy マッチが途中で切れないことの確認）を 1 件追加した．計画の調査フェーズが「non-greedy
+  対案は `I'm` 等の `'` で途中で切れるため不採用」と述べていた判断の妥当性を，実装した greedy 版が
+  正しく回避できることを示す形で裏付けるため，回帰の再発防止として追加した．他は計画どおりで差異は無い．
+- 既存テストの `_select_relevant_block` 関連 2 件（`falls_back_to_latest_when_no_block_matches` /
+  `prefers_matching_block_over_incomplete_latest_block`）は，`==`→`startswith` 化後も無改変のまま pass
+  することを確認した（"not-matching-anything" は "foo"/"bar" のいずれとも前方一致しないためフォールバック
+  維持，"Hello"は"Hello"と前方一致するため一致維持）．
+
+**次フェーズ（実験・分析）への申し送り**
+
+- 本イテレーションはコード実装・単体テストのみで完結し，実機実行は不要（計画フェーズの判断どおり）．
+  実機で「フォールバック警告が実際に消える」ことの最終確認は，backlog B1 の合意に基づき，
+  次回②（レバー掃引）の最初の承認済み実 run に畳み込んで行えばよい．
+- `docker logs` に将来 `-t`（タイムスタンプ）を追加する場合，継続行にも時刻プレフィックスが付き
+  「継続行結合」方式の前提（継続行はプレフィックス無し）が崩れるため，別途対応が必要になる点を
+  引き続き申し送る（調査フェーズの指摘を再掲）．
+
+---
+
+### 計画 (Iter2)
+
+**担当**: 計画フェーズ subagent（2026-07-18）．単一レバー「RESULT 複数行対応による照合ロジックの頑健化」
+（backlog B3，`tools/collect_results.py` のみ改変・`pipeline_inference.py`/`predict.py` 非改変）を，調査フェーズの
+結論（本ブロック直下 `### 調査 (Iter2)`）と実コードに照らして実装手順・追加テスト・成功条件に落とし込んだ．
+本イテレーションは**コード実装・単体テストのみ**で，実機クラスタへの deploy/推論実行は行わない．
+
+#### 1. 仮説
+
+`collect_results.py` のパース／弁別ロジックを 3 点一体で複数行 RESULT 対応にすれば，Iter1 実験で観測された
+フォールバック警告（`no block's RESULT text matched the predict result prefix; used the latest block as a fallback`）が
+生じる入力に対して**フォールバックに落ちず正しいブロックを選び**（`parse_warnings == []`），②（レバー掃引で複数 run が
+同一コンテナに連続する）で別 run 指標を誤レバーに紐付けるリスクを解消できる．修正は純関数に閉じるため単体テストで
+完了条件を組める．
+
+#### 2. 単一レバー・変更内容（`tools/collect_results.py` のみ・3 点一体）
+
+**変更ファイル**: `tools/collect_results.py`（本体），`tests/test_collect_results.py`（テスト追加）．
+`pipeline_inference.py`・`tools/predict.py`・`tools/common.py`・`mise.toml`・JSONL スキーマは**非改変**．
+
+**(i) `_extract_rank0_messages`（現 `:58-67`）を「継続行結合」方式へ置換（関数シグネチャ不変 `(log_text: str) -> list[str]`）**
+
+- 現状: `splitlines()` 各行を `_RANK0_LINE_RE = ^\[R0 \w+\] (.*)$`（`:46`）で照合し，プレフィックス行のみ残す
+  → 複数行 RESULT の継続行（プレフィックス無し）を全て捨てるのが根源．
+- 変更: **任意 rank の**行頭プレフィックスを新レコード開始とみなす正規表現を新設（案:
+  `_LOG_LINE_RE = re.compile(r"^\[R(\d+) \w+\] (.*)$")`，group1=rank・group2=本文）．各物理行を ANSI 除去
+  （`_ANSI_RE.sub`）後にこの正規表現へ通し，
+  - マッチ＝新しい論理レコード開始．`(rank, 本文)` を「現在のレコード」として開始する．
+  - 非マッチ＝継続行．**現在のレコードが存在する場合のみ**，その本文に `"\n" + clean_line` を連結する
+    （最初のプレフィックスより前に現れる行や，現在レコードが無い状態の継続行は捨てる）．
+  次のプレフィックス行が来たら現在レコードを確定し新レコードを開始する．最終行まで走査後に確定．
+  最後に **rank==0 の論理レコードの本文のみ**を順序保持で `list[str]` として返す．
+- 妥当性（調査フェーズ出典）: 本物のレコードは `_log`（`pipeline_inference.py:192`）で必ず `[R\d+ \w+]` 始まり，
+  継続行はメッセージ内の生改行のみが生む．RESULT は `print` 1 回でまるごと出るため継続行は先頭行直後に連続し，
+  途中に別レコードが割り込まない（方式の前提が壊れない）．フィクスチャの R1/R2 ノイズ行はプレフィックス付き＝
+  独立レコード扱いで rank0 抽出時に除外される．**現状 `docker logs` に `-t` は付いていない**ため全物理行が素の本文
+  （`-t` 追加時は継続行にも時刻が付き本方式が壊れるので，足すなら別対応が要る旨を申し送る）．
+
+**(ii) `_RESULT_RE`（`:55`）／`_extract_result_text`（`:85-95`）を複数行本文へ対応（シグネチャ不変）**
+
+- `_RESULT_RE` に **`re.DOTALL` を付与**: `re.compile(r"^Request response: '(.*)$", re.DOTALL)`．論理レコードが
+  複数行（例 `Request response: 'Hello! How can I help you today?\nthought\n'`）でも group1 が閉じ `'` まで含めて
+  全文を捕捉する．入力は既に (i) で 1 論理メッセージに畳まれているため，greedy `.*` が別レコードへ食い込む余地は無い
+  （非 greedy 案は応答中の `'`（例 `I'm`）で誤って切れるため不採用．調査フェーズの結論どおり）．
+- `_extract_result_text` の末尾 `'` 除去（`if text.endswith("'"): text = text[:-1]`）は現状のままで複数行に対応
+  （閉じ `'` は論理メッセージ末尾に来るため `endswith("'")` が成立）．戻り値には末尾 `\n` が残り得るが，(iii) の
+  照合で strip するため問題ない．
+
+**(iii) `_select_relevant_block`（`:98-130`）の照合を「両辺 strip＋前方一致」へ緩和（シグネチャ不変）**
+
+- 現状: `expected_prefix = predict_result[:100]`（改行保持）と `_extract_result_text(block)`（従来は先頭行のみ）を
+  `==` 比較 → 応答先頭 100 文字に改行が含まれると必ず不一致．加えて SSH 経路（`predict.py:86` `send_prompt_ssh` は
+  `result.stdout.strip()`）と HTTP 経路（`:46` 未 strip）・ログ側 `result[:100]` truncate の非対称で末尾空白差が残る．
+- 変更: 照合を以下に置き換える．
+  - `predict_norm = predict_result.strip()`．
+  - 各 block について `snippet = _extract_result_text(block)`；`snippet` が `None` または `snippet.strip() == ""`
+    ならスキップ（空スニペットは全一致してしまうので照合対象外）．
+  - `snippet_norm = snippet.strip()` とし，**`predict_norm.startswith(snippet_norm)`** が真なら一致とみなす．
+    ログ側スニペットは `result[:100]` の truncate 済みで predict 全文の前方部分に相当するため，**「predict 全文が
+    ログスニペットで始まる」方向の前方一致**が SSH/HTTP の strip 差・100 文字 truncate 差の両方を吸収する．
+  - `expected_prefix` 変数（`predict_result[:100]`）は不要になるため削除する．
+  - 一致ブロックが最新でないときの warning（`used an earlier block ...`）と，全不一致時のフォールバック warning
+    （`used the latest block as a fallback`）は**現状の文言・挙動を維持**する（既存テストが文言に依存するため変更しない）．
+
+#### 3. 追加すべきテストケース（`tests/test_collect_results.py`）
+
+既存 23 件は**すべて維持**（(i)〜(iii) は単一行入力に対し従来と同一結果になるよう設計；特に `==`→`startswith` は
+等文字列で真，`falls_back` テストの `"not-matching-anything".startswith("foo"/"bar")` は偽でフォールバック維持）．
+新規に最低 6 件を追加する．**フィクスチャ `.log` の gitignore トラップ（Iter1 の学び）を避けるため，複数行ケースの
+入力は原則テストモジュール内のインライン複数行文字列定数で与える**（新規 `.log` フィクスチャファイルを作らない＝
+`git add -f` 依存を無くす．ANSI ESC は `"\x1b[0;32m"` としてインラインで表現可能）．既存 `rank0_sample.log` は非改変で残す．
+
+- **T1 `_extract_rank0_messages` の継続行結合**: 入力
+  `"[R0 RESULT] Request response: 'Hello! How can I help you today?\nthought\n'\n"` を渡し，返る rank0 メッセージ列に
+  埋め込み `\n` を保持した 1 要素 `Request response: 'Hello! How can I help you today?\nthought\n'` が含まれることを assert．
+  併せて先頭プレフィックス前の行・現在レコード不在時の継続行が捨てられることも確認する．
+- **T2 `_extract_result_text` の複数行復元**: 上記 RESULT を含むブロックから，先頭行のみでなく
+  `Hello! How can I help you today?\nthought`（末尾 `\n` は残ってよい）まで復元し，閉じ `'` が除去されることを assert．
+  応答本文に `'` を含むケース（例 `I'm fine`）でも途中で切れないことを 1 ケース入れる（DOTALL greedy の回帰）．
+- **T3 先頭 100 文字に改行を含む照合（Iter1 実観測ケースの再現）**: 複数行 RESULT を持つ単一ブロックのログに対し
+  `parse_rank0_log(log_text, predict_result="Hello! How can I help you today?\nthought")` を通し，
+  **`parse_ok is True` かつ `parse_warnings == []`**（フォールバックに落ちない）ことを assert（現状はここで必ず
+  フォールバック警告が出る＝この修正が守るべき回帰）．
+- **T4 SSH（strip 済み）／HTTP（末尾 `\n` 未 strip）の両方が一致**: 同一ログに対し，`predict_result` を
+  `"...thought"`（SSH 相当）と `"...thought\n"`（HTTP 相当・末尾改行付き）の両方で `_select_relevant_block` を呼び，
+  どちらも一致ブロックを返し警告無しであることを assert．
+- **T5 正しいブロックが最新でない順序**: 同一 since 窓に「別 run（先）＝複数行 RESULT で predict と一致」と
+  「最新 run（後）＝別応答 or RESULT 未確定」が並ぶ 2 ブロック入力で，`_select_relevant_block` が**先の一致ブロック**を選び，
+  `used an earlier block` 警告を返す（フォールバックに落ちない）ことを assert．②の取り違え防止が実際に働くことの検証．
+- **T6 空スニペットのガード**: RESULT が空（`Request response: ''`）のブロックが並ぶとき，空スニペットで
+  誤って前方一致しない（空 snippet はスキップされフォールバックへ回る）ことを assert．
+
+#### 4. 成功条件（measurable・コードレベル）
+
+本イテレーションは実機実行を伴わないため，成功条件はコード（テスト）で定義する（config.yml success_criteria① は
+Iter1 で充足済み・本イテレーションの判定対象外）．以下すべてを満たせば「採用」候補とする．
+
+1. `uv run pytest tests/test_collect_results.py` が **green**．既存 23 件は全て pass のまま，新規 T1〜T6（最低 6 件）も
+   pass（合計 29 件以上 passed，failed/error 0）．
+2. T3 が示すとおり，Iter1 実験で実際に観測された複数行 RESULT 入力に対し `parse_rank0_log(...).parse_warnings == []`
+   （フォールバック警告が消える）．
+3. T5 が示すとおり，一致ブロックが最新でない並びでも取り違えず一致ブロックを選ぶ（`used an earlier block` 警告）．
+4. lint/型チェッカーはリポジトリ未導入のため（Iter1 で確認済み），
+   `uv run python -m py_compile tools/collect_results.py tests/test_collect_results.py` で構文健全性を確認する．
+5. スコープ厳守: `git diff --name-only` の変更が `tools/collect_results.py` と `tests/test_collect_results.py` の
+   2 ファイルのみ（`pipeline_inference.py`/`predict.py`/`common.py`/`mise.toml`/JSONL スキーマ非改変）．
+
+判定はすべて決定的（測定ノイズを伴わない純関数のテスト）であり，ノイズ幅の見積もりは不要．
+
+#### 5. end-to-end 再検証の要否（判断）
+
+- **本イテレーションの完了条件としては end-to-end 再検証は不要**．修正はパース純関数に閉じ，Iter1 実験で観測された
+  生ログ形式（`[R0 RESULT] Request response: 'Hello! How can I help you today?\nthought\n'`）を T1〜T4 の回帰入力として
+  忠実に再現しているため，単体テストで「フォールバックが消える」ことまで検証できる．
+- **任意の確認（推奨タイミング）**: 実機で「フォールバック警告が実際に消える」ことの最終確認は，②の最初の承認済み
+  実 run に**畳み込んで**行えば足りる（本修正のためだけに 51 ノードを単独起動する必要は無い）．単独で実機確認を
+  行う場合は 51 ノードへの接続を伴うため**人間確認が必須**（backlog B1）．本イテレーションでは実行しない．
+
+#### 6. `.gitignore` `*.log` トラップへの対処方針
+
+- 新規複数行ケースは**テストモジュール内のインライン複数行文字列**で与え，新規 `.log` フィクスチャファイルを作らない
+  ことを原則とする（＝`git add -f` 依存・チェックアウト再現不能リスクを最初から回避）．既存 `tests/fixtures/rank0_sample.log`
+  は Iter1 で `git add -f` 追跡済みのため非改変で残す．どうしてもファイル化する場合のみ拡張子を `.log` 以外にするか
+  `git add -f` すること（実装フェーズで `git status` に新規 `.log` が現れないことを確認して申し送る）．
+
+#### 7. 実装フェーズ（rc-implementer）への申し送り
+
+- **変更キー・箇所**: `tools/collect_results.py` の `_RESULT_RE`（`:55`，`re.DOTALL` 付与）／`_extract_rank0_messages`
+  （`:58-67`，継続行結合へ置換・新設 `_LOG_LINE_RE` 使用・`_RANK0_LINE_RE` は不要になり削除可）／
+  `_select_relevant_block`（`:98-130`，`==`→両辺 strip＋`predict_norm.startswith(snippet_norm)`＋空スニペットガード，
+  `expected_prefix` 削除）の 3 点のみ．`_extract_result_text` の末尾 `'` 除去ロジックは維持．
+- **非改変厳守**: `pipeline_inference.py`（`result[:100]` truncate・RESULT 書式）・`predict.py`（SSH strip / HTTP 未 strip の
+  非対称）・`common.py`・`mise.toml`・JSONL スキーマは触らない．strip 差は「照合側で吸収」する方針．
+- **既存テスト非破壊の確認観点**: `==`→`startswith` 化で `test_select_relevant_block_falls_back_...`（'foo'/'bar' が
+  predict 前方一致しない）と exact-match テスト（等文字列で startswith 真・警告無し）が従来どおり通ることを実行で確認する．
+- **禁止事項の再掲**: 実機への `deploy`/`predict:demo` 実行はしない（コードとテストのみ）．
+
+---
+
+### 調査 (Iter2)
+
+**担当**: 調査フェーズ subagent（2026-07-18）．単一レバー「RESULT 複数行対応による照合ロジックの頑健化」
+（backlog B3，`tools/collect_results.py` のみ改変・`pipeline_inference.py` 非改変）の計画に向け，
+現状の単一行前提のパース／弁別ロジックと，複数行 RESULT の実際のログ出力形式を，実機に触れず読み取り調査した．
+
+**問い**
+1. `collect_results.py` の現状パース・弁別ロジックはどこで単一行前提になっているか．
+2. `pipeline_inference.py` の RESULT ログ行は，複数行応答をどう物理ログへ書き出すか（改行はそのまま出るか）．
+3. 現行フィクスチャに複数行 RESULT ケースは含まれるか．
+4. このログ形式に最も適した複数行再構成方式は何か．
+
+**分かったこと（コード読み取り，出典＝リポジトリ内ファイル:行）**
+
+- **RESULT ログは改行を「そのまま」物理ログへ出す（エスケープしない）**．`pipeline_inference.py:1814` は
+  `_log("RESULT", f"Request response: '{result[:100]}'")`．`_log`（`:180-192`）は `print(f"[R{_RANK} {tag}] {msg}", flush=True)`
+  で出力するだけで，`result[:100]` に含まれる `\n` はエスケープされず生の改行として書かれる．結果，応答が複数行だと
+  ログは次のように**先頭行だけが `[R0 RESULT]` プレフィックスを持ち，継続行（`thought` や閉じ `'`）はプレフィックス無し**になる（実験フェーズの生ログと一致）:
+  ```
+  [R0 RESULT] Request response: 'Hello! How can I help you today?
+  thought
+  '
+  ```
+  なお本文は `result[:100]`（先頭 100 文字に truncate）である点も重要（後述の照合で効く）．
+
+- **単一行前提の箇所は 3 つ**（すべて `collect_results.py`）:
+  1. `_extract_rank0_messages`（`:58-67`）: `log_text.splitlines()` した各物理行を `_RANK0_LINE_RE = ^\[R0 \w+\] (.*)$`
+     （`:46`）で照合し，プレフィックスを持つ行だけ残す．→ **複数行 RESULT の継続行（プレフィックス無し）は
+     この時点で全て捨てられる**．これが単一行前提の根源．
+  2. `_RESULT_RE = ^Request response: '(.*)$`（`:55`）と `_extract_result_text`（`:85-95`）: `.` は改行に一致せず，
+     かつ入力は既に 1 物理行に分解済みなので，**復元できるのは RESULT の先頭物理行のみ**．末尾 `'` の除去も先頭行が
+     `'` で終わる場合しか働かない（複数行では閉じ `'` は最終行にあり除去対象にならない）．
+  3. `_select_relevant_block`（`:98-130`）の防御的照合: `expected_prefix = predict_result[:100]`（改行を保持）と
+     `_extract_result_text(block)`（先頭行のみ・改行喪失）を `==` 比較．→ **応答の先頭 100 文字に改行が含まれると
+     必ず不一致**になり，フォールバック（最新ブロック採用）に落ちる．弁別機構が事実上無効化される（backlog B3 の指摘どおり）．
+
+- **照合失敗の原因は「複数行」だけではない．predict 側の正規化差も効く**（新規発見，計画に必須）:
+  `send_prompt_ssh`（`predict.py:86`）は `result.stdout.strip()` を返す＝**前後空白（末尾 `\n` 含む）を除去**する．
+  一方 `send_prompt_http`（`predict.py:46`）は `result.get("result","")` で**未除去**．さらにログ側は raw な `result[:100]`．
+  実験フェーズの `result_text="...thought"`（末尾 `\n` 無し）とログの `'...thought\n'`（末尾 `\n` 有り）の食い違いは
+  この strip 差に由来する．→ **複数行を正しく再構成しても，SSH 経路では末尾空白差で `==` が依然失敗し得る**．
+  照合は両辺を正規化（`strip`）し，かつ log 本文は truncate されているので「predict 側が log スニペットで startswith」
+  という**前方一致方向**で判定するのが安全（SSH/HTTP 差・100 文字 truncate 差の両方を吸収できる）．
+
+- **フィクスチャに複数行 RESULT ケースは無い**（`tests/fixtures/rank0_sample.log`）．2 ブロックとも RESULT は単一行
+  （`'Hello'`／`'Hi there! How can I help you today?'`）．ANSI 混入行・他 rank（R1/R2）ノイズ行は含むが，
+  **複数行応答・照合失敗・前後空白差のいずれも現テストは検証していない**（＝今回の修正は回帰テストで守られていない）．
+
+- **推奨する複数行再構成方式＝「継続行結合（次の `[R\d+ \w+]` プレフィックス行までを 1 論理メッセージとみなす）」**．
+  ログ集約ツールの標準的なマルチライン方式（Filebeat の start パターン＋`negate:true`/`match:after`，Fluentd multiline
+  parser。出典: elastic.co "Manage multiline messages", docs.fluentd.org "multiline"）と同型で，本ログ形式に最も適する:
+  - 全ての本物のレコードは `_log` により必ず `[R\d+ \w+]` で始まる（`:192`）．継続行はメッセージ内の生改行のみが生む．
+  - `print` は RESULT メッセージ（埋め込み改行込み）を 1 回の呼び出しで出力するため，**継続行は先頭行の直後に連続する**
+    （途中に別レコードが割り込む余地は無い）＝方式の前提が壊れない．
+  - 対案の「DOTALL で `Request response: '(.*?)'` を non-greedy マッチ」は，応答本文に `'`（例: `I'm`）が含まれると
+    途中で切れるため**非推奨**．終端マーカー方式も閉じ `'` が曖昧なため不可．
+  - 実装上の注意: 継続行の帰属を正しく決めるため，境界判定は `[R0 ...]` だけでなく**任意の `[R\d+ \w+]`** を「新レコード開始」
+    として扱い，rank を付与して論理レコードへ畳んでから rank0 だけを残す（rank0 コンテナのログには実際上 rank0 行しか
+    出ないが，フィクスチャの R1/R2 ノイズ耐性のため）．また `collect_rank0_log`（`:439-444`）は現状 `docker logs --since`
+    のみで **`-t`（タイムスタンプ）は付けていない**ため全物理行が素の本文であり本方式が成立する（将来 `-t` を足すと
+    継続行にも時刻プレフィックスが付き方式が壊れるので，足すなら別途対応が要る点を申し送る）．
+
+**次フェーズ（計画）への示唆**
+
+- **修正の骨子（3 点セットで一体）**: (i) `_extract_rank0_messages` を「継続行結合」方式に置き換え，rank0 の各論理
+  メッセージを `\n` 連結で復元する；(ii) `_RESULT_RE`/`_extract_result_text` を複数行本文に対応（`re.DOTALL`
+  相当 or 行に依存しない末尾 `'` 除去）；(iii) `_select_relevant_block` の照合を**両辺 strip＋前方一致（predict が
+  log スニペットで startswith）**へ緩め，SSH/HTTP の strip 差と 100 文字 truncate 差を吸収する．この 3 つは連動して
+  はじめて弁別機構が復活するため，1 つでも欠けると②で取り違えリスクが残る．
+- **回帰テストの追加が完了条件の中核**: フィクスチャ（または新規フィクスチャ）に「複数行 RESULT を含むブロック」
+  「先頭 100 文字に改行を含む応答」「SSH 経路想定で末尾 `\n` を strip した predict_result」「同一 since 窓内に
+  複数ブロックが並び，正ブロックが最新でない」ケースを足し，`_select_relevant_block` が**フォールバックに落ちず
+  正しいブロックを選ぶ**ことを assert する（現行 23 件はこれを検証しない）．`.gitignore` の `*.log` がフィクスチャを
+  飲む落とし穴（Iter1 の学び）に注意し，フィクスチャ拡張子を `.log` 以外にするか `git add -f` する．
+- **スコープ厳守**: 改変は `collect_results.py`（と tests/fixtures）のみ．`pipeline_inference.py`（`result[:100]` の
+  truncate や RESULT ログ書式）・`predict.py`（strip 差）は非改変（backlog B3）．strip 差は「照合側で吸収」する方針で，
+  ログ側・送信側の書式は触らない．
+- **end-to-end 検証は原則不要**: 本修正はパース純関数に閉じるため単体テストで完了条件を組める．実機叩き（人間確認要）は
+  任意．なお②着手前に本修正が入れば，②の複数 run 連続送信でも弁別が機能する（B3 の目的を満たす）．
+
+---
+
 ## Iteration 1
 
 **フェーズ**: 計画（2026-07-18）．担当＝計画 subagent．対象＝ config.yml `research_frontier①`（結果永続化基盤の実装）．
