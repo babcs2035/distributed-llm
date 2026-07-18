@@ -1,0 +1,72 @@
+# research-cycle 設定: distributed-llm
+# サイクル全体の手順はグローバル skill（~/.claude/skills/research-cycle/SKILL.md）が規定する．
+# ここにはこのリポジトリ固有の差分だけを書く．
+
+repo_name: distributed-llm
+
+# 実験の起動系（実機 51 ノード: master wafl-ctrl1 + worker wafl100-139/200-209，Docker + mise タスク）
+# 注意: WAFL-PEFT と異なり「学習」ではなく「分散パイプライン並列推論」のチューニングが対象．
+tasks:
+  setup:   "mise run setup:env && mise run setup:registry"
+  deploy:  "mise run deploy"
+  run:     "mise run predict:demo"          # 単発の推論実行（プロンプト固定のベンチマーク）
+  analyze: "uv run python tools/show_logs.py --all"   # 暫定．軸②実装後は専用の集計スクリプトに差し替える
+  clean:   "mise run clean"                 # 破壊的（全ノードのコンテナ・イメージ削除）．自動実行しない
+
+experiment:
+  name_scheme: "Iter{n}"
+  results_glob: "results/*.jsonl"           # 現状は存在しない（軸①の実装対象，下記 research_frontier 参照）
+  metrics_cmd: "(未実装。research_frontier の①を参照)"
+  timeout_min: 30                           # predict:demo 単発は数分〜十数分程度の見込み（要実測）
+  poll_interval_sec: 60
+
+# 単一レバー原則で振る候補（順序＝優先度）．pipeline_inference.py の環境変数で制御．
+levers:
+  - {name: NUM_MICRO_BATCHES, values: [2, 4, 8], note: "既定4．パイプラインバブル低減とのトレードオフ"}
+  - {name: STAGGER_INTERVAL,  values: [0.0, 0.5, 1.0], note: "起動時 thundering herd 回避の待機間隔（秒）"}
+  - {name: SEQ_LEN,           values: [256, 512, 1024], note: "KV キャッシュ上限（Gemma-4 スライディングウィンドウ）"}
+  - {name: WORLD_SIZE,        values: [11, 21, 51], note: "参加ノード数．層割当の粒度に影響．削減は要ホスト健全性確認"}
+
+# 研究フロンティア（現状把握で判明した欠落・展望．いずれも本格実験の前提となるため，
+# planner は着手順を検討し，スコープが大きい場合は backlog へ登録して人間判断を仰ぐ）
+research_frontier:
+  - "①【最優先・基盤】結果永続化基盤の実装: 現状 stdout ログのみ（mise run logs で docker logs を tail するだけ）．
+     `[R{rank} LEVEL] message` 形式のログをパースし，ステップ時間・tokens/sec・隠れ状態統計を results/Iter{n}.jsonl
+     に構造化保存するパイプラインが無いと，レバー比較の定量評価ができない．最初のイテレーションの実装対象として
+     最有力（新規実装のみで着手可能・51 ノードへの追加負荷なし・可逆）．"
+  - "②マイクロバッチ数・stagger interval のスループット感度分析（①の基盤ができてから）"
+  - "③ノード数（WORLD_SIZE）を絞った縮小構成での前捌き検証（51 ノード全部でなく一部で最初に試す）"
+  - "④KV キャッシュ上限・max_seq_len と生成品質/メモリのトレードオフ"
+
+baselines: []   # 現状ベースライン比較の設計は未着手（①の後に検討）
+
+success_criteria: "①（結果永続化基盤）については「mise run predict:demo 実行後に results/Iter{n}.jsonl が
+  ステップ時間・tokens/sec を含む形で生成される」ことを完了条件とする．②以降のレバー比較は，
+  基盤完成後に time-to-first-token / tokens_per_sec の有意差（要基準値計測）で判定する．"
+
+slack:
+  channel: "#times-ktakahashi"
+  channel_id: "C0BHR9YLR47"
+  mention_user_id: "U08GLKY1QCW"
+
+notion:
+  parent_page: "Lab/Research"
+  database_id: "12c71cc0-c905-49b4-810f-247c230b3964"   # data_source_id（Research Cycle Log，WAFL-PEFT と共通）
+  repo_page_id: "3a15abda-e3f1-81fd-9b4a-edfca4cbea99"  # distributed-llm 行のページ ID（既存）
+
+git:
+  enabled: true
+  branch: "main"
+  commit_per_iteration: true
+  push: true
+
+autonomy:
+  destructive_requires_human: true
+
+# 重要な注意（launch.sh の env 注入について）:
+# このリポジトリの .claude/settings.local.json は，通常のクラウド Anthropic API ではなく
+# ローカルモデル（Qwen3.6 系プロキシ, ANTHROPIC_BASE_URL=http://localhost:8080 等）向けの
+# env 設定を持っていた．research-cycle 起動時（launch.sh）はこれを ~/.claude/env.cloud.json の
+# 内容で上書きし，クラウド Anthropic API を使う．これはユーザーが明示的に確認・承認した挙動である
+# （2026-07-18）．ローカルモデルでの動作確認に戻したい場合は，settings.local.json の env を
+# env.local.json 相当の内容へ手動で書き戻すこと．

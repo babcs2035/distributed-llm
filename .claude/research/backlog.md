@@ -1,0 +1,47 @@
+# backlog: distributed-llm — 人間判断待ち事項 / 自動判断の記録
+
+新しいものを常に先頭に追記する（逆時系列）．
+- 可逆な暫定判断: `## B{n} [auto-decided YYYY-MM-DD] 題目`（状況・自動選択・根拠・要レビュー）
+- 不可逆・危険な事項: `## B{n} [needs-human YYYY-MM-DD] 題目`（Slack で @mention 済みと明記）
+
+---
+
+## B3 [auto-decided 2026-07-18] Iteration 2 の単一レバー選定（② へ直行せず基盤頑健化を先行）
+- **状況**: Iteration 1（結果永続化基盤）を「採用」で確定．分析(解釈)が②着手前の高リスクとして
+  「RESULT 複数行照合の破綻（防御的照合が常時失敗し，②の複数 run で別 run の指標を誤レバーに紐付ける）」を指摘．
+- **自動選択**: Iteration 2 の単一レバーを「RESULT 複数行対応による照合ロジックの頑健化」（`collect_results.py` の
+  `_RESULT_RE`／`_extract_result_text`／`_select_relevant_block` 修正）とする．② のレバー掃引はその後に回す．
+  P1（levers 記録堅牢化，`pipeline_inference.py` 起動時 1 行 INFO）はホットパス改変を伴うため Iteration 3 の
+  独立イテレーションとして扱う．② 実施時は各レバー値 n≥3〜5 反復・主指標 ITL/TTFT を前提とする．
+- **根拠**: RESULT 修正は `collect_results.py` 内に閉じ・非侵襲・可逆でクラスタ負荷ゼロ，かつ①と同じ「基盤の
+  信頼性」レバーの延長で単一レバー原則に整合する．基盤が信用できない状態で掃引すると結論が汚染される．
+- **可逆性**: 掃引前の頑健化順序の選択であり完全に可逆．破壊的操作は含まない（自動判断とした）．
+- **要レビュー**: 「② へ直行し，取り違えは直列化＋狭い since 窓の運用規約で回避する」という別案の余地は残る．
+  次回 continue 時に人間が方針を上書きする場合はこの B3 を差し替えること．
+
+---
+
+## B2 [resolved 2026-07-18] Iter1 フェーズ4（実験）開始可否の確認依頼（B1 の実行）
+- **解決**: ユーザーが承認．「現行の実機構成（wafl-ctrl1 + worker 50 台）で `mise run deploy` と
+  `mise run predict:demo`（収集ツール経由）を実行し，`results/Iter1.jsonl` の生成まで確認してほしい」との
+  明示的な指示を受け，フェーズ4（実験）へ進行する．
+- 状況: Iteration 1 のフェーズ1〜3（調査・計画・実装）が完了．結果永続化基盤（`tools/collect_results.py`）を
+  コードのみ・実機非接続で実装し，単体テスト 23 件 green．B1 の合意方針通り，フェーズ4（実験，51 ノード実機への
+  `deploy`/`predict:demo` 実行を伴う）へ進む前に一度停止し，Slack で `<@U08GLKY1QCW>` へ確認を依頼した
+  （2026-07-18 17:37 頃投稿）．
+- 論点: 現行の実機構成（wafl-ctrl1 + worker 50 台）で `mise run deploy` → `mise run predict:demo`（収集ツール経由）を
+  実行し，`results/Iter1.jsonl` の生成を確認してよいか．
+- 現在の状態: `state.json.status=blocked` として待機中．人間の返信（Slack）を受けて `continue` 実行時に，
+  承認内容に応じてフェーズ4へ進むか，スコープ変更・延期の指示に従う．
+
+---
+
+## B1 [needs-human 2026-07-18] 51 ノード全体への実機デプロイ・推論実行の実行可否
+- 状況: このリポジトリの実験（`mise run deploy` / `mise run predict:demo`）は，管理サーバ wafl-ctrl1 と
+  worker 50 台（wafl100-139, wafl200-209）という大規模な実機クラスタに対して行われる．WAFL-PEFT（5 ノード）
+  より遥かに影響範囲が大きく，他ユーザーとの共有資源への影響・障害時の切り分けコストも大きい．
+- 論点: 実験フェーズ（rc-experimenter）が実際に 51 ノードへ deploy・推論実行するのを，人間の確認なしに
+  自動実行してよいか．
+- 暫定方針（planner が着手前に確認）: 初回イテレーションは research_frontier①（結果永続化基盤の実装，
+  コードのみ・クラスタに触れない）を対象とする．実機への deploy/predict を伴う実験（②以降）に進む前に，
+  必ず一度 Slack で確認を仰ぐ．確認が取れるまでは投機的な 51 ノード実行はしない．

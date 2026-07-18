@@ -1,0 +1,12 @@
+{
+  "repo": "distributed-llm",
+  "iteration": "Iter2",
+  "phase": "investigate",
+  "status": "running",
+  "current_lever": "result-parsing-robustness (RESULT複数行対応)",
+  "experiment_dir": "results",
+  "experiment_deadline": null,
+  "updated_at": "2026-07-18T18:10:00+09:00",
+  "last_slack_ts": null,
+  "last_commit": null
+}

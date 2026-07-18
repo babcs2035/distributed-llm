@@ -1,0 +1,21 @@
+[R0 INFO] Rank 0: prompt='Hi'
+[R0 INFO] Rank 0: prompt tokens=5, embedding shape=torch.Size([1, 5, 4096]) mean=0.001000 std=0.500000 min=-2.000000 max=2.000000
+[R1 INFO] Rank 1: received forward chunk
+[R0 INFO] Rank 0: === step 0/64 is_first=True ===
+[R0 INFO] Rank 0: step 0 done token=101 dt=1.200s
+[R0 INFO] Rank 0: step 1 done token=102 dt=0.300s
+[R0 INFO] Rank 0: decoding 2 generated tokens (prompt=5)...
+[R0 INFO] Rank 0: decoded in 0.050s: 'Hello'
+[R0 RESULT] Request response: 'Hello'
+[R0 [0;34mINFO[0m] Rank 0: prompt='Hello!'
+[R0 INFO] Rank 0: prompt tokens=6, embedding shape=torch.Size([1, 6, 4096]) mean=0.012345 std=0.987654 min=-3.210000 max=3.450000
+[R2 INFO] Rank 2: forwarding activations
+[R0 INFO] Rank 0: === step 0/64 is_first=True ===
+[R0 INFO] Rank 0: step 0 done token=201 dt=0.800s
+[R0 [0;34mINFO[0m] Rank 0: step 1 done token=202 dt=0.120s
+[R0 INFO] Rank 0: step 2 done token=203 dt=0.150s
+[R0 INFO] Rank 0: step 3 done token=204 dt=0.110s
+[R0 INFO] Rank 0: step 4 done token=205 dt=0.200s
+[R0 INFO] Rank 0: decoding 5 generated tokens (prompt=6)...
+[R0 INFO] Rank 0: decoded in 0.045s: 'Hi there! How can I help you today?'
+[R0 [0;32mRESULT[0m] Request response: 'Hi there! How can I help you today?'

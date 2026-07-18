@@ -119,5 +119,5 @@ description = "Send prompt to distributed LLM and display inference result (via 
 run = "uv run python tools/predict.py"
 
 [tasks."predict:demo"]
-description = "Send demo prompt for demonstration"
-run = 'uv run python tools/predict.py --prompt "Hello!"'
+description = "Send demo prompt and persist rank0 metrics to results/Iter{n}.jsonl"
+run = 'uv run python tools/collect_results.py --iter Iter1 --prompt "Hello!"'
