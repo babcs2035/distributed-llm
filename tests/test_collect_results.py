@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from collect_results import (
+    _extract_levers,
     _extract_rank0_messages,
     _extract_result_text,
     _percentile,
@@ -425,6 +426,147 @@ def test_build_levers_returns_none_for_unparseable_numeric_value(monkeypatch: py
     levers = build_levers(fake_config)  # type: ignore[arg-type]
 
     assert levers["NUM_MICRO_BATCHES"] is None
+
+
+# ====================================================================
+# levers 記録の堅牢化（Iteration 3: TL1〜TL8）
+# ログ由来の levers（`Rank 0: levers NUM_MICRO_BATCHES=... ...` 行）を env より優先する．
+# ====================================================================
+
+
+def test_extract_levers_parses_typed_values() -> None:
+    """TL1: levers 行から NUM_MICRO_BATCHES/WORLD_SIZE を int，STAGGER_INTERVAL/SEQ_LEN を数値として抽出する．"""
+
+    block = [
+        "Rank 0: prompt='Hi'",
+        "Rank 0: levers NUM_MICRO_BATCHES=8 STAGGER_INTERVAL=0.5 SEQ_LEN=512 WORLD_SIZE=21",
+    ]
+
+    levers = _extract_levers(block)
+
+    assert levers == {
+        "NUM_MICRO_BATCHES": 8,
+        "STAGGER_INTERVAL": 0.5,
+        "SEQ_LEN": 512,
+        "WORLD_SIZE": 21,
+    }
+    assert isinstance(levers["NUM_MICRO_BATCHES"], int)
+    assert isinstance(levers["STAGGER_INTERVAL"], float)
+    assert isinstance(levers["SEQ_LEN"], int)
+    assert isinstance(levers["WORLD_SIZE"], int)
+
+
+def test_extract_levers_returns_none_when_line_absent() -> None:
+    """TL2: levers 行を含まない（旧形式の）ブロックでは None を返す．"""
+
+    block = ["Rank 0: prompt='Hi'", "Rank 0: step 0 done token=1 dt=0.1s"]
+
+    assert _extract_levers(block) is None
+
+
+def test_extract_levers_handles_stagger_zero_and_default() -> None:
+    """TL3: STAGGER_INTERVAL=0.0（掃引の最小値）と 3.0（既定値）がいずれも float として拾える．"""
+
+    zero_block = [
+        "Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=0.0 SEQ_LEN=1 WORLD_SIZE=51",
+    ]
+    default_block = [
+        "Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51",
+    ]
+
+    assert _extract_levers(zero_block)["STAGGER_INTERVAL"] == pytest.approx(0.0)
+    assert _extract_levers(default_block)["STAGGER_INTERVAL"] == pytest.approx(3.0)
+
+
+def test_parse_rank0_log_populates_levers_from_log() -> None:
+    """TL4: 物理ログ（`[R0 INFO]` プレフィックス付き）全体から levers_from_log が正しく設定される．"""
+
+    log_text = (
+        "[R0 INFO] Rank 0: prompt='Hi'\n"
+        "[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=0.5 SEQ_LEN=256 WORLD_SIZE=11\n"
+        "[R0 INFO] Rank 0: prompt tokens=6, embedding shape=(1,6,3) mean=0.01 std=0.98 min=-3.2 max=3.4\n"
+        "[R0 INFO] Rank 0: step 0 done token=1 dt=0.1s\n"
+    )
+
+    parsed = parse_rank0_log(log_text)
+
+    assert parsed.levers_from_log == {
+        "NUM_MICRO_BATCHES": 4,
+        "STAGGER_INTERVAL": 0.5,
+        "SEQ_LEN": 256,
+        "WORLD_SIZE": 11,
+    }
+    assert parsed.parse_ok is True
+
+
+def test_parse_rank0_log_levers_from_log_none_for_legacy_log() -> None:
+    """TL5: levers 行の無い旧形式ログでは levers_from_log が None のまま（後方互換）．"""
+
+    log_text = (
+        "[R0 INFO] Rank 0: prompt='Hi'\n"
+        "[R0 INFO] Rank 0: step 0 done token=1 dt=0.1s\n"
+    )
+
+    parsed = parse_rank0_log(log_text)
+
+    assert parsed.levers_from_log is None
+
+
+def test_build_levers_prefers_log_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TL6（本レバーの核心）: env と食い違っても，levers_from_log が与えられればそちらを採用する．"""
+
+    monkeypatch.setenv("SEQ_LEN", "1024")
+    fake_config = SimpleNamespace(num_micro_batches="2", stagger_interval="1.0", world_size="51")
+    levers_from_log: dict[str, int | float | None] = {
+        "NUM_MICRO_BATCHES": 8,
+        "STAGGER_INTERVAL": 0.5,
+        "SEQ_LEN": 256,
+        "WORLD_SIZE": 21,
+    }
+
+    levers = build_levers(fake_config, levers_from_log)  # type: ignore[arg-type]
+
+    assert levers == levers_from_log
+
+
+def test_build_levers_falls_back_to_env_when_log_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TL7: levers_from_log が None（旧ログ・パース失敗）の場合は従来の env/config フォールバックを使う．"""
+
+    monkeypatch.delenv("SEQ_LEN", raising=False)
+    fake_config = SimpleNamespace(num_micro_batches="4", stagger_interval="3.0", world_size="51")
+
+    levers = build_levers(fake_config, None)  # type: ignore[arg-type]
+
+    assert levers == {
+        "NUM_MICRO_BATCHES": 4,
+        "STAGGER_INTERVAL": 3.0,
+        "SEQ_LEN": None,
+        "WORLD_SIZE": 51,
+    }
+
+
+def test_levers_bound_to_selected_block_in_multiblock_log() -> None:
+    """TL8: 2 ブロックが存在する状況で，predict_result が一致する（最新でない）ブロックの
+    levers に紐づき，別ブロックの levers と混同しない（Iteration 2 の T5 と対になる levers 版）．
+    """
+
+    log_text = (
+        "[R0 INFO] Rank 0: prompt='Older'\n"
+        "[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=2 STAGGER_INTERVAL=0.0 SEQ_LEN=256 WORLD_SIZE=11\n"
+        "[R0 INFO] Request response: 'older-result'\n"
+        "[R0 INFO] Rank 0: prompt='Newer'\n"
+        "[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=8 STAGGER_INTERVAL=1.0 SEQ_LEN=1024 WORLD_SIZE=51\n"
+        "[R0 INFO] Request response: 'newer-result'\n"
+    )
+
+    parsed = parse_rank0_log(log_text, predict_result="older-result")
+
+    assert parsed.levers_from_log == {
+        "NUM_MICRO_BATCHES": 2,
+        "STAGGER_INTERVAL": 0.0,
+        "SEQ_LEN": 256,
+        "WORLD_SIZE": 11,
+    }
 
 
 # ====================================================================

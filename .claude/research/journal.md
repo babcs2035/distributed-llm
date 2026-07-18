@@ -6,6 +6,597 @@ research-cycle が読み書きする実験ジャーナル．**新しいイテレ
 
 ---
 
+## Iteration 3
+
+### 考察・次計画 (Iter3)
+
+**担当**: 考察・次計画 subagent（2026-07-18）．分析(解釈) の結論（本ブロック `### 分析(解釈) (Iter3)`）を受け，
+本イテレーションの単一レバー「P1: levers 記録の堅牢化」の採否を確定し，次イテレーションの方向を決めた．
+実機への新規接続・実行はしていない（記録の読み取りとコミット操作のみ）．
+
+**1. 採否判定: 採用（adopt）**
+
+- **判定根拠**: 計画 §4 のコードレベル成功条件 6 件をすべて機械的に充足（`pytest` 38 passed＝既存 30＋新規
+  TL1〜TL8，failed/error 0；TL6 が env≠log で log 採用を assert；TL7 が env フォールバック維持；TL4/TL8 が
+  選択済みブロック紐付け；`py_compile` エラー無し；変更 3 ファイル厳守）．加えて，実機 51 ノードで仕組みの発火を
+  確認した．rank0 ログに `Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51` が
+  実出力され，`results/Iter3.jsonl` の `levers.SEQ_LEN=1`（Iter1 は同フィールド `null`）で確定した．`build_levers` は
+  ログ由来があれば dict を丸ごと返す all-or-nothing 構造のため，`SEQ_LEN` 非 null がログ由来経路の作動を一意に示す．
+- **追加反復の要否**: 不要．levers 抽出は決定的（純関数・正規表現一致）で測定ノイズを持たず，判定が一意に定まる．
+  「env≠実レバーの食い違いそのものの実機再現」だけが残るが，これは②の初回掃引 run（NMB/STAGGER を実際に振る run）で
+  自然に exercised されるため，P1 単独での追加 run は不要（分析(解釈) §2 の申し送りに従う）．
+- **副次的成果**: 複数行 RESULT（`Hello! ...\nthought`）の実 run で `parse_ok=true`・`parse_warnings=[]` を確認でき，
+  Iter2（RESULT 複数行照合の頑健化）の最大残存点だった「実機 end-to-end 未検証」を追認して解消した．
+
+**2. このレバーの収束状況**
+
+- 「基盤の信頼性」系レバー（①永続化基盤 → Iter2 (a)RESULT 複数行照合 → Iter3 (b)levers 記録堅牢化）は，②着手前に
+  事前イテレーションで潰すべき (a)(b) を両方とも解消し，**やり切った（収束）**．残る②着手条件 (c) n≥3 反復・
+  (d) 主指標 ITL/TTFT は事前イテレーションではなく②の実験設計に属する（分析(解釈) §4）．したがって次は基盤頑健化を
+  離れ，config `levers`／`research_frontier` の次候補へレバーを移す．
+
+**3. 次に振るレバーの決定（Iteration 4）: ユーザー指示⑤「先行研究調査に基づく推論パイプライン高速化」**
+
+- **決定**: Iteration 4 の単一レバーは，ユーザーが会話内で 2 回明示的に指示した「ログ収集だけでなく，先行研究・
+  関連研究を調査した上で推論パイプラインのパフォーマンス改善を行え」に基づき，config `research_frontier⑤`
+  （2026-07-18 追加）を対象とする．**フェーズ1（調査）で tavily 等により分散パイプライン並列推論の高速化手法を
+  文献調査**し（通信オーバーラップ・KV キャッシュ最適化・量子化・バッチング戦略・continuous batching・
+  speculative decoding 等），**フェーズ2（計画）で単一レバー原則に従い効果の高い 1 つの改善案へ絞り込む**という
+  2 段設計とする．
+- **②との統合**: 分析(解釈) は（ユーザー指示を認識する前に）②（マイクロバッチ数・stagger interval 感度分析）へ
+  進む方向を推奨していた．②は⑤の調査対象（バッチング戦略・チューニング軸）の一部であり，⑤に一本化できる．
+  よって Iteration 4 は「②の感度分析を含む，より広い高速化手法の中から調査で 1 つ選ぶ」形で②を吸収する．
+- **②/⑤着手の前提条件（フェーズ2＝計画が実験設計に必ず織り込む申し送り）**: (i) `mise.toml` の
+  `[tasks."predict:demo"]` が `--iter Iter1` 固定のため，複数 run が `results/Iter1.jsonl` に混在する実害を解消する
+  （`--iter Iter{n}` 変数化，または `collect_results.py --iter Iter{n}` 直接呼び出しを正式手順に固定）．
+  (ii) 冷開始交絡（再デプロイ後のプロセスグループ再初期化 348s，本 Iter3 の `ttft_s=81.637s` 突出がその実例）の
+  除去（最初の 1 run を捨てるか warm-up 後に計測）．(iii) 各レバー水準 n≥3〜5 反復．(iv) 主指標 ITL/TTFT の指定．
+  これらは backlog B6 に auto-decided として記録した．
+- **可逆性**: 次に振るレバーの選定であり可逆．ユーザーの直接指示に基づく自動判断とした（破壊的操作を含まない）．
+  実機 deploy/推論を伴う②/⑤の掃引 run 着手は，B1 の合意通りフェーズ4 直前に別途 Slack 確認を要する（不可逆側は
+  そこで人間判断を仰ぐ）．
+
+**次イテレーションへの結論**: Iteration 3（P1 levers 記録堅牢化）を採用で確定・収束．Iteration 4 は
+research_frontier⑤（ユーザー指示：先行研究調査に基づく推論パイプライン高速化）を，調査→計画で単一レバーへ
+絞り込む形で開始する（②を吸収）．
+
+---
+
+### 分析(解釈) (Iter3)
+
+**担当**: 分析(解釈) subagent（2026-07-18）．`## Iteration 3` の全ブロック（調査・計画・実装・実験）と
+`results/Iter3.jsonl`（journal 転記，1 レコード）を読み，単一レバー「P1: levers 記録の堅牢化」の成否判定・
+目的達成度・②着手条件・`mise.toml` 副次問題を解釈した．実機への新規接続・実行はしていない（記録の読み取りのみ）．
+
+**前提（判定の枠組み）**: 本イテレーションの判定対象は「振ったレバー値が正しく記録される仕組み」の成否であり，
+levers 抽出は決定的（純関数・正規表現一致）で**測定ノイズを持たない**．したがって Iter1 で問題になった「n が
+小さくノイズ幅未知」という論点は levers 記録の合否には該当しない．一方で実験値（`ttft_s` 等）の絶対水準・
+Iter1 比較は，レバーが全て既定値のままである本 run では**レバー効果ではない**ため判定材料にしない（下記 1 の注記）．
+
+**1. 成否判定: 採用相当（コードレベル成功条件 6 件を充足＋実機で仕組みが発火したことを機械的に確認）**
+
+- **コードレベル（計画 §4 の 1〜6，決定的）**: 実装フェーズ記録で全て充足．(1) `pytest` 38 passed（既存 30＋
+  新規 TL1〜TL8＝8 件，failed/error 0，「36 件以上」の下限超過），(2) TL6 が env と食い違う `levers_from_log` を
+  与えてもログ側が採用されること（P1 の核心）を assert，(3) TL7 が `levers_from_log is None` で env フォールバック
+  維持，(4) TL4/TL8 が選択済みブロック紐付け，(5) `py_compile` エラー無し，(6) コード変更 3 ファイル厳守
+  （`mise.toml`／JSONL スキーマ非改変）．
+- **実機での仕組み発火の機械的確認（今回の主眼）**: rank0 ログに新規 levers 行
+  `Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51` が実出力され，
+  `results/Iter3.jsonl` の `levers.SEQ_LEN=1`（Iter1 は同フィールド `null`）で確定した．`build_levers` は
+  `levers_from_log is not None` のとき `dict(levers_from_log)` を**丸ごと**返す all-or-nothing 構造（計画 §2 B-4）
+  であるため，**SEQ_LEN が非 null であること自体が「ログ由来経路が発火し，4 フィールド全部がログ由来で埋まった」
+  ことを一意に示す**（env フォールバックだったなら Iter1 と同じく `SEQ_LEN=null` になる）．TL6 の env≠log 挙動が
+  実機の実 run 上でも齟齬なく作動したことの，フィールドレベルの唯一かつ決定的な証拠がこの `SEQ_LEN=1` である．
+- **副次的な end-to-end 確認（Iter2 の実機未検証点の解消）**: 応答本文が複数行（`Hello! ...\nthought`）である
+  実 run で `parse_ok=true`・`parse_warnings=[]` を確認できた．Iter2（RESULT 複数行照合の頑健化）は単体テスト
+  止まりで実機 end-to-end 未検証だったが，本 run が「複数行 RESULT でフォールバック警告が実際に消える」ことを
+  実機で追認した（Iter2 分析(解釈) §3・考察 §2 の最大残存点が今回副次的に解消）．
+- **注記（判定対象外）**: `ttft_s=81.637s`（Iter1 の 26.0s より大）はレバー効果ではなく，実験 3 節記載の
+  再デプロイ後プロセスグループ再初期化（348s）に伴う冷開始の交絡である．本 run は 4 レバーが全て既定値
+  （NMB=4／STAGGER=3.0／SEQ_LEN=1／WORLD_SIZE=51）で，レバー掃引ではないため絶対水準の比較評価は行わない．
+
+**2. 目的達成度: 「env 由来の暗黙仮定で記録レバーが実レバーと食い違うリスク」を実機発火まで確認して解消**
+
+- 目的（②着手前の解消対象）は「収集ツール実行時 env とコンテナ起動時 env の一致という暗黙仮定
+  （`collect_results.py:405-406`）により，②で `NUM_MICRO_BATCHES`／`STAGGER_INTERVAL` を振ると記録レバーが実
+  レバーと食い違うリスク」の除去．今回の実機確認は，(i) rank0 が per-request で実効設定を 1 行出す，(ii) 収集側が
+  `--since run_start` 窓内・選択済みブロックからそれを抽出する，(iii) `build_levers` がログ由来を採用する，の 3 段が
+  実 run 上で連結して働くことを `SEQ_LEN=1`（非 null）で確定した．all-or-nothing 構造ゆえ，この 1 事例で「ログ由来
+  経路の実機発火」が担保され，env 依存はこの run について完全にバイパスされた．
+- **残存（限定的）**: 実機では env≠実レバーの**食い違いそのもの**はまだ再現していない（本 run は全レバー既定値で
+  env と一致しても不一致でも同値になる 3 フィールドと，唯一弁別できる SEQ_LEN のみで確認）．ただし食い違いケースは
+  TL6 が単体で押さえており，かつ build_levers の all-or-nothing 構造上「ログ経路が発火すれば env は一切参照されない」
+  ため，仕組みとしては一般化できる．食い違い自体の実機作動は②で NMB／STAGGER を実際に振る初回 run で自然に
+  exercised される（②の levers 列がログ由来の実値になることを確認すれば足り，P1 のためだけの追加単独 run は不要）．
+- **判定**: 目的（リスク解消）は，コードレベル（TL6）＋実機での仕組み発火（SEQ_LEN=1）まで到達しており達成．
+  「食い違いの実機再現」は②に畳み込む残タスクとして申し送る（P1 単独での追加反復は不要）．
+
+**3. `mise.toml` の `--iter Iter1` 固定問題の評価（P1 範囲外だが②の前提を壊す実害あり）**
+
+- 実験フェーズが `mise.toml` の `[tasks."predict:demo"]` に `--iter Iter1` が固定引数として入っており，
+  `mise run predict:demo` を素朴に実行すると常に `results/Iter1.jsonl` へ追記されると指摘（今回は
+  `collect_results.py --iter Iter3` を直接実行して回避）．これは今回のレバー（levers 記録堅牢化）の範囲外だが，
+  **②の前提を壊す実害**を持つ: ②はマイクロバッチ数・stagger interval を振って**複数イテレーション**を回すため，
+  `mise run predict:demo` を使う限り全 run が `results/Iter1.jsonl` に混在し，「どの run がどのイテレーション（＝
+  どのレバー水準の束）だったか」がファイルレベルで汚染される．皮肉にも，これは P1／Iter2 が levers 列・ブロック
+  照合レベルで潰した「run とレバーの取り違え」と**同種の誤紐付けが，より粗いファイル／イテレーション粒度で残る**
+  という関係にある．P1 で levers 列を堅牢化しても，出力先ファイルが固定では②の比較土台が別経路で崩れる．
+- **扱いの示唆**: これは推論スループット／品質に効く**研究レバーではなく実験ハーネス（tooling）の欠陥**である．
+  仮説・成功条件をスループット有意差で立てる「単一レバーの独立研究イテレーション」として扱うのは枠組みの
+  カテゴリ不一致であり，過剰である．**②のフェーズ2（実験設計）で，ハーネス前提条件として `--iter` を `Iter{n}`
+  へ変数化（あるいは②の run 手順として `collect_results.py --iter Iter{n}` 直接呼び出しを正式手順に固定）して
+  対処すること**を推奨する．②は複数イテレーション・複数ファイルが初めて意味を持つフェーズであり，この修正は②の
+  マルチ run 設計そのものによって検証される（別イテレーションを新設するより，②の setup に自然に載る）．厳格な
+  スコープ分離を優先する場合は，②着手前の小さな独立 tooling 修正コミット（研究レバーとは別枠）としてもよいが，
+  いずれにせよ**②の最初の掃引 run を回す前に**解消しないと結果が意図せず同一ファイルへ混在する．
+
+**4. ②（research_frontier②）着手条件の充足状況と進行可否**
+
+Iter1 分析(解釈) §3 が②着手前条件として挙げた 4 点（(a) RESULT 複数行対応・(b) levers 堅牢化・(c) n≥3 反復・
+(d) truncation に強い主指標 ITL/TTFT）の Iteration 1〜3 での解消状況を整理する．
+
+- **(a) RESULT 複数行照合の頑健化** → Iter2 で採用（単体テスト），本 Iter3 の実 run で `parse_ok=true`・
+  `parse_warnings=[]` を実機追認（上記 1）．**単体＋実機 end-to-end で解消**．
+- **(b) levers 記録の堅牢化** → 本 Iter3 で解消（コードレベル TL6 ＋実機で `SEQ_LEN=1` 非 null により仕組み発火を
+  確認）．**残存は「env≠実レバーの食い違いそのものの実機再現」のみで，②の初回掃引 run に畳み込み可**（上記 2）．
+- **(c) レバー値あたり n≥3〜5 反復でノイズ幅確立** → **未解消（②内で担保すべき実験設計条件）**．Iter1〜3 は
+  いずれも n=1 で run 間ばらつきは未知のまま．これは事前イテレーションで潰す種類の欠陥ではなく，②の実験計画に
+  組み込む前提であり，②のフェーズ2 で各レバー水準 n≥3〜5 を設計する．
+- **(d) truncation に強い主指標 ITL/TTFT の採用** → **仕組みは整備済み・決定は②で行う**．`Iter3.jsonl` は
+  `itl_p50_s`／`itl_p95_s`／`ttft_s` を既に算出しており（コード基盤は Iter1 で確立），②の success_criteria で
+  これらを主指標，`tokens_per_sec` を補助と明記すればよい（Iter1 で指摘された loop-detection truncation の
+  スループット交絡を回避）．コードギャップではなく②設計での指標指定事項．
+
+- **進行可否の判断**: ②着手前に「事前イテレーションで潰すべき基盤頑健化」だった (a)(b) は**両方とも解消した**
+  （B3→B4 の経緯＝①基盤→②直行せず (a) 頑健化→②直行せず (b) levers 堅牢化，が完了）．残る (c)(d) は②の実験
+  **設計条件**であり，独立の先行イテレーションを要しない．したがって**②（マイクロバッチ数・stagger interval の
+  感度分析）へ進む条件は，実験ハーネス側の 1 点を満たせば整う**．すなわち②のフェーズ2 で，(i) `mise.toml` の
+  `--iter Iter1` 固定を解消（上記 3），(ii) 各レバー水準 n≥3〜5 反復，(iii) 主指標 ITL/TTFT の指定，(iv) 冷開始
+  交絡の除去（再デプロイ直後のプロセスグループ再初期化 348s を避けるため，最初の 1 run は捨てるかクラスタ warm-up
+  後に計測する．本 Iter3 の `ttft_s=81.637s` 突出はこの交絡の実例）を設計に織り込むこと．これらは事前イテレーション
+  ではなく②の計画そのものに属する．
+
+**次フェーズ（考察・次計画 reflector）への結論（採用/棄却の材料）**
+
+- **P1（levers 記録の堅牢化）は採用が妥当**．コードレベル成功条件 6 件を充足（38 passed 他），実機で仕組みの
+  発火（`levers.SEQ_LEN=1` 非 null，all-or-nothing 構造によりログ由来経路の作動を一意に確定）を確認した．
+  判定は決定的で**追加反復は不要**（食い違い自体の実機再現は②の初回掃引 run に畳み込む）．
+- **次イテレーションの示唆**: ②着手前に先行イテレーションで潰すべき基盤頑健化 (a)(b) は Iteration 2・3 で完了した．
+  残る (c) n≥3 反復・(d) 主指標 ITL/TTFT は②の実験設計条件で②内で担保する．よって**② へ進む方向を推奨**するが，
+  その直前に (i) `mise.toml` の `--iter Iter1` 固定を②のハーネス設計で解消（②の複数ファイル混在という実害を防ぐ），
+  (ii) 冷開始交絡（再デプロイ後 348s 再初期化）の除去，を②のフェーズ2 前提として明記すること．P1 の実機 deploy/
+  推論は B1/B5 で承認済み（既に②の最初の承認済み run へ畳み込める状態）．
+
+---
+
+### 実験 (Iter3)
+
+**担当**: 実験フェーズ subagent（2026-07-18）．B5 でユーザーが承認した範囲（`mise run deploy` による
+再デプロイ＋ `mise run predict:demo`（収集ツール経由）1 回の実行）で，実装フェーズが確定した levers 記録の
+堅牢化（`pipeline_inference.py` の 1 行 INFO ログ追加）を実機 51 ノードで動作確認した．数値の良否判定は行わない．
+
+**1. 事前ヘルスチェック**
+
+- `uv run python tools/healthcheck.py`（デプロイ前）: **51/51 healthy**（SSH／Docker daemon／
+  distributed-llm container running／モデル重み／MTU 1500，全項目 OK）．
+
+**2. デプロイ（`mise run deploy`）**
+
+- 実行コマンド: `mise run deploy`（バックグラウンド実行＋ポーリング，`poll_interval_sec=60` 間隔で
+  `state.json.updated_at` を更新しつつ待機）．
+- フェーズ内訳（ログより）: Phase1〜3（ローカル build → registry push → モデル配布，モデル重みは
+  「all files already present, skipping」で既存重みを再利用）が約 2 分強，Phase4（51 ノードへの
+  イメージ pull・コンテナ再起動）が **06:34.25**．
+- 結果: `[RESULT] Deploy results: success=51, failed=0, total=51`．`Phase 4 completed in 06:34.25`，
+  `Deploy script complete. Total time: 08:49.54`．異常・失敗ノード無し．
+
+**3. デプロイ直後の一時的接続エラー（実害なし・原因特定済み）**
+
+- デプロイ完了直後に `uv run python tools/collect_results.py --iter Iter3 --prompt "Hello!"` を実行したところ，
+  1 回目は `ConnectionRefusedError: [Errno 111] Connection refused`（HTTP 8082 未リッスン）で失敗した．
+  `RANK=0 uv run python tools/show_logs.py` で rank0 ログを確認したところ，コンテナ再起動後
+  `Initializing process group ... Waiting for 51 nodes to join... Process group initialized on attempt 1 (347.9s)`
+  とあり，51 ノードの再接続（プロセスグループ初期化）に約 348 秒かかっており，その完了・HTTP サーバ起動
+  （`HTTP server listening on 0.0.0.0:8082`）前にリクエストを送ってしまったことが原因と特定できた．
+  数十秒待って再実行したところ正常に応答した（下記4）．51 ノード再接続に伴う既知の起動レイテンシであり，
+  ノード障害・デプロイ失敗ではない．
+
+**4. 推論実行（`mise run predict:demo` 相当，収集ツール経由）**
+
+- 実行コマンド: `uv run python tools/collect_results.py --iter Iter3 --prompt "Hello!"`
+  （`mise.toml` の `[tasks."predict:demo"]` は `--iter Iter1` を固定引数として持つため，`results/Iter3.jsonl` へ
+  出力させるために `--iter Iter3` を明示指定．`mise run predict:demo` 単体ではファイル名が `Iter1.jsonl` に
+  固定される点は運用上の既知事項として次フェーズへ申し送る）．
+- 標準出力: `[INFO] appended 1 record to results/Iter3.jsonl (parse_ok=True, tokens_per_sec=0.07037958053769999)`，
+  応答本文 `Hello! How can I help you today?\nthought`．
+
+**5. rank0 ログでの levers 行の実測確認（今回の主目的）**
+
+`RANK=0 uv run python tools/show_logs.py` で rank0 ログを取得し，`Rank 0: prompt=` 行の直後に新しい levers 行が
+実際に出力されていることを確認した．
+
+```
+[R0 INFO] Rank 0: prompt='Hello!'
+[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51
+```
+
+**6. `results/Iter3.jsonl` の内容**（1 レコードのみ．ファイル行数 `wc -l` = 1）
+
+```json
+{
+  "schema_version": 1,
+  "iter": "Iter3",
+  "run_id": "Iter3-20260718T130743Z-4d3608",
+  "timestamp": "2026-07-18T13:07:43Z",
+  "prompt": "Hello!",
+  "prompt_tokens": 15,
+  "output_tokens": 15,
+  "step_dt": [81.637, 7.066, 7.017, 7.015, 6.878, 6.81, 6.838, 6.937, 6.871, 6.902,
+              6.824, 6.759, 6.864, 6.926, 7.001, 6.784, 6.858, 7.153, 6.942, 7.048],
+  "ttft_s": 81.637,
+  "generation_time_s": 213.13,
+  "tokens_per_sec": 0.07037958053769999,
+  "itl_p50_s": 6.902,
+  "itl_p95_s": 7.0747,
+  "decode_time_s": 0.0,
+  "e2e_latency_s": 240.949642,
+  "result_text": "Hello! How can I help you today?\nthought",
+  "embed_stats": {"mean": 0.004217, "std": 1.108908, "min": -15.3125, "max": 16.875},
+  "levers": {"NUM_MICRO_BATCHES": 4, "STAGGER_INTERVAL": 3.0, "SEQ_LEN": 1, "WORLD_SIZE": 51},
+  "parse_ok": true,
+  "parse_warnings": []
+}
+```
+
+- **今回の主目的（levers がログ由来で埋まっているか）の機械的確認**: `levers.SEQ_LEN=1` は，
+  Iter1 の同フィールド（`null`．env フォールバックでは値を取得できず未設定だった）と異なり，**非 null の
+  実測値**で埋まっている．`pipeline_inference.py:309` の実装 `self.seq_len = int(os.environ.get("SEQ_LEN", "1"))`
+  と，rank0 ログの levers 行（`SEQ_LEN=1`）が一致しており，5 の実ログ行から `_extract_levers` が値を取り出して
+  `levers_from_log` を経由し JSONL の `levers` に採用されていることを確認した（env フォールバックだった場合，
+  Iter1 と同じく `SEQ_LEN=null` になっていたはずである）．他 3 フィールド（`NUM_MICRO_BATCHES=4`，
+  `STAGGER_INTERVAL=3.0`，`WORLD_SIZE=51`）もログ行の値と完全一致．
+- **内部整合の機械的チェック**（Iter1 分析(実行)と同型の検算，`python3` で実施）:
+  - `sum(step_dt) = 213.13 = generation_time_s`（完全一致）．
+  - `ttft_s(81.637) == step_dt[0](81.637)`: True．
+  - `e2e_latency_s(240.9496) − generation_time_s(213.13) = 27.8196s`（符号・大小関係は正常，e2e ≥ generation）．
+  - `parse_ok=true`，`parse_warnings=[]`（Iter2 で対処した複数行 RESULT のフォールバック警告も今回発生せず）．
+- **注記（判定は行わない）**: 今回の `ttft_s=81.637s` は Iter1（`ttft_s≈26.0s`）より大きいが，3 節で記録した
+  デプロイ直後の 51 ノード再接続（プロセスグループ再初期化 348s）に伴う一時的な状態と，Iter1 実行時の
+  クラスタ状態（既に稼働継続中）との違いが疑われる．絶対水準・Iter1 との比較評価は本フェーズの対象外
+  （analyst の担当）．
+
+**7. 事後ヘルスチェック**
+
+- `uv run python tools/healthcheck.py`（実験後）: **51/51 healthy**（全項目 OK，異常ノード無し）．
+
+**8. 実行/ログ上の異常の有無（まとめ）**
+
+- デプロイ: 異常無し（51/51 成功）．
+- 推論実行: 1 回目の `ConnectionRefusedError` は 3 節で原因特定済みの一時的事象（51 ノード再接続完了前の
+  リクエスト）であり，実害・ノード障害ではない．2 回目で正常完了．
+- ログ: 新しい levers 行が想定どおり出力され，`results/Iter3.jsonl` の `levers` フィールドがログ由来の
+  非 null 値で埋まっていることを確認した．`parse_ok=true`，`parse_warnings=[]`．
+- クラスタ健全性: デプロイ前後とも 51/51 healthy．
+
+**次フェーズ（分析(実行)）への申し送り**
+
+- `mise run predict:demo` は `mise.toml` 上 `--iter Iter1` に固定されているため，本フェーズは
+  `uv run python tools/collect_results.py --iter Iter3 --prompt "Hello!"` を直接実行して `results/Iter3.jsonl`
+  へ出力した．`mise.toml` 側の固定値を `Iter{n}` 変数化する改修余地は残る（要レビュー，今回の変更範囲外）．
+  `mise run predict:demo` をそのまま使うと現状 `results/Iter1.jsonl` に上書き追記される点に注意．
+- n=1 のため run 間ばらつきは未知（Iter1 と同じ既知の限界）．
+- success_criteria①（Iter1 で確立済み）に対する機械検証と，levers 記録堅牢化（P1）の成功条件充足可否の
+  判定は analyst に委ねる．
+
+---
+
+### 実装 (Iter3)
+
+**担当**: 実装フェーズ subagent（2026-07-18）．計画フェーズ（本ブロック下 `### 計画 (Iter3)`）が確定した単一レバー
+「P1: levers 記録の堅牢化（env 由来 → ログ由来）」を，計画の指定どおり 3 ファイルのみ変更して実装した．
+実機クラスタへの deploy／推論実行は行っていない（フェーズ4は人間確認後にオーケストレータが着手）．
+
+**変更内容（計画からの差異は無し）**
+
+1. **`pipeline_inference.py`**（`:1441` `Rank 0: prompt='...'` の直後，`if self.config.rank == 0:` ブロック内・
+   生成ループ外）に，計画どおり `self.config.num_micro_batches`／`self.config.stagger_interval`／
+   `self.config.seq_len`／`self.config.world_size` を 1 行 INFO ログで出す処理を追加した（起動バナー `:2008-2015`
+   へは追加していない）。出力書式:
+   `Rank 0: levers NUM_MICRO_BATCHES=<int> STAGGER_INTERVAL=<float> SEQ_LEN=<int> WORLD_SIZE=<int>`。
+   `:1443` のローカル変数 `seq_len`（prompt token 数）とは取り違えず，`self.config.seq_len` を使用した。
+2. **`tools/collect_results.py`**: `_LEVERS_RE` を新設（既存正規表現群の並びに追加），`_extract_levers(block)` を
+   `_extract_prompt_tokens_and_embed` と同型で新設，`ParsedLog` に `levers_from_log: dict[str, int | float | None]
+   | None = None`（デフォルト付き，既存 keyword 構築テストと非破壊）を追加し，`parse_rank0_log` の本 return で
+   選択済み `block` から `_extract_levers(block)` を設定するよう配線した。`build_levers(config,
+   levers_from_log=None)` へシグネチャを変更し，`levers_from_log is not None` ならそれを優先採用，`None` なら
+   従来の env/`ClusterConfig` フォールバック（`_to_number` 本体は無改変）へ回す 2 段構えにした。
+   `run_and_collect` の呼び出しを `build_levers(config, parsed.levers_from_log)` に更新した。
+3. **`tests/test_collect_results.py`**: TL1〜TL8（8 件）を追加した。核心の TL6
+   （`test_build_levers_prefers_log_over_env`）は env と `levers_from_log` を意図的に食い違わせ，ログ側が
+   採用されることを確認する。TL8（`test_levers_bound_to_selected_block_in_multiblock_log`）は 2 ブロック
+   （levers 値が異なる）を用意し，`predict_result` が一致する（最新でない）ブロックの levers に正しく紐づき，
+   他ブロックの levers と混同しないことを確認する。
+
+**テスト結果**
+
+- `uv run pytest tests/test_collect_results.py -v`: **38 passed, 0 failed**（既存 30 件 + 新規 8 件，回帰無し）。
+- `uv run python -m py_compile pipeline_inference.py tools/collect_results.py tests/test_collect_results.py`:
+  エラー無し。
+- `git diff --name-only` のコード変更は `pipeline_inference.py`／`tools/collect_results.py`／
+  `tests/test_collect_results.py` の 3 ファイルのみ（`git status` に新規 `.log` フィクスチャの混入も無し）。
+  `tools/predict.py`／`tools/common.py`／`mise.toml`／JSONL スキーマは無改変。
+
+**計画からの差異**: 無し。TL4（`test_parse_rank0_log_populates_levers_from_log`）のみ，計画の例示ログに
+`prompt tokens=...` 行が無く `parse_ok` が意図せず `False` になったため，実装時に当該行を追加して `parse_ok=True`
+まで確認できるようにした（計画の意図「levers_from_log が選択済みブロックから設定され，かつ parse_ok が従来
+どおり決まることを確認する」を満たすための軽微な補完であり，レバー本体・成功条件には影響しない）。
+
+フェーズ4（実機実験）は本イテレーションのフェーズ2・3の範囲外であり，B1 の人間確認後にオーケストレータが着手する。
+
+---
+
+### 計画 (Iter3)
+
+**担当**: 計画フェーズ subagent（2026-07-18）．単一レバー「P1: levers 記録の堅牢化」（backlog B4，auto-decided）を，
+調査フェーズの結論（本ブロック下 `### 調査 (Iter3)`）と実コード（`pipeline_inference.py`／`tools/collect_results.py`）に
+照らして実装手順・追加テスト・成功条件へ落とし込んだ．**本イテレーションのフェーズ2・3 はコード実装・単体テストのみで，
+実機クラスタへの deploy/推論実行は行わない**（フェーズ4は B1 の人間確認後にオーケストレータが着手する）．
+
+#### 1. 仮説
+
+rank0 が **リクエスト毎に**「実際に効いた実行設定（`self.config` 解決後の 4 レバー）」を 1 行 INFO ログで出し，
+収集側（`collect_results.py`）が **その当該ブロックのログ行から** levers を確定すれば，現行 `build_levers` が抱える
+「コンテナ起動時 env と収集ツール実行時 env の一致」という暗黙仮定（`collect_results.py:405-406` に明記）を排除でき，
+②（`NUM_MICRO_BATCHES`／`STAGGER_INTERVAL` 掃引）で env が不一致になっても記録レバーが実レバーと食い違わない．
+変更はホットパス外の per-request 1 print とパース純関数に閉じるため単体テストで完了条件を組める．
+
+#### 2. 単一レバー・変更内容
+
+変更ファイルは **`pipeline_inference.py`（1 行追加）**，**`tools/collect_results.py`（levers 確定をログ優先化）**，
+**`tests/test_collect_results.py`（テスト追加）** の 3 つのみ．`tools/predict.py`／`tools/common.py`／`mise.toml`／
+JSONL スキーマは非改変．固定する構成: 出力位置・書式・rank0 限定・env フォールバック維持は調査フェーズの推奨方式に
+固定し，本イテレーションで動かすのは「levers を env 由来からログ由来へ切り替える」1 点のみとする（単一レバー原則）．
+
+**(A) `pipeline_inference.py`（per-request 1 行 INFO 追加）**
+
+- **出力位置**: rank0 のブロック開始マーカー `_log("INFO", f"Rank 0: prompt='{prompt}'")`（`pipeline_inference.py:1441`）の
+  **直後**（次行 `input_ids = _tokenize(prompt)` `:1442` の手前）に 1 行追加する．`if self.config.rank == 0:` ブロック内
+  （`:1439`）かつ生成ループ（`:1451` 開始）の**外側**なので graph-break・性能影響は無い（`torch.compile` 実呼び出しは
+  リポジトリに 0 件）．
+- **正確な追加コード**（`self.config` は当該メソッド内で有効．`:1434` `self.config.rank` 等で既出）:
+  ```python
+  _log("INFO", f"Rank 0: levers NUM_MICRO_BATCHES={self.config.num_micro_batches} STAGGER_INTERVAL={self.config.stagger_interval} SEQ_LEN={self.config.seq_len} WORLD_SIZE={self.config.world_size}")
+  ```
+- **値の出所**: `PipelineConfig.__init__`（`:288-309`）が env→既定値の順に解決した確定値
+  （`num_micro_batches` int，`stagger_interval` float，`seq_len` int（既定 1），`world_size` int）．env を直接読むより
+  堅牢で「起動時に実際に効いた値」を出せる（特に `SEQ_LEN` は現行 `build_levers` が env 未設定時 `null` にするが実効は
+  既定 1．`config.seq_len` を出せば解消する）．**`prompt` 直後の `seq_len`（`:1443` で prompt token 数に再代入）とは別物**
+  なので，必ず `self.config.seq_len`（KV キャッシュ上限レバー）を使うこと．
+- **物理ログの見え方**: `_log`（`:180-192`）が `[R{rank} {tag}] {msg}` を付すため，rank0 の物理行は
+  `[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51` となる．
+- **rank0 限定で十分**: 収集は rank0 の `docker logs` のみを見る（`collect_rank0_log:477-494`，`_extract_rank0_messages`
+  は `R0` レコードのみ残す `:94`）．この位置は `if self.config.rank == 0:` 内なので自然に rank0 のみ出る．
+  **起動バナー（`:2008-2015`）への追加は不採用**（`docker logs --since {run_start}` 窓の外になり収集されない．調査フェーズ
+  「`--since` 窓の落とし穴」参照）．
+
+**(B) `tools/collect_results.py`（levers をログ優先・env フォールバックの 2 段構えへ）**
+
+- **(B-1) 正規表現 `_LEVERS_RE` を新設**（既存の per-block 抽出用正規表現群 `:45-60` と同じ場所に置く）:
+  ```python
+  _LEVERS_RE = re.compile(
+      r"^Rank 0: levers NUM_MICRO_BATCHES=(\d+) STAGGER_INTERVAL=([\d.]+) "
+      r"SEQ_LEN=(\d+) WORLD_SIZE=(\d+)$"
+  )
+  ```
+  `_extract_rank0_messages` が `[R0 INFO] ` プレフィックスを剥がした本文（`Rank 0: levers ...`）に対して照合する
+  （既存 `_PROMPT_TOKENS_EMBED_RE` 等と同型）．`STAGGER_INTERVAL` は config lever 値（0.0/0.5/1.0，既定 3.0）が
+  `f"{float}"` で `0.0`/`0.5`/`1.0`/`3.0` と出るため `([\d.]+)` で確実に拾える．
+- **(B-2) per-block 抽出関数 `_extract_levers` を新設**（既存 `_extract_prompt_tokens_and_embed` 等 `:179-226` と同型）:
+  ```python
+  def _extract_levers(block: list[str]) -> dict[str, int | float | None] | None:
+      """ブロック内の `Rank 0: levers NUM_MICRO_BATCHES=... ...` 行から実効 levers を抽出する．
+      見つからなければ None（旧ログ互換で env フォールバックへ回す）．"""
+      for msg in block:
+          match = _LEVERS_RE.match(msg)
+          if match:
+              return {
+                  "NUM_MICRO_BATCHES": int(match.group(1)),
+                  "STAGGER_INTERVAL": float(match.group(2)),
+                  "SEQ_LEN": int(match.group(3)),
+                  "WORLD_SIZE": int(match.group(4)),
+              }
+      return None
+  ```
+- **(B-3) `ParsedLog` に `levers_from_log: dict[str, int | float | None] | None = None` を追加**（`:229-240`．既存
+  `parse_warnings` の後ろ＝デフォルト付きフィールドとして追加するので，早期 return 分岐（`:258-271`）は無改変で通り，
+  `ParsedLog(...)` を keyword 構築する既存テスト（`:452`）も影響を受けない）．`parse_rank0_log` の本 return（`:299-304`）で
+  `levers_from_log=_extract_levers(block)` を渡す（**選択済みブロック** `block` から読むため，複数 run が並んでも
+  `_select_relevant_block` が選んだ正しいブロックの levers が紐づく）．
+- **(B-4) `build_levers` をログ優先へ変更**（`:397-422`）．シグネチャに任意引数を追加し，ログ由来があればそれを採用，
+  無ければ従来の env/config フォールバックを残す（後方互換）:
+  ```python
+  def build_levers(
+      config: ClusterConfig,
+      levers_from_log: dict[str, int | float | None] | None = None,
+  ) -> dict[str, int | float | None]:
+      if levers_from_log is not None:
+          return dict(levers_from_log)
+      # フォールバック（旧ログ・パース失敗時）: 従来の env/config 由来（既存 `_to_number` 本体をそのまま残す）
+      ...
+  ```
+- **(B-5) `run_and_collect`（`:516`）の呼び出しを `levers = build_levers(config, parsed.levers_from_log)` に変更**．
+  これが唯一の配線変更（`build_record` 以降は無改変）．
+- docstring（`build_levers` / `parse_rank0_log` の Returns）に「ログ優先・env フォールバック」「`levers_from_log`」の
+  記述を追記する．
+
+#### 3. 追加すべきテストケース（`tests/test_collect_results.py`．既存 30 件は全て維持）
+
+既存 3 件（`test_build_levers_reads_config_defaults_and_seq_len_from_env` 他 `:392-427`）は `build_levers(fake_config)` を
+1 引数で呼ぶため，任意引数追加後もそのまま pass（＝env フォールバック経路の回帰確認を兼ねる）．新規は物理ログ
+（`[R0 ...]` プレフィックス付き）のインライン文字列で与え，新規 `.log` フィクスチャは作らない（Iter2 の `*.log`
+gitignore トラップ回避）．追加（最低 6 件）:
+
+- **TL1 `test_extract_levers_parses_typed_values`**: `_extract_levers` が `Rank 0: levers NUM_MICRO_BATCHES=8
+  STAGGER_INTERVAL=0.5 SEQ_LEN=512 WORLD_SIZE=21` を含むブロックから `{NUM_MICRO_BATCHES:8, STAGGER_INTERVAL:0.5,
+  SEQ_LEN:512, WORLD_SIZE:21}` を返し，型が int/float で正しいことを assert（`isinstance` 検査を含める）．
+- **TL2 `test_extract_levers_returns_none_when_line_absent`**: levers 行を含まないブロック（旧形式）で `None` を返す．
+- **TL3 `test_extract_levers_handles_stagger_zero_and_default`**: `STAGGER_INTERVAL=0.0` および `=3.0` が `0.0`/`3.0`
+  (float) として拾える（掃引で使う 0.0/0.5/1.0 と既定 3.0 の書式カバレッジ）．
+- **TL4 `test_parse_rank0_log_populates_levers_from_log`**: 物理ログ全体（`[R0 INFO] Rank 0: prompt='...'` の直後に
+  `[R0 INFO] Rank 0: levers ...` を置く）を `parse_rank0_log` に通し，`levers_from_log` が期待 dict になり，かつ
+  `_extract_rank0_messages`→`_split_into_blocks`→`_extract_levers` の end-to-end で `[R0 INFO] ` 剥離と正規表現一致が
+  効くこと・`parse_ok` が従来同様に決まることを assert（出力書式が収集側正規表現と噛み合うことの検証）．
+- **TL5 `test_parse_rank0_log_levers_from_log_none_for_legacy_log`**: levers 行の無い旧形式ログで `levers_from_log is None`
+  （後方互換）．
+- **TL6 `test_build_levers_prefers_log_over_env`（本レバーの核心）**: `os.environ` の
+  NUM_MICRO_BATCHES/STAGGER_INTERVAL/WORLD_SIZE/SEQ_LEN と `fake_config` を，`levers_from_log` と **食い違う値**に設定した上で
+  `build_levers(fake_config, levers_from_log=<log値>)` を呼び，戻り値が `levers_from_log` と一致する（ログ側が優先され env が
+  無視される）ことを assert．
+- **TL7 `test_build_levers_falls_back_to_env_when_log_none`**: `build_levers(fake_config, None)` が従来どおり env/config から
+  構築する（＝既存 3 件と同じ経路．env 不在時の SEQ_LEN=null も確認）．
+- **TL8 `test_levers_bound_to_selected_block_in_multiblock_log`**: 2 ブロック（levers 値が異なる）を並べ，`predict_result`
+  が **先（最新でない）ブロック** の RESULT に一致する状況で，`parse_rank0_log(...).levers_from_log` が**一致した正しい
+  ブロックの levers**（最新ブロックのものではない）になることを assert．②の per-run クロス汚染防止が levers 記録でも
+  働くことの検証（Iter2 の T5 と対になる）．
+
+#### 4. 成功条件（measurable・コードレベル．実機接続不要）
+
+判定はすべて決定的（純関数・dataclass の pass/fail）でノイズ幅の見積もりは不要．以下を全て満たせば「採用」候補とする．
+
+1. `uv run pytest tests/test_collect_results.py` が green．**既存 30 件が全て pass のまま**，新規 TL1〜TL8（最低 6 件）も
+   pass（合計 36 件以上 passed，failed/error 0）．
+2. TL6 が示すとおり `build_levers(config, levers_from_log)` は **env と食い違ってもログ由来を採用**する（P1 の核心＝
+   env 依存の暗黙仮定の排除）．
+3. TL7 が示すとおり `levers_from_log is None`（旧ログ・パース失敗）では従来の env/config フォールバックが維持される
+   （後方互換）．
+4. TL4/TL8 が示すとおり，levers は `parse_rank0_log` の**選択済みブロック**から抽出され，複数ブロックでも正しい run に
+   紐づく．
+5. `uv run python -m py_compile pipeline_inference.py tools/collect_results.py tests/test_collect_results.py` が
+   エラー無し（lint/型チェッカーはリポジトリ未導入．`py_compile` は import せず構文のみ検査するため，
+   `pipeline_inference.py` の重い依存を走らせずに追加行の構文健全性を確認できる）．
+6. スコープ厳守: `git diff --name-only` の**コード変更**が `pipeline_inference.py`／`tools/collect_results.py`／
+   `tests/test_collect_results.py` の 3 ファイルのみ（`predict.py`／`common.py`／`mise.toml`／JSONL スキーマ非改変．
+   `git status` に新規 `.log` が現れないこと）．
+
+#### 5. フェーズ4（実験・実機接続）は本イテレーションの範囲外
+
+- **フェーズ2（本計画）・フェーズ3（実装）はコード実装・単体テストのみで完結する**．`pipeline_inference.py` への 1 行追加
+  自体は graph-break リスクが無いが，実際に「rank0 ログに levers 行が出て収集側が拾う」ことの end-to-end 確認には
+  `mise run deploy`（再デプロイ）＋推論実行が必要で，これは 51 ノード実機接続を伴う．
+- backlog B4 の通り，**Iteration 3 のフェーズ4（実験）へ進む前に，B1 の合意に基づく人間確認（Slack）が必須**．
+  実機での最終確認は②（レバー掃引）の最初の承認済み実 run に畳み込めばよく，本レバーのためだけに 51 ノードを単独
+  起動する必要は無い．オーケストレータはフェーズ4の直前で必ず人間確認を挟むこと（コードとテストだけでこのフェーズ2・3
+  は完了と扱う）．
+
+#### 6. 実装フェーズ（rc-implementer）への申し送り
+
+- **変更キー・箇所**: (A) `pipeline_inference.py:1441` の直後に §2(A) の 1 行を追加（`self.config.*` の解決値を使用．
+  `self.config.seq_len` を使い `:1443` の `seq_len` と取り違えない．起動バナー `:2008-2015` には**足さない**）．
+  (B) `tools/collect_results.py` に `_LEVERS_RE`（§2 B-1）／`_extract_levers`（B-2）を新設，`ParsedLog.levers_from_log`
+  （B-3）を追加し `parse_rank0_log` 本 return で設定，`build_levers` にログ優先分岐（B-4）を追加，`run_and_collect` の
+  呼び出しを `build_levers(config, parsed.levers_from_log)`（B-5）へ変更．
+- **非改変厳守**: `tools/predict.py`／`tools/common.py`（`ClusterConfig`）／`mise.toml`／JSONL スキーマは触らない．
+  `build_levers` の env フォールバック本体（`_to_number` 込み）は既存のまま残す（後方互換）．`_extract_result_text` 等
+  Iter2 の照合ロジックは無改変．
+- **既存テスト非破壊の確認観点**: 既存 `build_levers` 3 件（`:392-427`，1 引数呼び出し）と `ParsedLog(...)` を keyword 構築
+  する既存テスト（`:452`）が，任意引数・デフォルト付き新フィールド追加後もそのまま pass することを実行で確認する．
+- **禁止事項の再掲**: 実機への `deploy`/`predict:demo` 実行はしない（フェーズ2・3 はコードとテストのみ）．フェーズ4は
+  人間確認後にオーケストレータが着手する．
+
+---
+
+### 調査 (Iter3)
+
+**担当**: 調査フェーズ subagent（2026-07-18）．単一レバー「P1: levers 記録の堅牢化」（backlog B4）の計画に向け，
+`pipeline_inference.py` の起動・実行設定の決定箇所と `tools/collect_results.py` の levers 構築を，実機に触れず
+コード読み取りのみで調査した．実機クラスタへの接続・deploy/推論実行は一切していない．
+
+**問い**
+1. 4 レバー（`NUM_MICRO_BATCHES`/`STAGGER_INTERVAL`/`SEQ_LEN`/`WORLD_SIZE`）の「有効値」はどこでどう決まるか．
+2. 起動時 1 行 INFO ログをどこに・どの書式で出すのが自然か．全 rank か rank0 のみか．
+3. `collect_results.py` 側のパース統合方式（既存 rank0 ログパースに載せられるか）．
+4. graph-break / ホットパス性能への影響．
+
+**分かったこと（コード出典＝リポジトリ内 ファイル:行）**
+
+- **4 レバーの有効値は全て `PipelineConfig.__init__`（`pipeline_inference.py:288-309`）が `os.environ` → 既定値の
+  順で解決し，`config.num_micro_batches`/`config.stagger_interval`/`config.seq_len`/`config.world_size` に確定する**．
+  既定値は `NUM_MICRO_BATCHES=4`（`DEFAULT_NUM_MICRO_BATCHES`，`:63`），`STAGGER_INTERVAL=3.0`（`:64`），
+  `SEQ_LEN=1`（`os.environ.get("SEQ_LEN","1")`，`:309`），`WORLD_SIZE` は必須（既定無し，`:289`）．
+  → **1 行ログに出すべきはこの 4 つの解決後の値**（env そのものではなく `config.*` の確定値）．env を直接読むより
+  堅牢＝「起動時に実際に効いた値」を出せる．特に `SEQ_LEN` は現行 `build_levers`（下記）が env 未設定時に `null` に
+  するが，実際の有効値は既定 `1` である（この食い違いも `config.seq_len` を出せば解消する）．
+- **命名の注意（計画・実装向け）**: 委譲元・backlog は「`ClusterConfig`」と呼ぶが，`pipeline_inference.py` の設定
+  クラスは `PipelineConfig` である（`ClusterConfig` は `tools/common.py` にある別クラスで，`deploy.py`/`collect_results.py`
+  が使う）．両者は独立（deploy 側 `ClusterConfig` の env を各コンテナへ注入し，コンテナ内 `PipelineConfig` が読む）．
+- **`main()` には既に起動バナーがある（`pipeline_inference.py:2008-2015`）**．`_log("INFO", ...)` で rank/world_size・
+  assigned layers・hidden size・weight format・master を出しているが，**4 レバーのうち出ているのは world_size のみで
+  `NUM_MICRO_BATCHES`/`STAGGER_INTERVAL`/`SEQ_LEN` は出ていない**．また `:1020` に
+  `_log("OK", "Inference loop started. micro_batches=... pipeline_stages=...")` があり micro_batches と world_size は
+  既に出るが，stagger/seq_len は無く，レベルも OK．いずれも 4 レバー全部を機械可読に並べた 1 行ではない．
+- **rank0 のみで足りる（重要）**: 収集側 `collect_rank0_log`（`collect_results.py:477-494`）は wafl-ctrl1（=rank0）の
+  `docker logs` **だけ**を取得し，パースは `_extract_rank0_messages` が `[R0 ...]` 行だけを残す（`:64-94`）．
+  よって**消費されるのは rank0 の 1 行だけ**．env はコンテナ毎注入だが `deploy.py:563,573` が全コンテナへ同一値
+  （deploy 時 `ClusterConfig` の `world_size`/`num_micro_batches` 等）を渡すため設計上は全 rank 共通．記録に使うのは
+  rank0 自身が実際に使った値であり自己整合する．全 rank が出しても害は無い（バナーは既に全 rank 出力）が，
+  **パーサが必要とするのは rank0 の 1 行のみ**．
+- **graph-break / 性能影響は無い**: `pipeline_inference.py` に **`torch.compile()` の実呼び出しは無い**
+  （`:164-165` はコメントで言及するのみ．grep で呼び出し 0 件）．追加するのは起動時または 1 リクエスト 1 回の `print`
+  1 行で，トークン生成ループ（`:1451` 開始）の外側．デコードループは 1 step ごとに複数 INFO 行を既に出している
+  （`:1453` 等）ため，1 リクエスト 1 行の増加は定常運用に対し無視できる．
+
+**収集側パース統合と「`--since` 窓」の落とし穴（計画に必須の設計論点）**
+
+- `collect_results.py` の levers は `build_levers`（`:397-422`）が **`ClusterConfig`（＝収集ツール実行時の
+  `os.environ`）由来**で構築しており，「コンテナ起動時 env と収集時 env の一致」を暗黙仮定する（`:405-406` に明記）．
+  これが B4 で潰す対象．ログ由来へ切り替えれば env 依存を排除できる．
+- **落とし穴（最重要）**: `collect_rank0_log` は `docker logs --since {run_start}` を使い，`run_start` は**プロンプト
+  送信直前**の `datetime.now(UTC)`（`run_and_collect:500`）．一方コンテナ／`main()` バナーの起動ログは **deploy 時に
+  一度だけ**出る（通常は run より遥か前）．したがって **起動時バナーに 1 行足すだけでは `--since run_start` 窓から
+  外れて収集側に見えない可能性が高い**．この点を計画が握らないと「ログは出るのに収集できない」齟齬になる．
+- **推奨する両立策 ＝ 設定 1 行を「リクエスト毎」に rank0 のブロック内で出す**．具体的には rank0 のブロック開始
+  マーカー `_log("INFO", f"Rank 0: prompt='{prompt}'")`（`pipeline_inference.py:1441`）の**直後**に，
+  `_log("INFO", f"Rank 0: levers NUM_MICRO_BATCHES={config.num_micro_batches} STAGGER_INTERVAL={config.stagger_interval} SEQ_LEN={config.seq_len} WORLD_SIZE={config.world_size}")`
+  のような 1 行を足す（`config` は `self.config`）．こうすると，
+  1. `--since run_start` 窓に必ず入る（そのリクエストの処理中に出る）．
+  2. `_split_into_blocks`（`collect_results.py:97-109`）の**ブロック内**（開始マーカー `^Rank 0: prompt='` の直後）に
+     入り，既存の per-block 抽出（`_extract_prompt_tokens_and_embed` 等，`:179-226`）と**同じ枠組み**で
+     `_extract_levers(block) -> dict` を 1 個足せばよい（`_select_relevant_block` で選んだ当該ブロックから読む）．
+  3. rank0 行なので `_extract_rank0_messages` を素通りする．
+  - 書式は空白区切り `KEY=VALUE`（例: 物理ログ `[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=4 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51`）が読みやすく，
+    正規表現 `^Rank 0: levers NUM_MICRO_BATCHES=(\d+) STAGGER_INTERVAL=([\d.]+) SEQ_LEN=(\d+) WORLD_SIZE=(\d+)$` で
+    確実に拾える．既存マーカーが全て `Rank 0: ` 始まりなので接頭辞を合わせると一貫する（`_PROMPT_TOKENS_EMBED_RE`
+    等と同様）．
+  - `build_levers` は「ログから取れたらそれを採用，取れなければ現行の env フォールバック（`ClusterConfig`）」の
+    2 段構えにすると後方互換（旧ログ・パース失敗時も `null`/env で埋まる）を保てる．
+- **代替（起動バナーに 1 行）を採る場合**は，`collect_rank0_log` の `--since` を起動時刻まで広げる（あるいは
+  `docker logs` 全取得）改修が別途必要になり，複数 run 蓄積時のブロック分離が重くなる．per-request 方式の方が
+  スコープが `collect_results.py` の per-block 抽出追加に閉じて筋が良い．なお per-request で出すと，同一 run を
+  複数ブロック取り違える状況（Iter2 で対処済み）でも levers が正しいブロックに紐づく利点がある．
+
+**次フェーズ（計画）への示唆**
+
+- **出力位置**: rank0 の per-request パス，`pipeline_inference.py:1441`（`Rank 0: prompt='...'`）の直後に 1 行 INFO を
+  追加（起動バナー `:2008-2015` への追加は `--since` 窓から外れるため非推奨）．値は `self.config.num_micro_batches`
+  /`stagger_interval`/`seq_len`/`world_size` の解決後の値を使う．
+- **rank0 限定で足りる**: 収集は rank0 の docker logs のみを見るため，パーサは rank0 の 1 行だけ要る（全 rank 出力は
+  無害だが不要）．
+- **フォーマット案**: `Rank 0: levers NUM_MICRO_BATCHES=<int> STAGGER_INTERVAL=<float> SEQ_LEN=<int> WORLD_SIZE=<int>`
+  （空白区切り KEY=VALUE，接頭辞 `Rank 0: ` で既存マーカー群と一貫）．
+- **パース方式**: `collect_results.py` に `_LEVERS_RE` と per-block `_extract_levers(block)` を新設し，`build_levers` を
+  「ログ優先・env フォールバック」の 2 段構えへ変更（`build_levers` は現状 `ClusterConfig` 引数のみ．計画で
+  `parsed`/選択ブロック経由の levers を渡す形へシグネチャ変更が要るか検討）．per-block 抽出の器は既存 4 関数
+  （`:179-226`）と同型で載せられる．
+- **graph-break リスク無し**: `torch.compile` 実呼び出しは無く，追加は生成ループ外の per-request 1 print．定常性能へ
+  の影響は無視できる．
+- **回帰テスト**: `_extract_levers` の単体テスト（正常 1 行・欠落時 `null`・env フォールバック）と，設定行を含む
+  複数行ブロック入力での `parse_rank0_log`/`build_levers` の統合テストを追加すれば，実機非接続で完了条件を組める
+  （Iter1/Iter2 と同じくパース純関数中心）．
+- **フェーズ4（実験）前の人間確認**: backlog B4 の通り，本 P1 は `pipeline_inference.py`（ホットパス）改変・再デプロイ
+  を伴うため，実機 deploy/推論実行の直前に B1 の人間確認が必須．フェーズ1〜3 はコードのみで進行可能．
+
+---
+
 ## Iteration 2
 
 ### 考察・次計画 (Iter2)

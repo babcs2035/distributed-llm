@@ -52,6 +52,10 @@ _PROMPT_TOKENS_EMBED_RE = re.compile(
     r"^Rank 0: prompt tokens=(\d+),.*mean=([-\d.eE]+) std=([-\d.eE]+) "
     r"min=([-\d.eE]+) max=([-\d.eE]+)$"
 )
+_LEVERS_RE = re.compile(
+    r"^Rank 0: levers NUM_MICRO_BATCHES=(\d+) STAGGER_INTERVAL=([\d.]+) "
+    r"SEQ_LEN=(\d+) WORLD_SIZE=(\d+)$"
+)
 _STEP_DONE_RE = re.compile(r"^Rank 0: step (\d+) done token=(\d+) dt=([\d.]+)s$")
 _DECODING_RE = re.compile(r"^Rank 0: decoding (\d+) generated tokens \(prompt=(\d+)\)")
 _DECODED_RE = re.compile(r"^Rank 0: decoded in ([\d.]+)s:")
@@ -195,6 +199,25 @@ def _extract_prompt_tokens_and_embed(
     return None, dict(_EMPTY_EMBED_STATS)
 
 
+def _extract_levers(block: list[str]) -> dict[str, int | float | None] | None:
+    """ブロック内の `Rank 0: levers NUM_MICRO_BATCHES=... ...` 行から実効 levers を抽出する．
+
+    見つからなければ `None`（levers 行の無い旧形式ログとの互換のため，呼び出し元は
+    `build_levers` の env/`ClusterConfig` フォールバックへ回す）．
+    """
+
+    for msg in block:
+        match = _LEVERS_RE.match(msg)
+        if match:
+            return {
+                "NUM_MICRO_BATCHES": int(match.group(1)),
+                "STAGGER_INTERVAL": float(match.group(2)),
+                "SEQ_LEN": int(match.group(3)),
+                "WORLD_SIZE": int(match.group(4)),
+            }
+    return None
+
+
 def _extract_step_dt(block: list[str]) -> list[float]:
     """`Rank 0: step N done token=... dt=...s` 行を step 昇順の dt 配列に変換する．"""
 
@@ -238,6 +261,7 @@ class ParsedLog:
     result_text_snippet: str | None
     parse_ok: bool
     parse_warnings: list[str] = field(default_factory=list)
+    levers_from_log: dict[str, int | float | None] | None = None
 
 
 def parse_rank0_log(log_text: str, predict_result: str | None = None) -> ParsedLog:
@@ -251,6 +275,8 @@ def parse_rank0_log(log_text: str, predict_result: str | None = None) -> ParsedL
     Returns:
         ParsedLog: 必須指標（`prompt_tokens` / `step_dt` / `embed_stats`）が全て取れていれば
         `parse_ok=True`．欠落・ブロック不一致があっても値を黙って捨てず，`parse_warnings` に残す．
+        `levers_from_log` は選択済みブロックの `Rank 0: levers ...` 行から抽出した実効 levers
+        （`build_levers` がログ優先で使う．行が無い旧形式ログでは `None`）．
     """
 
     messages = _extract_rank0_messages(log_text)
@@ -300,7 +326,7 @@ def parse_rank0_log(log_text: str, predict_result: str | None = None) -> ParsedL
         prompt_tokens=prompt_tokens, embed_stats=embed_stats, step_dt=step_dt,
         output_tokens_from_log=output_tokens_from_log, decode_time_s=decode_time_s,
         result_text_snippet=result_text_snippet, parse_ok=parse_ok,
-        parse_warnings=warnings,
+        parse_warnings=warnings, levers_from_log=_extract_levers(block),
     )
 
 
@@ -394,17 +420,30 @@ def make_run_id(iter_name: str, run_start: datetime) -> str:
     return f"{iter_name}-{timestamp_part}-{short_uuid}"
 
 
-def build_levers(config: ClusterConfig) -> dict[str, int | float | None]:
+def build_levers(
+    config: ClusterConfig,
+    levers_from_log: dict[str, int | float | None] | None = None,
+) -> dict[str, int | float | None]:
     """levers（NUM_MICRO_BATCHES / STAGGER_INTERVAL / SEQ_LEN / WORLD_SIZE）を収集する．
 
-    NUM_MICRO_BATCHES / STAGGER_INTERVAL / WORLD_SIZE は `os.environ` を優先し，
-    無ければ `ClusterConfig` の既定値（`num_micro_batches`/`stagger_interval`/`world_size`，
-    いずれも `ClusterConfig.__post_init__` 内で `os.environ` → 既定値の順に解決済み）を使う．
-    SEQ_LEN は既定ログに出ない値のため `os.environ` のみを見て，未設定なら `null` とする．
+    `levers_from_log`（`parse_rank0_log` が選択済みブロックの `Rank 0: levers ...` 行から
+    抽出した実効値）があれば，それをそのまま採用する（rank0 コンテナが起動時に実際に解決した
+    値であり，本ツール実行時の env と食い違っても正しい．journal.md Iteration 3 参照）．
 
-    前提と限界: この方式は「コンテナ起動時の env と本ツール実行時の env が一致している」ことを
-    暗黙に仮定する．不一致があっても本ツールからは検出できない（journal.md Iteration 1 参照）．
+    `levers_from_log` が `None`（levers 行の無い旧形式ログ・パース失敗）の場合のみ，従来どおり
+    `os.environ` → `ClusterConfig` 既定値のフォールバックで構築する．NUM_MICRO_BATCHES /
+    STAGGER_INTERVAL / WORLD_SIZE は `os.environ` を優先し，無ければ `ClusterConfig` の既定値
+    （`num_micro_batches`/`stagger_interval`/`world_size`，いずれも `ClusterConfig.__post_init__`
+    内で `os.environ` → 既定値の順に解決済み）を使う．SEQ_LEN は既定ログに出ない値のため
+    `os.environ` のみを見て，未設定なら `null` とする．
+
+    前提と限界（フォールバック時のみ）: この方式は「コンテナ起動時の env と本ツール実行時の
+    env が一致している」ことを暗黙に仮定する．不一致があっても本ツールからは検出できない
+    （journal.md Iteration 1 参照）．
     """
+
+    if levers_from_log is not None:
+        return dict(levers_from_log)
 
     def _to_number(raw: str | None, cast: type) -> int | float | None:
         if raw is None:
@@ -513,7 +552,7 @@ def run_and_collect(config: ClusterConfig, prompt: str, iter_name: str, use_http
         parsed.parse_ok = False
 
     derived = compute_derived_metrics(parsed.step_dt, parsed.output_tokens_from_log)
-    levers = build_levers(config)
+    levers = build_levers(config, parsed.levers_from_log)
 
     return build_record(
         iter_name=iter_name, run_id=run_id, run_start=run_start, prompt=prompt,

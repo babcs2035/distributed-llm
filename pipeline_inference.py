@@ -1439,6 +1439,14 @@ class FullyOptimizedPipelineNode:
             if self.config.rank == 0:
                 # ===== Prompt processing + generation loop =====
                 _log("INFO", f"Rank 0: prompt='{prompt}'")
+                _log(
+                    "INFO",
+                    "Rank 0: levers "
+                    f"NUM_MICRO_BATCHES={self.config.num_micro_batches} "
+                    f"STAGGER_INTERVAL={self.config.stagger_interval} "
+                    f"SEQ_LEN={self.config.seq_len} "
+                    f"WORLD_SIZE={self.config.world_size}",
+                )
                 input_ids = _tokenize(prompt)  # (1, seq_len)
                 seq_len = input_ids.size(1)
                 embed = F.embedding(input_ids, _embed_tokens)  # (1, seq_len, hidden_size)
