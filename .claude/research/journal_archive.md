@@ -1,3 +1,380 @@
+## Iteration 5
+
+### 考察・次計画 (Iter5)
+
+**担当**: 考察・次計画 subagent（2026-07-19）．分析(解釈) の結論（本ブロック `### 分析(解釈) (Iter5)`）を受け，
+単一レバー「SL1: compute 側上限の local マイクロベンチ」の採否を確定し，次イテレーション（Iteration 6）の方向を
+決めた．実機への新規接続・実行はしていない（記録の読み取りとコミット操作のみ）．
+
+**1. 採否判定: 採用で確定・収束（adopt & converged）**
+
+- **判定根拠**: SL1 は診断（計測）レバーであり，判定対象は「B3 の compute 側効き源 (ii)（seq_len=1 GEMV を K 位置
+  まとめた GEMM に変えると 4 コア CPU の演算強度／キャッシュ効率が上がる）が対象 CPU で実在するか（向き）」．計画 §3 の
+  成功条件を全て充足した．実装（`scripts/bench_compute_ceiling.py`／`tests/test_bench_compute_ceiling.py` の新規 2 ファイル
+  のみ・`pipeline_inference.py` 非改変・`pytest` 53 passed／回帰なし・`py_compile` 健全）と，判定（実機 i5-8350U，
+  `wafl100`＝rank1，cpuset 0-3＝デプロイ対象そのもので ratio_2=0.753／ratio_4=0.378／ratio_8=0.213，K 昇順単調減少かつ
+  `ratio_8 ≤ 0.85` を満たし判定ルール (i)「利得あり」に明確該当）が揃った．効果量（ratio_8 の 1.0 からの乖離 0.787）は
+  計画 §3 のノイズ幅 ±0.05 の十数倍で，n=1 でもラベルが反転する余地は無い．**採用で確定**．
+- **追加反復の要否**: 不要．CPU マイクロアーキ・BLAS・torch 版が異なる 2 環境（ローカル 64 コア／実機 i5-8350U 4 コア
+  専有）が独立に単調減少・同一ラベルを再現しており，同一ホスト 3 回反復より強い外的頑健性が既に得られている．
+- **このレバーの収束状況**: SL1（compute 天井の診断）は「利得あり」で目的を達成し，**このサブレバーは収束**．「compute 側
+  利得がこの CPU で実在するか」という単一の問いに決定的な答え（実在する）が出たため，同じ問いへ SL1 を再び振っても
+  新情報は得られない．次は B3 の go/no-go を決めるもう一方の因子（draft 採択率）へ論点を移す段である．
+
+**2. 非自明な学び（次の自分向け）**
+
+- **(i) SL1 は B3 のダウンサイドリスクの片側だけを消した**: B8／B9 が SL1 に課した唯一の問い「compute 側効き源が実在
+  しなければ B3 の天井は残差償却 ≈1.08 倍に縮み大投資の意味が無い」というダウンサイドリスクは，実機 ratio_8=0.213
+  （per-token compute を実機で 79% 削減，理論上 82%）により**棄却**された．B3 の compute 天井は採択が理想化されれば
+  per-token compute を最大 1/0.213≈4.7 倍に高める余地がある．ただし SL1 が測るのは計算効率のみで，**実運用の速度向上は
+  draft 採択率・検証コスト・relay 1 往復化のプロトコルオーバーヘッドにも依存する**．したがって B3 の go/no-go は
+  「compute 天井 × 採択率 × 検証コスト」の積で期待値が決まり，SL1 は積の 1 因子（上限側）を埋めたにすぎない．
+- **(ii) 利得の絶対量は CPU 依存で，実機値を基準にすべき**: ratio_2 が 0.497（ローカル）→0.753（実機）と 0.25 も乖離した．
+  非力な CPU（1.7GHz・4 コア）では固定オーバーヘッドの相対比が大きく，K=2 程度の小さなまとめでは利得が縮む．B3 の
+  期待効果を見積もる際はローカル値ではなく**実機値（ratio_8=0.213）**を用いること．向き（利得の有無）は CPU アーキの
+  違いで覆らないが，倍率の絶対値はローカル推定を鵜呑みにしてはいけない，というのが SL1 の非自明な学びである．
+- **(iii) 残る不確実性は期待値側（採択率）に一点集約された**: SL1 で上限側の空白は埋まったが，採択率が低ければ K を
+  捨て直す割合が増え実効利得は上限から目減りする．B3 は「投資に値する下限条件はクリアだが期待値は未確定」の状態．
+
+**3. B9（B3 本体 go/no-go）の扱い: 温存（今回は人間に諮らない）**
+
+- **判断**: 分析(解釈) の推奨どおり，B9（SL3＝relay プロトコル改修の go/no-go）を**今のタイミングで人間に諮るのは
+  時期尚早**とし，B9 は `[needs-human]` のまま**温存**する（差し替えない）．理由は §2(i) のとおり，採択率が未計測の
+  まま大投資の是非を人間へ丸投げすると，SL1 で下げたリスクの半分（期待値側）を人間判断へ転嫁するだけで情報不足だから
+  である．Iteration 6 で SL2（採択率）を埋め，SL1×SL2 で B3 の実効利得の期待値レンジを数値で括ってから B9 を諮る．
+
+**4. 次に振るレバーの決定（Iteration 6）: SL2（draft 採択率のオフライン見積もり）を自動選定**
+
+- **決定（自律判断・可逆）**: Iteration 6 の単一レバーを **SL2（draft 採択率のオフライン見積もり）**とする．検証するのは
+  「K トークン提案のうち検証で受理される割合（＝毎回 K を捨てずに済む割合）」を，relay 改修せず・prompt-lookup／n-gram
+  draft または小 draft モデルで既存ログ／参照出力に対して見積もること．SL1（compute 天井）と SL2（採択率）が揃えば
+  B3 の実効利得の期待値レンジを初めて数値で括れ，B9 go/no-go の質が上がる．具体的な実装方針（draft 戦略・参照データの
+  取り方）は次の rc-planner が決める．
+- **可逆性の確認（この決定を自律判断とした根拠）**: 採択率のオフライン見積もりは通常，実クラスタへの deploy／relay 改修を
+  伴わない静的解析または小規模なオフライン生成（既存の軽量モデルでの試行）で完結する可逆な作業であり，SL1 と同じ
+  「作る前に測る」診断系譜に収まる．参照出力の取得に実機推論を要する場合があるが，それは B7 の包括承認範囲内の非破壊
+  SSH で対応可（破壊的操作ではない）．**もし計画フェーズで SL2 の実装がクラスタ本体（`pipeline_inference.py` ホットパス
+  や 51 ノード再デプロイ）への大きな変更を要すると判明すれば，その時点で backlog へ `[needs-human]` として登録し
+  Slack で確認を仰ぐこと**（申し送り）．
+- **見送り（非選定）**: SL3／B3 本体（relay プロトコル改修）は不可逆・大規模で B9 の人間 go/no-go 事項のため見送り．
+  config `levers`（NUM_MICRO_BATCHES 等）は Iter4 で「支配項 compute に効かない（Σcompute 不変・残差止まり）」と確定済み
+  で，支配項を攻める文脈では優先度が低い．backlog に `## B10 [auto-decided 2026-07-19]` として本決定を記録した．
+
+**次イテレーションへの結論**: Iteration 5（SL1: compute 側上限の local マイクロベンチ）を**採用で確定・収束**
+（実機で ratio_8=0.213，判定「利得あり」＝B3 の compute 側利得の実在を確認し，ダウンサイドリスクを棄却）．
+Iteration 6 は SL2（draft 採択率のオフライン見積もり）を自動選定して開始する．B3 本体（SL3）go/no-go の B9 は温存し，
+SL1×SL2 で期待値レンジを固めてから改めて人間に諮る．
+
+---
+
+### 分析(解釈) (Iter5)
+
+**担当**: 分析(解釈) subagent（2026-07-19）．`## Iteration 5` の全ブロック（計画・実装・実験）と backlog B8／B9 を
+Read し，単一レバー「SL1: compute 側上限の local マイクロベンチ」が測った `ratio_K` を，過去反復（Iter4 の run 間
+ばらつき）と計画 §3 の判定ルール・ノイズ幅（±0.05）に照らして解釈した．実機への新規接続・実行はしていない（記録の
+読み取りのみ）．
+
+**前提（判定の枠組み）**: 本イテレーションの判定対象は「B3 の compute 側効き源 (ii)（seq_len=1 GEMV を K 位置
+まとめた GEMM に変えると 4 コア CPU の演算強度／キャッシュ効率が上がる）が対象 CPU で**実在するか（向き）**」であり，
+B3 本体の実レイテンシ低減量そのものではない．したがって判定は「`ratio_K` の 1.0 からの乖離が計画 §3 のノイズ幅
+±0.05 を超え，K 昇順で単調減少するか」で行う．
+
+**1. 有意性の判定: signal（利得は実在）．ラベル「利得あり」はノイズに対して頑健．ただし n=1／環境依存の限界は明記する**
+
+- **効果量がノイズ幅を桁違いに上回る**: 実機（i5-8350U，`wafl100`，cpuset 0-3）で ratio_2=0.753／ratio_4=0.378／
+  ratio_8=0.213．1.0 からの乖離は最小の ratio_2 でも 0.247，ratio_8 では 0.787 に達し，計画 §3 のノイズ幅 ±0.05 の
+  5〜16 倍大きい．K 昇順で単調減少（0.753→0.378→0.213）かつ `ratio_8=0.213 ≤ 0.85` を満たし，判定ルール (i) の
+  **「compute 側利得が実在（≥15% 短縮）」に明確に該当**する．曖昧域 (iii)（0.85<ratio<0.95）や利得なし (ii)（全 K で
+  ≥0.95）からは大きく離れており，このラベルが反転する余地は無い．
+- **n=1 の限界を，2 環境の一致とスクリプト内 200 反復中央値で補う**: 各環境の実行は 1 回ずつ（n=1）で，`ratio` 自体の
+  run 間分散は直接は得ていない．ただし (a) スクリプトは内部で `WARMUP_ITERS=50`／`MEASURE_ITERS=200` の中央値を採り
+  timer jitter を均している，(b) **CPU マイクロアーキ・BLAS・torch 版が異なる 2 環境**（ローカル 64 コア／実機 i5-8350U
+  4 コア専有）が**独立に**単調減少・同一ラベルを再現した——これは同一ホストでの 3 回反復より強い外的頑健性の証拠である，
+  (c) 効果量が上記のとおりノイズ幅を桁違いに上回る，の 3 点から，**ラベル「利得あり」は n=1 でも有意**と断定できる．
+  Iter4 で確認した実機 run 間ばらつき（compute% レンジ 0.27pp，step_dt 幅 0.55%）を参照しても，この規模の効果量を
+  覆すノイズは想定しにくい．
+- **ただし絶対値は環境依存で，実機値を基準にすべき**: ratio_2 が 0.497（ローカル）→0.753（実機）と 0.25 も乖離しており，
+  **利得の絶対量は CPU 依存**である．非力な CPU（1.7GHz・4 コア）では固定オーバーヘッドの相対比が大きく，K=2 程度の
+  小さなまとめでは利得が縮む．B3 の期待効果を見積もる際はローカル値ではなく**実機値（ratio_8=0.213，K=8 で per-token
+  compute を実測 79% 削減）**を用いること．なお実機追試は**デプロイ対象そのもの**（wafl100＝rank1，i5-8350U，cpuset 0-3）
+  で行われており，代表性の点でも local 実行より信頼できる．想定外挙動（言語崩れ・発散・OOM 等）は無く，形状取得も
+  `real_gemma4_layer`（フォールバック未使用）で成立している．
+
+**2. B3 本体への示唆: SL1 は compute 側「天井の存在」だけを保証．実運用の速度向上は保証しないが，ダウンサイドリスクの一部は解消**
+
+- **SL1 が測ったもの／測っていないもの**: `ratio_K` は「K 位置を 1 度の GEMM にまとめたときの，1 トークンあたり計算
+  効率」のみを測る．speculative decoding の実レイテンシ低減は，これに加えて **draft 採択率**（提案 K のうち検証で受理
+  される割合＝毎回 K を捨てずに済む割合）・**検証コスト**・**relay 1 往復化のプロトコルオーバーヘッド**に依存する．
+  したがって **SL1 の結果だけで B3 の実運用速度向上（FlowSpec/PipeDec の 1.36–1.77× 等）を保証することはできない**．
+- **解消されたのは「compute 側が利得ゼロ」というダウンサイドリスク**: B8／B9 が SL1 に課した唯一の問いは「compute 側
+  効き源がこの CPU で実在するか（実在しなければ B3 の天井は残差償却 ≈1.08 倍に縮み，大投資の意味が無い）」であった．
+  実機で ratio_8=0.213（理論上 82% 削減／実機 79% 削減）が確認され，**「compute 側の利得が存在しないので投資しても
+  無駄」というダウンサイドリスクは棄却された**．すなわち B3 の compute 側の天井は「残差償却 1.08 倍止まり」ではなく，
+  採択が理想化されれば per-token compute を実機で最大 1/0.213≈4.7 倍に高める余地がある，という上限が引けた．
+- **残る不確実性は期待値側（採択率）**: SL1 は B3 の**上限（ceiling）を引き上げた**が，**期待値（実際に何倍出るか）は
+  採択率が未計測のため依然不定**である．採択率が低ければ K を捨て直す割合が増え，実効利得は上限から大きく目減りする．
+  つまり B3 は「上限はゼロではない（投資に値する下限条件はクリア）が，期待値は未確定」という状態にある．
+
+**3. backlog B9（B3 本体 go/no-go）への推奨: SL1 は決定的入力の片側を埋めた．採択率（SL2）を埋めてから人間に諮るのが妥当**
+
+- SL1 は B9 が求めた「compute 側利得の実在有無」という決定的入力の**片側を確定的に埋めた（＝go 方向の下限条件クリア）**．
+  一方で B3 の go/no-go は本来「compute 天井 × 採択率 × 検証コスト」の**積**で期待値が決まる意思決定であり，SL1 だけでは
+  積の 1 因子しか埋まっていない．採択率がゼロに近ければ SL3（不可逆・大規模な relay 改修・51 ノード再デプロイ）の投資は
+  依然回収できない．
+- **推奨（考察フェーズ＝rc-reflector への材料提示）**: **「compute 側効き源は実在確認済み．ただし draft 採択率という
+  期待値側の不確実性が残るため，SL2（draft 受理率のオフライン見積もり）を先に潰してから B3 本体 go/no-go を人間に諮る」**
+  のが妥当と考える．SL1 と同じ「作る前に測る」診断系譜（Iter1〜5 の一貫した方針）に沿い，不可逆な SL3 に踏み込む前に
+  期待値側の因子を安価に埋める順序が筋が通る．「SL1 で十分な確証が得られたので今すぐ SL3 go/no-go を諮る」案は，採択率
+  未知のまま大投資の是非を人間に丸投げすることになり，SL1 で下げたリスクの半分（期待値側）を人間判断へ転嫁するだけで
+  情報不足と判断する．ただし go/no-go 自体は人間確認事項（B9）であり，最終的な諮り方は考察フェーズが決めること．
+
+**4. 次イテレーション（Iteration 6）のレバー選定材料（判定は考察フェーズ）**
+
+- **第一候補: SL2（draft 採択率のオフライン見積もり）**．B3 の期待値を決めるもう一方の因子（採択率）を，relay 改修せず・
+  prompt-lookup／n-gram draft または小 draft モデルで既存ログ／参照出力に対して見積もる．SL1（compute 天井）と SL2
+  （採択率）が揃えば，B3 の実効利得の期待値レンジを**初めて数値で括れる**＝B9 go/no-go の質が上がる．規模は中
+  （参照出力の取得に実機推論を要する場合があり，その場合は B7 の包括承認範囲内の非破壊 SSH で対応可．draft 生成の
+  実装粒度は計画フェーズで要精査）．「作る前に測る」系譜に整合し，単一レバー原則にも収まる．
+- **非推奨（今回は見送り）**: SL3／B3 本体（relay プロトコル改修）は不可逆・大規模で B9 の人間 go/no-go 事項．SL2 を
+  経ずに直行するのは上記 §3 のとおり期待値側が空白のまま大投資を諮ることになり，時期尚早．config `levers`
+  （NUM_MICRO_BATCHES 等）は Iter4 で「支配項 compute に効かない（Σcompute 不変・残差止まり）」と確定済みで，
+  支配項を攻める文脈では優先度が低い．
+- **レバー収束の状況**: SL1（compute 天井の診断）は「利得あり」で目的を達成し，このサブレバーは収束．ただし B3 全体の
+  go/no-go はまだ収束しておらず，採択率（SL2）という単一の残不確実性へ論点が移った段階である．
+
+---
+
+### 実験 (Iter5)
+
+**担当**: 実験フェーズ subagent（2026-07-19）．`### 実装 (Iter5)` で完了した `scripts/bench_compute_ceiling.py`
+のローカル実行結果（`os_cpu_count=64` の非対象ホスト，ratio_8=0.178，「利得あり」）が，対象実機（i5-8350U，
+4 コア専有）でも同じ向きを示すかを追試した．クラスタの relay プロトコルや `pipeline_inference.py` の常駐推論
+プロセスには一切接続・変更していない（`docker exec` による追加プロセスの起動のみ）．
+
+**1. 実行可能性の確認**
+
+- `hosts.txt` の rank 1（`hosts[1]`，read_hosts の順序規約は `tools/collect_results.py:745` 参照）は `wafl100`．
+  `tools/common.py` の `ssh_via_master`（ProxyJump 経由，master=`wafl-ctrl1`，user=`denjo`）で疎通確認．
+- `wafl100` 上の `distributed-llm` コンテナは稼働中（`docker ps` で `Up 13 hours (healthy)`）．
+- コンテナ内 `python3` で `torch==2.13.0+cpu`／`transformers==5.14.1` が利用可能なことを確認．
+- `lscpu`（ホスト側）で `Intel(R) Core(TM) i5-8350U CPU @ 1.70GHz` を確認．`docker inspect
+  --format '{{.HostConfig.CpusetCpus}}'` で `0-3`（4 コア専有）を確認．計画が想定した対象 CPU・コア数と一致．
+
+**2. 転送・実行**
+
+- ローカルの `scripts/bench_compute_ceiling.py`（15335 バイト）を base64 化し，`docker exec distributed-llm sh -c
+  'echo <base64> | base64 -d > ...'` でコンテナ内 `/tmp/iter5_bench_check/scripts/bench_compute_ceiling.py` へ
+  書き込み（転送後にバイト数一致を確認済み）．`config.json`（`/app/config.json`）はコンテナ内で読み取り専用コピー
+  を `/tmp/iter5_bench_check/config.json` へ作成（`/app` 側は非変更）．
+- `docker exec -w /tmp/iter5_bench_check distributed-llm python3 scripts/bench_compute_ceiling.py` で実行．
+  既存の常駐推論プロセス（メインプロセス）とは別の追加プロセスとして起動しており，メインプロセスの停止・再起動は
+  行っていない（実行前後で `docker ps` の稼働時間が変化していないことを確認）．
+- 所要時間 347.7 秒（ローカル実行時の 113 秒より約 3 倍．4 コア・1.7GHz という非力な CPU での実行のため妥当）．
+
+**3. 実行結果（実機 i5-8350U，`wafl100`）**
+
+- `shape_source="real_gemma4_layer"`（`shape_warnings=[]`）．コンテナ内から `AutoConfig.from_pretrained
+  ("google/gemma-4-31B-it")` に到達でき，ローカル実行と同じ実 Gemma4 線形層形状（`q_proj: 5376->8192` 等）を使用．
+- GEMV（seq_len=1）1 層中央値: 209.80ms．
+- K=2: per_token=158.04ms，**ratio_2=0.7533**
+- K=4: per_token=79.28ms，**ratio_4=0.3779**
+- K=8: per_token=44.76ms，**ratio_8=0.2133**
+- K 昇順で単調減少かつ `ratio_8=0.2133 ≤ 0.85` を満たし，判定は**「利得あり」**．
+
+**4. ローカル実行結果との比較（同じ向きの確認）**
+
+| | ratio_2 | ratio_4 | ratio_8 | 単調減少 | 判定 |
+|---|---|---|---|---|---|
+| ローカル（os_cpu_count=64） | 0.497 | 0.292 | 0.178 | Yes | 利得あり |
+| 実機 i5-8350U（`wafl100`，cpuset 0-3） | 0.753 | 0.378 | 0.213 | Yes | 利得あり |
+
+実機でも K 昇順で比率が単調に低下し「利得あり」の判定が再現された（向きは一致）．ただし絶対値は実機の方が
+全体的に高め（特に ratio_2 が 0.50→0.75 と差が大きい）で，1.7GHz・4 コアという非力な CPU では固定オーバーヘッド
+の相対比率が大きく，K=2 程度の小さなまとめでは利得が縮小することを示唆する．K=8 まで見れば利得は十分明確
+（ratio_8=0.2133，1.0 から大きく乖離）であり，判定ラベルとしては反転していない．
+
+**5. 後片付け**
+
+- 実行後，コンテナ内の一時ディレクトリ `/tmp/iter5_bench_check`（スクリプト・config.json コピー・結果 jsonl を
+  含む）を `docker exec distributed-llm rm -rf /tmp/iter5_bench_check` で削除し，削除確認（`ls` が
+  `No such file or directory` を返すこと）を実施．ローカルの base64 中間ファイルも削除済み．
+- クラスタ側に変更は一切残していない（`/app/config.json` は読み取りのみ，コンテナのメインプロセスは無停止）．
+
+**6. 気づいた点**
+
+- 実機（i5-8350U，4 コア専有）でもローカル代替ホスト（64 コア）と同じ「向き」（K を増やすほど 1 トークンあたり
+  compute 時間が減る）が確認され，B3（speculative decoding）go/no-go 判断における compute 側効き源の実在性は，
+  CPU マイクロアーキテクチャの違いによって覆らないことが実測で裏付けられた．
+- 絶対比率は実機の方が高め（利得がローカル推定より小さい）ため，B3 の期待効果を見積もる際はローカル値
+  （ratio_8=0.178）ではなく実機値（ratio_8=0.213）を基準にすべきである．
+- コンテナ内の `transformers`／`torch` バージョンはローカル環境と異なる（`transformers==5.14.1`／
+  `torch==2.13.0+cpu` vs ローカルの版）が，形状取得（`real_gemma4_layer`）に成功しており，判定への影響は
+  無いと考えられる．
+
+---
+
+### 実装 (Iter5)
+
+**担当**: 実装フェーズ subagent（2026-07-19）．計画（本ブロック直下 `### 計画 (Iter5)` §2・§4）に従い，単一レバー
+「SL1: compute 側上限の local マイクロベンチ」を実装した．`pipeline_inference.py`／`tools/*.py` は一切非改変．
+実機クラスタへの接続・deploy・推論実行は行っていない（ローカル単一プロセスでの実装・単体テスト・1 回実行のみ）．
+
+**1. 変更ファイル（新規 2 つのみ，計画どおり）**
+
+- **`scripts/bench_compute_ceiling.py`**（`scripts/` ディレクトリ新設）:
+  - 定数 `WARMUP_ITERS=50`／`MEASURE_ITERS=200`／`K_VALUES=(2,4,8)`／`NUM_THREADS=4`／`COMPUTE_DTYPE=torch.float32`
+    （`pipeline_inference.py:38` と同一）を計画どおりに定義．
+  - `build_linear_shapes()`: 実 `Gemma4TextDecoderLayer(text_config, layer_idx=0)` を `AutoConfig.from_pretrained
+    ("google/gemma-4-31B-it")` 経由で random-init 構築し（重みファイル非ロード），`named_modules()` から `nn.Linear`
+    を列挙して形状（`LinearShape(name, in_features, out_features)`）を取得する．実構築が失敗した場合のみ
+    `_build_linear_shapes_from_config_fallback()` が `config.json` の `model.overrides` と `head_dim=256` 等の
+    フォールバック定数から形状を導出し，`intermediate_size` が仮定値である旨を `warnings` に明記する（黙って歪めない）．
+  - `measure_linear()`／`measure_layer_ns()`: `time.perf_counter_ns()` でウォームアップ `WARMUP_ITERS` 回後，
+    `MEASURE_ITERS` 回を 1 回ずつ計測し中央値・最小値を返す．1 層分は全 `nn.Linear` の中央値総和．
+  - `compute_ratios()`: `ratio_K = (GEMM(K) 1層時間/K) / GEMV(seq_len=1) 1層時間` を純関数として算出．
+  - `classify_ratio()`: 計画 §3 の判定ルールどおり，`ratio_8 ≤ GAIN_RATIO_THRESHOLD(=0.85)` かつ K 昇順で単調減少なら
+    「利得あり」，全 K が `NO_GAIN_RATIO_THRESHOLD(=0.95)` 以上なら「利得なし」，それ以外は「曖昧」を返す．
+  - 結果は人間可読テーブルを stdout へ，かつ `results/bench_compute_ceiling.jsonl`（新規）へ 1 レコード追記
+    （`num_threads`／`dtype`／`torch_version`／`cpu`／線形形状／per-layer 時間／K 別 `ratio`／判定ラベルを含む）．
+  - `if __name__ == "__main__":` の単独実行スクリプトとして完結．
+
+- **`tests/test_bench_compute_ceiling.py`**（新規）: 純関数 `_build_linear_shapes_from_config_fallback`／
+  `compute_ratios`／`classify_ratio` に対し計 8 件のテストを追加（計画の「最低 4 件」を上回る）．
+  タイミング依存の `measure_linear`／`measure_layer_ns` は対象外とした（計画どおり）．`scripts/` を `sys.path` へ
+  追加する処理はテストファイル自身に閉じ込め，`tests/conftest.py`（`tools/` 追加専用）は非改変とした．
+
+**2. 検証結果**
+
+- `uv run python -m py_compile scripts/bench_compute_ceiling.py tests/test_bench_compute_ceiling.py`: エラー無し．
+- `unset VIRTUAL_ENV && uv run pytest tests/test_bench_compute_ceiling.py -v`: **8 passed**（計画の「最低 4 件」を
+  満たす）．`unset VIRTUAL_ENV && uv run pytest tests/ -v`: **53 passed, 0 failed/error**（既存 45 件＋新規 8 件，
+  回帰なし）．
+- `unset VIRTUAL_ENV && uv run python scripts/bench_compute_ceiling.py` を実行環境（i5-8350U ではなく本 research-cycle
+  実行ホスト，`os_cpu_count=64`・`cpu=x86_64`）で 1 回実行．約 113 秒で完走し `results/bench_compute_ceiling.jsonl` へ
+  1 レコード追記された．`shape_source="real_gemma4_layer"`（フォールバック未使用，`shape_warnings=[]`）で，実際に
+  `AutoConfig.from_pretrained` が到達可能だったことを確認．
+- **実行結果（ratio 値）**: GEMV(seq_len=1) 1層中央値 80.97ms に対し，K=2: per_token=40.27ms（ratio=0.497），
+  K=4: per_token=23.63ms（ratio=0.292），K=8: per_token=14.38ms（ratio=0.178）．K 昇順で単調減少かつ
+  `ratio_8=0.178 ≤ 0.85` を満たし，判定は「利得あり」．
+- `git status --short`: 変更は `scripts/bench_compute_ceiling.py`（新規ディレクトリ含む）／
+  `tests/test_bench_compute_ceiling.py`（新規）／`results/bench_compute_ceiling.jsonl`（新規，スクリプト実行の
+  自然な出力）の 3 エントリのみ．`pipeline_inference.py`／`tools/*.py` は非改変．`.claude/research/config.yml`・
+  `journal.md`・`state.json`・`agent.json` の差分は計画フェーズ以前から存在した未コミット変更であり，本実装
+  フェーズが持ち込んだものではない（触れていない）．
+
+**3. 気づいた点・申し送り**
+
+- **実行ホストは i5-8350U ではない**（`os_cpu_count=64` の多コアサーバ．計画 §4 が既に指摘済みの CPU 代表性の注意）．
+  絶対値は実ノードと異なりうるが，本イテレーションの判定対象は「向き（K をまとめることで 1 トークンあたり compute
+  時間が減るか）」であり，K=2/4/8 で単調に大きく減少（ratio 0.50→0.29→0.18）しているため，方向としての利得は
+  このホストでも明確に観測された．i5-8350U（4 コア専有・OpenBLAS/MKL 構成が異なる可能性）での追試により絶対値は
+  変わりうるが，判定ラベルが反転するほどの余地（ratio_8 が 0.85 を超える）は小さいと考えられる．
+- `AutoConfig.from_pretrained("google/gemma-4-31B-it")` は本実行ホストから到達可能で（ネットワークまたは既存
+  キャッシュ経由），フォールバック分岐は未使用で終わった．フォールバック分岐（config.json 由来）は単体テストで
+  別途検証済み（`intermediate_size=hidden_size*4=21504` が実測値と一致することも事前確認済み）．
+- **実験を開始してよい状態か**: 本 SL1 は計測・実装・1 回実行まで完了しており，追加の実機接続・deploy は不要
+  （計画どおりクラスタ非接触で完結する単発診断のため，本イテレーションに「実験フェーズ」の別途着手は無い）．
+  結果（ratio・判定ラベル）は次の分析・考察フェーズが B3 本体（SL3: relay プロトコル改修，backlog B9）の
+  go/no-go 判断の入力として解釈すること．
+
+---
+
+### 計画 (Iter5)
+
+**担当**: 計画フェーズ subagent（2026-07-19）．`journal` Iter4（分析(解釈)§3 の B3／FlowSpec／PipeDec 記述），backlog B8／B9，
+`pipeline_inference.py`（`COMPUTE_DTYPE`:38・`set_num_threads`:404・層 forward hot path :1702-1704・decode の hidden 形状），
+`config.json`（`hidden_size=5376` 等），`tools/gemma4_layer.py`（`Gemma4TextDecoderLayer` 構築）を実際に Read し，backlog B8
+（SL1: compute 側上限の local マイクロベンチ）を実装可能な粒度へ落とし込んだ．**本フェーズは実機クラスタへの接続・deploy・
+推論実行を一切行わない（コード読み取りのみ）**．
+
+#### 0. コードで確認した前提（計画の土台）
+
+- **compute の実体**: decode step の計算は `for layer in self.my_layers: hidden_state = layer(hidden_state,
+  position_ids=positions, is_first=is_first)`（`pipeline_inference.py:1702-1703`）で，`hidden_state` は
+  **(batch=1, seq_len=1, hidden=5376) の GEMV**．`compute dt` はこのループ直後（`:1704`）に確定し，Iter4 で ITL の 92% と
+  確定した支配項そのものである．
+- **計算条件（固定すべき値）**: `COMPUTE_DTYPE = torch.float32`（`:38`），`torch.set_num_threads(os.cpu_count())`＝
+  i5-8350U で 4（`:404`），`torch.set_num_interop_threads(1)`（`:405`）．
+- **層本体**: transformers の `Gemma4TextDecoderLayer`（`gemma4_layer.py:13,35`）．ノードあたり層数は 60/51 で大半 1 層・
+  9 ノードが 2 層．支配的な線形層（GEMM 対象）は `self_attn.{q,k,v,o}_proj` と `mlp.{gate,up,down}_proj`．正確な out 次元は
+  `head_dim`／`intermediate_size` に依存し，`config.json` には `intermediate_size` が無い．そのため実 `Gemma4TextDecoderLayer` を
+  **重みロードせず random-init で構築**して `nn.Linear` 子モジュールから `(in_features, out_features)` を列挙し，正確な GEMM 形状を
+  得る（ハードコードを避ける）．
+- **B8 の性質**: 重み不要のランダムテンソルで足り，`pipeline_inference.py` 非改変・再デプロイ不要・クラスタ本体（分散推論）
+  非接触・完全に可逆．Iter1〜4 と同じ「本体を作る前に測る」診断の系譜に属する．
+
+#### 1. 仮説
+
+B3（speculative decoding）の compute 側効き源 (ii)「seq_len=1 の GEMV を K 位置まとめた GEMM に変えると 4 コア CPU の演算強度／
+キャッシュ効率が上がる」がこの実機（i5-8350U 相当・4 スレッド・float32・OpenBLAS/MKL）で実在するなら，1 層分の全線形層について
+**「K 位置 GEMM の総時間 ÷ K」が「seq_len=1 GEMV の総時間」より小さくなる**（重み行列の読み出しが K トークンに 1 回へ償却され，
+GEMV の帯域律速が緩和されるため）．逆に演算強度が上がらない CPU では GEMM(K)≈K×GEMV となり **比率≈1**．この比率が B3 本体
+（SL3: relay プロトコル改修，backlog B9）着手の go/no-go の決定的入力になる．
+
+#### 2. 単一レバー・変更内容
+
+**単一レバー**: 「記録・診断の対象を，実機の分散 relay 経路（Iter1〜4）から，**単一プロセスの local compute マイクロベンチ
+（GEMV vs GEMM）**へ移す」の 1 点．クラスタ・relay・`pipeline_inference.py` は一切変更しない（固定）．振るのは **seq_len（=1 vs K）**
+のみで，計算条件（hidden=5376・実 Gemma4 層の線形形状・float32・num_threads=4・batch=1）は直近最良＝実機 Iter4 の compute 条件に
+合わせて固定する．
+
+**変更ファイル（新規のみ・クラスタ非接触）**:
+- 新規 `scripts/bench_compute_ceiling.py`（`scripts/` ディレクトリ新設）．責務: i5-8350U 相当条件下で GEMV（seq_len=1）と
+  GEMM（seq_len=K, K∈{2,4,8}）の 1 トークンあたり compute 時間を比較する local マイクロベンチ．
+- 新規 `tests/test_bench_compute_ceiling.py`（純関数の単体テスト）．
+
+**スクリプト設計**:
+- **(a) セットアップ**: `torch.set_num_threads(NUM_THREADS=4)`・`torch.set_num_interop_threads(1)`・dtype=float32．
+  `platform.processor()`／`os.cpu_count()`／`torch.__version__` を記録（CPU 代表性の解釈のため）．
+- **(b) 形状取得**: 実 `Gemma4TextDecoderLayer(text_config, layer_idx=0)` を random-init で構築（重みファイル非ロード）し，
+  `named_modules()` から `nn.Linear` を列挙して `LinearShape(name, in_features, out_features)` のリストを得る．構築失敗時
+  （transformers 層や model config が local に無い場合）は `config.json` ＋ `head_dim=256`（`query_pre_attn_scalar=256` 由来）から
+  q=32×256=8192・k/v=16×256=4096・o=8192→5376 を導出し，`intermediate_size` のみ **log 付き仮定値**へフォールバックする
+  （黙って歪めず，仮定を明示）．
+- **(c) 計測**: 各 `LinearShape` について `W[out,in]`・`x1[1,in]`・`xK[K,in]` を float32 random 生成し，`F.linear(x, W)` を
+  warmup=`WARMUP_ITERS(=50)` 回捨てたのち，`MEASURE_ITERS(=200)` 回を `time.perf_counter_ns()` で 1 回ずつ計測して**中央値**
+  `t_median` を採る（微小 matmul の scheduler jitter 対策に median を主指標，min も併記）．1 層＝全 Linear の `t_median` 総和を
+  per-layer 時間とする．
+- **(d) 指標**: 各 K について `per_token_K = t_gemm_layer(K) / K`，`ratio_K = per_token_K / t_gemv_layer(1)`．
+- **(e) 出力**: 人間可読テーブル（stdout）＋ `results/bench_compute_ceiling.jsonl` へ 1 レコード追記（`num_threads`・`dtype`・
+  `torch_version`・`cpu`・線形形状・per-layer 時間・K 別 `ratio`・判定ラベル）．
+
+**計測パラメータの定数化**（マジックナンバー回避）: `WARMUP_ITERS=50`・`MEASURE_ITERS=200`・`K_VALUES=(2,4,8)`・`NUM_THREADS=4`．
+
+#### 3. 成功条件（measurable）
+
+実装・実行の完了条件（決定的）:
+
+1. `scripts/bench_compute_ceiling.py` がエラー無く完走し，K∈{2,4,8} それぞれについて `ratio_K` を算出・出力する．
+2. 純関数（形状フォールバック導出・`per_token=t/K`・`ratio=per_token/t1`・判定ラベル付与）の単体テストが **green（最低 4 件）**，
+   `uv run python -m py_compile scripts/bench_compute_ceiling.py tests/test_bench_compute_ceiling.py` がエラー無し．
+3. 変更は `scripts/bench_compute_ceiling.py`／`tests/test_bench_compute_ceiling.py` の **新規 2 ファイルのみ**
+   （`pipeline_inference.py` 他，既存本体は非改変）．
+
+判定（go/no-go の決定的入力，判定は analyst）:
+
+4. **判定ルール**: (i) `ratio_8 ≤ 0.85` かつ K について単調減少 → **compute 側利得が実在**（GEMM で 1 トークンあたり ≥15% 短縮）
+   ＝ B3 go 方向の根拠．(ii) 全 K で `ratio ≥ 0.95` → **compute 側利得なし** ＝ B3 の天井は残差償却（≈1.08 倍）に縮小し，大規模な
+   relay 改修（SL3）は見送り方向．(iii) `0.85 < ratio < 0.95` → 曖昧，追加 K や実ノード計測を検討．
+5. **ノイズ幅**: 中央値採用＋`MEASURE_ITERS=200` で微小 matmul の timer jitter を均す．`ratio` の 1.0 からの差が **±0.05 を超えるもの
+   だけ**を有意な向き付けとして扱う（Iter4 集計の run 間ばらつき <1% を参考に，microbench では保守的に ±5% を採る）．
+
+#### 4. 実装フェーズ（rc-implementer）への申し送り
+
+- **対象ファイル・キー**: 新規 `scripts/bench_compute_ceiling.py`（定数 `WARMUP_ITERS`／`MEASURE_ITERS`／`K_VALUES`／
+  `NUM_THREADS`，純関数 `build_linear_shapes()`／`measure_linear()`／`compute_ratios()`／`classify_ratio()`），
+  新規 `tests/test_bench_compute_ceiling.py`．実行は `unset VIRTUAL_ENV && uv run python scripts/bench_compute_ceiling.py`
+  （Iter4 と同様の `VIRTUAL_ENV` 汚染回避）．
+- **CPU 代表性の注意（重要）**: この判定は CPU アーキテクチャ（キャッシュ／メモリ帯域）依存である．B8 の指定どおり
+  `num_threads=4`・float32 で local 実行するが，research-cycle 実行ホストは i5-8350U ではない可能性が高く，比率の**絶対値**は
+  実ノードと差が出る．よって analyst は `ratio` を「**向き（利得の有無）**」として解釈し，判定が (iii) 曖昧域に落ちた場合は，
+  実験フェーズで worker ノード 1 台上の軽量単独プロセス（**推論コンテナ非接触**）で追試する案を B9 go/no-go の補助に据える．
+  この追試はクラスタ本体（分散推論）に触れないが SSH を伴うため，実施時は B7 の包括承認（非破壊 SSH は自律可）の範囲内で行う．
+- **やらないこと**: 実機 relay・deploy・`pipeline_inference.py` 改変・推論実行は本イテレーションでは一切行わない．B3 本体
+  （SL3: relay プロトコル改修）は backlog B9 として温存し，本 SL1 の `ratio` 結果を添えて別途人間に go/no-go を諮る．
+
+---
+
 ## Iteration 4
 
 ### 考察・次計画 (Iter4)

@@ -6,6 +6,38 @@
 
 ---
 
+## B15 [auto-decided 2026-07-20] Iteration 9 の方向選定（実機 bench への per-microbatch timing ログ追加で直列化点を特定）
+- **状況**: Iteration 8（`pipeline_fill_microbench` ローカル Gloo 診断）を **採用（診断として結論確定）・収束**で確定．
+  Decision1（blocking×sleep, N=16,M=32,repeat=5）で **FF=0.9716（≥0.7 の (1b)，閾値まで約 129σ）**．結論は
+  「blocking `recv→compute→send` 構造は段が真並列なら本来ほぼ完全に fill する」＝**Iter7 実機の `time_per_step ∝ m`
+  （ほぼ完全直列，含意 FF は m=51 で 0.038・m=204 で 0.024＝1/p にほぼ張り付く）は blocking 通信構造では説明できず，
+  別の（大域的な）ハードな同期点由来**と切り分けた（Iter7 §2-i「blocking だから不 fill」の修正）．補足の matmul proxy
+  （FF 0.30）はレジームが違いすぎ真因の説明にはならない（F3 の傍証止まり）．async 二重バッファ大改修（B14(b)/F2 overlap
+  軸）の事前確度は低下したが，本ローカル bench は実機の同期点そのものを特定できない（計画 §6 の射程外）．
+- **自動選択**: Iteration 9 の単一レバーを **「実機 51 ノード bench 経路（`_run_microbatch_bench`/`_process_microbatch`）への
+  per-microbatch timing ログ追加による直列化点の特定」**とする（analyst 示唆 (A)）．Iter7 のほぼ完全直列を生む実際の
+  同期点（rank0 の microbatch 生成直列・`_reset_kv_cache_for_bench` 同期・barrier 等の候補）を，実測 timing で確定する．
+  SL1/SL2/pipeline_fill_microbench と同じ「作る前に測る／攻める前に直す点を特定する」診断系譜．state は
+  `phase="investigate"`・`current_lever=null` で開始．
+- **根拠**: (1) 未解決点が「実機の直列化点はどこか」の一点に集約されており，(A) はそれを直接特定でき最も情報利得が高い．
+  (2) 追加するのは bench 経路への**加算的な計測 INFO ログ**で serving/relay ロジックも計算結果も変えない（Iter3/P1 の
+  per-request INFO ログ追加と同種，graph-break リスク低・可逆）．(3) 誤った処方箋（async 大改修＝B14(b)）へ大投資する前に
+  真因を一次証拠で押さえる順序が「作る前に測る」系譜と整合．(4) 調査・計画・実装はコードのみ・実機非接続で可逆，
+  測定の deploy/predict は B7 の包括承認（非破壊 SSH/deploy）の範囲内で破壊的操作なし．
+- **可逆性**: 次に振るレバーの選定であり可逆．コード変更は加算的計測ログのみ・実機 deploy は B7 承認範囲内で破壊的操作なし
+  （自動判断とした）．
+- **要レビュー / 要人間判断**: (a) 本軸は bench 経路への読み取り専用計測で **relay プロトコル（B9/SL3）には一切触れず
+  軸が直交・実装衝突なし**．**B9 は今回も温存（`[needs-human]` 維持，reflector では自動判定しない）**．(b) フォールバック:
+  (A) の実装が過大（bench 経路の計測が予想外に serving 経路へ波及する等）と判明した場合は，示唆 (B)「重み int8 dynamic
+  quantization を SL1 型 local マイクロベンチで作る前に測る」（compute 92% を直接攻める・可逆）へ振り替える．config
+  `levers`（`STAGGER_INTERVAL`/`SEQ_LEN`/`WORLD_SIZE`）はさらに下位のフォールバックとして温存（B14(a)）．(c) async
+  ホットパス大改修（B14(b)）は，(A) で直列化点が判明し，かつ async で解消可能と分かるまで着手しない（不可逆・大規模の
+  ため，着手が妥当と判明した時点で改めて `[needs-human]` 登録＋Slack 確認）．なお journal（計画 §7）で B15 は Decision2a
+  到達時の async 大改修 needs-human 用に条件付きで言及されていたが，Decision1=(1b) により Decision2 は実行されず当該
+  条件は成立しなかったため，B15 は本 Iteration 9 方向選定へ充てた（採番の重複なし）．
+
+---
+
 ## B14 [auto-decided 2026-07-20] Iteration 8 の方向選定（research_frontier⑤: 通信・計算オーバーラップを起点とする高速化調査）
 - **状況**: Iteration 7（`NUM_MICRO_BATCHES` のスループット感度，research_frontier②）を**不採用（仮説棄却）・現実装で
   収束**と確定．実測は m=8→51 で 1.12 倍（2.8478→3.1772→3.2102 microbatch/s）で採用閾値 1.5 に遠く未達，かつ微増は
