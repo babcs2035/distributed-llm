@@ -6,6 +6,71 @@
 
 ---
 
+## B14 [auto-decided 2026-07-20] Iteration 8 の方向選定（research_frontier⑤: 通信・計算オーバーラップを起点とする高速化調査）
+- **状況**: Iteration 7（`NUM_MICRO_BATCHES` のスループット感度，research_frontier②）を**不採用（仮説棄却）・現実装で
+  収束**と確定．実測は m=8→51 で 1.12 倍（2.8478→3.1772→3.2102 microbatch/s）で採用閾値 1.5 に遠く未達，かつ微増は
+  バブル低減ではなく固定オーバーヘッド償却の副作用（機構が仮説と異なる＝実質的な反証）．最重要の学びは
+  **「本パイプラインの bench 経路には段間の通信・計算オーバーラップが構造的に存在しない」**（blocking Gloo・逐次
+  マイクロバッチループ・二重バッファ無し，`time_per_step ≈ 0.31×m + 0.35` の逐次型が適合，バブル式は不成立）．
+- **自動選択**: Iteration 8 を **research_frontier⑤（先行研究調査に基づく推論パイプライン高速化）**とし，Iter7 の上記
+  発見を具体的な起点として着手する．調査フェーズ（rc-investigator）が「通信・計算オーバーラップ（async `isend`/`irecv`・
+  二重バッファ・GPipe 型スケジューリングの CPU/Gloo 上での有効性）」を主軸に，KV キャッシュ最適化・量子化・continuous
+  batching 等の⑤候補も併せて文献調査し，計画フェーズが単一レバー原則で 1 つの具体案へ絞り込む．state は
+  `phase="investigate"`・`current_lever=null` で開始．
+- **根拠**: (1) Iter7 が「段間オーバーラップが無い」という具体的で行動可能な発見を残しており，これは⑤の中核候補
+  （通信・計算オーバーラップ）を直接指す．(2) analyst 推奨の次 config レバー `STAGGER_INTERVAL` は起動時 thundering
+  herd 回避が主目的で定常状態のスループット/レイテンシに直接効かず（Iter4 で ITL は compute 律速 92% と確定，起動時
+  交絡は warm-up 除去済み），振っても Iter7 同様「効かない確認」に終わる公算が高く期待値が低い．(3) config levers の
+  優先順位は目安であり，⑤はユーザーの明示指示（2026-07-18）による常設項目で「②③④と重複する場合は一本化」と規定
+  ——②の結果が⑤の一軸を名指しした以上，⑤へ一本化するのが config の意図に沿う．(4) 調査・計画フェーズはコードのみ・
+  実機非接続・可逆．
+- **可逆性**: 次の調査方向の選定であり可逆．破壊的操作を含まない（自動判断とした）．
+- **要レビュー / 要人間判断**: **重要な留保（levers 優先順位からの逸脱を含むため要レビュー）**——(a) config `levers` の
+  厳密な優先順位に従うなら次は `STAGGER_INTERVAL` だが，本決定はそれを見送り⑤を優先した．`STAGGER_INTERVAL`/`SEQ_LEN`/
+  `WORLD_SIZE` は levers に残置し，⑤の調査で行動可能な単一レバー案が得られない場合のフォールバック候補として温存する
+  （人間が優先順位を厳守させたい場合はこの B14 を差し替え，`STAGGER_INTERVAL` へ切り替えること）．(b) ⑤の自然な帰結
+  （`_process_microbatch` の async `isend`/`irecv`＋二重バッファ化）は `pipeline_inference.py` ホットパス改変を伴い
+  **不可逆・大規模になりうる**．計画フェーズが実装案をそこまで踏み込ませると判明した時点で backlog へ `[needs-human]`
+  登録し Slack で確認を仰ぐこと（調査・計画自体はコードのみで進めてよい）．(c) ⑤（通信オーバーラップ）は B9/SL3
+  （speculative decoding の relay 改修）とは別軸（通信・計算の重なり vs トークン投機）で直交するが，同じ
+  `pipeline_inference.py` を触るため，計画時に B9 との実装衝突・重複を確認すること．また Iter7 で再確認された
+  `dist.recv`/`dist.send` の例外握り潰し（通信断隠蔽）は，async 通信化の際に通信断の検知・伝播が信頼性の前提になるため
+  ⑤の設計時に併せて検討すべき将来課題として記録する．
+- **B9 の扱い**: 今回も温存（`[needs-human]` 維持，reflector では自動判定しない）．B9 回答が得られ次第，人間がこの B14 を
+  差し替えて SL3 を優先してよい（本 B14 は待ち時間を無駄にしないための直交軸の選定である）．
+
+---
+
+## B13 [auto-decided 2026-07-19] Iteration 7 実験フェーズ失敗への対処（bench 実装バグの修正のため実装フェーズへ差し戻し）
+- **状況**: Iteration 7（NUM_MICRO_BATCHES のスループット感度）の実験フェーズが，m=8 でのパイロット実行
+  （`MICROBATCH_BENCH_STEPS=5`）で 2 件のブロッキング実装バグを実機で発見した．
+  **バグA（クラッシュ）**: `_process_microbatch`（`pipeline_inference.py:995` 付近）が `layer(hidden_state)` を
+  `position_ids` 無しで呼び出しており，`_build_transformer_layer` の実シグネチャ（`:829`，`position_ids` に
+  既定値なし）と不整合で `TypeError` fatal crash．さらに `dist.recv`/`dist.send` の例外握り潰しにより，
+  下流 rank がクラッシュを検知できず「正常完了に見える rank」と「1 時間タイムアウトまでハングする rank」に
+  分かれる副作用も確認．**バグB（構造的）**: bench の KV キャッシュ書き込み位置がマイクロバッチ間で共有され
+  リセットされないため，本番設定（`MICROBATCH_BENCH_STEPS=100`）では総呼び出し数が `max_gen_tokens=2048` を
+  超え，バグA修正後も別クラッシュに至る見込み（コードレビューで確定，実クラッシュ未確認）．
+  実験フェーズはこれらを実験フェーズの役割（domain 知識を要する修正）を超えると判断し，パイロットを打ち切り，
+  bench 無効で全 51 ノードを健全な serving 状態へ復元済み（`results/Iter7.jsonl` は 0 件）．
+- **自動選択**: Iteration 7 の単一レバー（`NUM_MICRO_BATCHES`）は変更せず，**実装フェーズ（rc-implementer）へ
+  差し戻し**，バグA（`position_ids` 明示渡し）・バグB（bench 中の KV キャッシュ書き込み位置のリセット/バイパス）
+  を修正した上で，実験フェーズへ再度進む．
+- **根拠**: (1) B11（Iter6 の HF キャッシュ revision 修正）の前例と同様，**同一イテレーション内の実装バグ修正**
+  であり新たなレバー変更ではない（単一レバー原則に抵触しない）．(2) バグ修正自体はコード変更のみで可逆．
+  (3) 実験フェーズが自律判断で `tools/deploy.py`/`tools/common.py` の env 転送漏れを先に修正・pytest 88 passed
+  確認済みで，実装フェーズが着手しやすい状態に整えられている．
+- **可逆性**: 実装フェーズへの差し戻しであり可逆．クラスタは既に健全な状態に復元済みで，破壊的操作は含まない
+  （自動判断とした）．
+- **要レビュー / 要人間判断**: バグA・Bの修正は RoPE position_ids の意味・KV キャッシュ容量設計という
+  domain 知識を要する（実験フェーズ申し送り参照）．実装フェーズが「serving 経路への影響が読めない」等
+  過大と判断した場合は，その時点で backlog へ `[needs-human]` 登録し Slack で確認を仰ぐこと．また，
+  `dist.recv`/`dist.send` の例外握り潰し（通信断を隠蔽する設計，バグA副作用）は bench 固有の問題ではなく
+  `pipeline_inference.py` 全体の設計の弱点である可能性があり，本 Iteration の直接のスコープ外だが，
+  将来の research_frontier 候補として記録に値する（reflector が判断）．
+
+---
+
 ## B12 [auto-decided 2026-07-19] Iteration 7 の単一レバー選定（NUM_MICRO_BATCHES: research_frontier② のスループット感度）
 - **状況**: Iteration 6（SL2: draft 採択率のオフライン見積もり）を「採用」で確定・収束．overall α=0.5856（≳0.5）・
   a_2=1.8562（≳1.5）で計画の go 条件を両方充足し，SL1×SL2 合成の実効 compute 利得は最良 K=4 で ≈1.43 倍と数値化した．

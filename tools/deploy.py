@@ -524,6 +524,19 @@ def deploy_single_node(
             log("WARN", f"Cleanup warning on Rank {rank}: {clean_result.stderr.strip()}")
 
         # Step 4: Start container
+        # research-cycle Iter7: MICROBATCH_BENCH_* はシェル起動時に env で渡されても，従来この
+        # docker run コマンドには一切転送されていなかった（NUM_MICRO_BATCHES/STAGGER_INTERVAL と
+        # 異なり見落とされていた）ため，未設定時は `-e` 行ごと省略する形で明示的に転送を追加する．
+        bench_env_lines = ""
+        if config.microbatch_bench_steps:
+            bench_env_lines += f"    -e MICROBATCH_BENCH_STEPS={config.microbatch_bench_steps} \\\n"
+        if config.microbatch_bench_warmup_steps:
+            bench_env_lines += (
+                f"    -e MICROBATCH_BENCH_WARMUP_STEPS={config.microbatch_bench_warmup_steps} \\\n"
+            )
+        if config.microbatch_bench_repeats:
+            bench_env_lines += f"    -e MICROBATCH_BENCH_REPEATS={config.microbatch_bench_repeats} \\\n"
+
         deploy_command = f"""
 PHYS_IFACE=$(ip -o -4 route show to default | awk '{{print $5}}')
 if [ -z "${{PHYS_IFACE}}" ]; then
@@ -571,7 +584,7 @@ LC_ALL=C docker run -d \\
     -e KMP_AFFINITY=granularity=fine,compact,1,0 \\
     -e KMP_BLOCKTIME={KMP_BLOCKTIME_STR} \\
     -e NUM_MICRO_BATCHES={config.num_micro_batches} \\
-    {config.target_image}
+{bench_env_lines}    {config.target_image}
 """
         result = ssh_via_master(
             config.ssh_user, config.master_addr, ip, deploy_command, timeout=300,

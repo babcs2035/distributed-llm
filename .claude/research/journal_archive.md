@@ -1,3 +1,594 @@
+## Iteration 4
+
+### 考察・次計画 (Iter4)
+
+**担当**: 考察・次計画 subagent（2026-07-19）．分析(解釈) の結論（本ブロック `### 分析(解釈) (Iter4)`）を受け，
+単一レバー「B0: per-stage compute/recv dt の内訳記録」の採否を確定し，次イテレーション（Iteration 5）の方向を決めた．
+実機への新規接続・実行はしていない（記録の読み取りとコミット操作のみ）．
+
+**1. 採否判定: 採用（adopt）**
+
+- **判定根拠**: B0 は診断（計測）レバーであり，判定対象は「7s/token の計算 vs 通信内訳を確定できたか」．計画 §3 の
+  成功条件 4〜6 を実機 3 run で全て充足した（条件4: `n_ranks_reporting=50/50`×3，条件5: `compute+send+residual ==
+  rank0_step_dt` が丸め誤差すら無く厳密一致・X/Y/Z 数値言明可，条件6: 再デプロイなし n=3・中央値集計・step0 分離）．
+  実装フェーズも `pytest` 45 passed（既存 38＋差分 7）・変更 3 ファイル厳守・`pipeline_inference.py` 非改変を満たす．
+  実測（3 run 中央値）は **compute≈92.0%・send≈0.32%・residual≈7.6%** で，「ITL≈7s/token は計算律速」を確定した．
+- **追加反復の要否**: 不要．内訳比率は決定的（純関数集計）な量で run 間ばらつきが 1pp 未満（compute% レンジ 0.27pp），
+  弁別したい「compute ≫ residual ≫ send」の桁違いの大小関係はノイズの数十〜数百倍大きく，n=3 で判定は反転しない．
+- **非自明な学び（次の自分向け）**: (i) **residual 7.6% は「純粋な通信/待機」ではない**．実コード上，最終 rank の
+  final_norm＋lm_head（5376×語彙数の行列積）＋argmax＋全語彙 topk/診断（`pipeline_inference.py:1600-1622`）は
+  `compute dt` にも `send` にも計上されず全て residual に落ちる．正しくは residual ＝段間同期（recv 待ち＋ACK 往復＋
+  Gloo/Python オーバーヘッド）＋最終 rank の未計上計算，と分解すべき．(ii) 調査(Iter4)が B2（診断ログ削減）へ付けていた
+  「compute dt に含まれる可能性が高い」という見立ては**実コード上は否**（f-string 評価順で `compute dt` が先に確定し，
+  `hidden_mean/std/...` はその後に走るため 92% の compute には非含）．これらは B1/B2 の期待効果を大きく下げる知見である．
+
+**2. このレバーの収束状況**
+
+- B0 で「支配項は 50 段の逐次 CPU 計算（float32・4 コア GEMV）で 92%，通信（生転送）は 0.3% で無視できる」が確定し，
+  **「計算律速か通信律速かの弁別」という診断課題は完了（収束）**した．Iter1〜4 と続いた「収集ツールに閉じた非侵襲な
+  基盤/診断」系レバー（①永続化 → (a)RESULT 照合 → (b)levers 堅牢化 → B0 内訳診断）は，ここでやり切った．
+- したがって次は「診断」を離れ，**支配項（92% の compute）そのものを攻めるレバー**へ移す段である．ただし B0 が明らかにした
+  副次事実（residual の内実＝段間同期＋最終 rank の未計上計算）から，B1（WORLD_SIZE 絞り込み）は Σcompute 不変で
+  残差止まり，B2（診断ログ削減）は compute dt 非含で残差の一部止まり，といずれも支配項に効かないことが確定した．
+
+**3. 次に振るレバーの決定（Iteration 5）: B3 を最小サブレバーへ分解し，SL1（compute 上限の local マイクロベンチ）を自動選定**
+
+- **状況**: 分析(解釈) の推奨は B3（speculative decoding）＝支配項の「逐次性」を崩せる唯一の候補．ただし B3 本体は
+  実装規模が大きい（draft モデル追加・relay プロトコル大改修・検証木・51 ノード再デプロイ）．research-cycle の自律判断
+  ポリシー（可逆/小規模は自動選択・不可逆/大規模は人間判断）に照らし，B3 を**そのまま Iteration 5 の単一レバーには
+  しない**．まず実装規模を落とした最小サブレバーへ分解した（複数案，下記）．
+- **B3 の最小サブレバー分解案（実装規模の小さい順）**:
+  - **SL1（採用＝Iteration 5）: compute 側上限の local マイクロベンチ**．目的は，分析(解釈) が挙げた B3 の効き源
+    (ii)「seq_len=1 の GEMV を K 位置まとめた GEMM に変え，4 コア CPU の演算強度/キャッシュ効率を上げる」が
+    **この実機（i5-8350U・4 コア・float32・OpenBLAS/MKL）で実在するか**を，クラスタ本体・relay プロトコルに一切触れず
+    測ること．具体的には，本モデルの実次元（`hidden_size=5376`，ノードあたり 1〜2 層相当の GEMM 形状）で
+    `torch.set_num_threads(4)`・float32 のもと，seq_len=1（GEMV）と seq_len=K（K=2,4,8 の GEMM）の**1 トークンあたり
+    実行時間**を比較する．規模: **小**（単一プロセスのローカル計測スクリプト・重み不要のランダムテンソルで足りる，
+    `pipeline_inference.py` 非改変・再デプロイ不要・破壊的操作なし＝完全に可逆）．リスク: 低．決定価値: **大**．
+    もし GEMM(K) の 1 トークンあたりコストが GEMV とほぼ同じなら B3 の compute 側利得は実在し，大投資の根拠になる．
+    逆に GEMM(K)≈K×GEMV（この CPU では演算強度が上がらない）なら B3 の天井は残差償却（≈7.6% ぶん＝上限 1.08 倍程度）に
+    縮み，**大規模な relay プロトコル改修に見合わない**ことが判明する＝B3 本体 go/no-go の決定的入力になる．
+  - **SL2: draft 戦略の受理率オフライン検証**（prompt-lookup/n-gram draft か小 draft モデル）．K トークン提案の受理率を
+    既存ログ/参照出力で見積もる．規模: 中（参照出力の取得に実機推論を要する場合あり）．relay プロトコル改修は不要だが
+    B3 本体の期待値算定に必要．
+  - **SL3: relay プロトコル改修（K トークン運搬＋検証を 1 往復で行う本体実装）**．規模: **大**・`pipeline_inference.py`
+    ホットパス改変・51 ノード再デプロイを伴い**不可逆側**．どの draft 戦略でも実レイテンシ低減にはこれが避けられない．
+- **決定（自律判断・path (a)）**: Iteration 5 の単一レバーを **SL1** とする．理由は，(1) B3 の最大の不確実性（compute 側
+  利得がこの CPU で実在するか）を near-zero コストかつクラスタ非接触で潰せ，(2) B0 と同じ「作る前に測る」診断の系譜で
+  単一レバー原則に整合し，(3) 完全に可逆で破壊的操作を含まないため**自律判断の範囲内**だからである．backlog に
+  `## B8 [auto-decided 2026-07-19]` として記録した．
+- **人間判断の申し送り（不可逆側の温存）**: SL3（relay プロトコル改修・再デプロイを伴う B3 本体）は**不可逆・大規模**で
+  自律判断の範囲外であり，backlog に `## B9 [needs-human 2026-07-19]` として温存した．**SL1 の結果（compute 側利得の
+  実在有無）を添えて，B3 本体着手の go/no-go を人間に諮る**方針．今回は path (a)（十分小さいサブレバーを自動選定）に
+  該当するため `status="blocked"` にはせず `running` で進める．ただし透明性のため Slack 完了サマリーで
+  `<@U08GLKY1QCW>` に「B3 本体は SL1 の結果を見て別途 go/no-go を諮る」旨を明記し，異論があれば上書きできるようにする．
+- **可逆性**: 次に振るレバーの選定（SL1）であり可逆．破壊的操作を含まない（自動判断とした）．
+
+**次イテレーションへの結論**: Iteration 4（B0 内訳診断）を採用で確定・収束（「7s/token は計算律速・compute 92%」を確定）．
+Iteration 5 は，B3 を最小サブレバーへ分解した SL1（compute 側上限の local マイクロベンチ）を自動選定して開始する．
+B3 本体（SL3: relay プロトコル改修）は不可逆・大規模のため needs-human として温存し，SL1 の結果を添えて go/no-go を諮る．
+
+---
+
+### 分析(解釈) (Iter4)
+
+**担当**: 分析(解釈) subagent（2026-07-19）．`## Iteration 4` の全ブロック（調査・計画・実装・実験）と
+`results/Iter4.jsonl`（3 run）を読み，さらに `pipeline_inference.py:1560-1729`（最終 rank／中間 rank の
+per-stage 計時と診断ログの実コード）を Read して，単一レバー「B0: per-stage compute/recv dt の内訳記録」の
+成否・調査一次推定との整合・次レバーへの示唆を解釈した．実機への新規接続・実行はしていない（記録の読み取りのみ）．
+
+**前提（判定の枠組み）**: 本イテレーションの判定対象は「診断（計測）レバーが目的（7s/token の計算 vs 通信内訳の確定）を
+達成したか」であり，レバー効果によるスループット改善そのものではない（B0 はホットパス非改変・掃引なしの計測 run）．
+したがって Iter1 の「n が小さくノイズ幅未知でレバー効果を弁別できない」論点は，ここでは「内訳比率が run 間で安定し，
+バケット間の大小関係が一意に読めるか」という形に置き換わる．
+
+**1. 有意性・再現性: 3 run で内訳比率は安定，成功条件 4〜6 を全て充足．計算律速の判定はノイズに対して頑健**
+
+- **run 間ばらつきはノイズ相当で小さい**: `rank0_step_dt_median_ms` は 7016〜7055ms（幅 39ms＝最大値の 0.55%），
+  `compute_sum_ms_median` は 6443〜6498ms（幅 55ms＝0.85%），`send_sum_ms_median` は 21.5〜25.0ms（幅 3.5ms）．
+  比率換算では compute 91.83%/92.09%/92.10%，send 0.31%/0.32%/0.35%，residual 7.86%/7.59%/7.54% で，**3 run とも
+  compute≈92%・send≈0.3%・residual≈7.6% にほぼ一定**（compute% のレンジ 0.27pp，residual% のレンジ 0.32pp）．
+- **判定は測定ノイズに対して頑健**: 弁別したい命題は「compute ≫ residual ≫ send」という**桁違いの大小関係**であり，
+  その差（92% 対 7.6% 対 0.3%）は run 間変動（1pp 未満）の数十倍〜数百倍大きい．n=3 でも判定が反転する余地は無く，
+  「計算律速」の結論は有意（noise ではなく signal）と断定できる．内訳比率という決定的（純関数集計）な量である点も，
+  Iter1 型のノイズ問題を持ち込まない．
+- **計画 §3 の成功条件（フェーズ4，判定は analyst）を全て充足**:
+  - 条件 4（`n_ranks_reporting ≥ 45`）: 3 run とも **50/50**．許容幅 5 を使わず全 worker が報告．**充足**．
+  - 条件 5（`compute_sum+send_sum+residual ≈ rank0_step_dt` の丸め内成立と，X/Y/Z の数値言明）: 3 run とも
+    **厳密一致**（丸め誤差すら無し．`residual` を減算で導出する実装のため定義上一致するが，入力側集計にバグが無い
+    ことの傍証）．「ITL≈7s/token のうち計算 Σcompute≈92.0%・送信 Σsend≈0.32%・残差≈7.6%」と数値言明でき，
+    `X+Y+Z=100%`．**充足**＝B0 の目的（計算律速か通信律速かの確定）を達成．
+  - 条件 6（`--stage-timing` を n≥3 回・再デプロイなし・代表値中央値・step0 は `prefill_recv_ms_by_rank` 別枠）:
+    3 run 実施・冷開始交絡なし・中央値集計・step0 分離を確認．**充足**．
+- 異常無し（`parse_warnings=[]`×3，`parse_ok=True`，`schema_version=2`，一部ノード到達不可・言語崩れ・発散・OOM 等の
+  想定外挙動は無し）．
+
+**2. 調査(Iter4)一次推定との整合: 「計算律速」を確定．ただし residual の内実は一部修正が要る**
+
+- 調査の一次推定「ホップ数×1 ホップ固定レイテンシ＋各段逐次 CPU 計算の和が支配的．生帯域は律速でない」は，**支配項が
+  各段逐次 CPU 計算である点は実測で確定**した（Σcompute≈6.47s が 7.02s の 92%）．seq_len=1・単一マイクロバッチの
+  自己回帰デコードで 50 段を厳密逐次通過し，任意時刻に 1 段しか稼働しない構造が，そのまま「50 段の float32・4 コア
+  GEMV の和」として ITL に現れている．**通信（send）は 0.3%＝無視できるほど小さい**（21KB/ホップ×50 の生転送は
+  一次推定どおり律速でない）．
+- **修正が要る点（residual の帰属）**: 「残差 7.6%＝recv 待ち＋ACK 往復＋Gloo/Python オーバーヘッド」と**単純に言い切ることは
+  できない**．実コードを読むと，(i) 段間計時の起点 `_t`（`:1588,1694`）は layer ループ直前で，`compute dt`（`:1598,1704`）は
+  layer ループ直後に確定する．(ii) 最終 rank の **final_norm＋lm_head（`F.linear(final_hidden, _lm_head)`＝5376×語彙数の
+  行列積）＋argmax＋全語彙 topk/診断**（`:1600-1622`）は `compute dt` にも `send`（最終 rank は `sent to next` を持たない）
+  にも計上されず，**全て residual に落ちる**．4 コア float32 での lm_head 行列積は非自明なコストであり，residual≈551ms の
+  一部は「未計上の最終 rank 計算」である．したがって正確には **residual ＝ 段間同期（recv 待ち＋ACK 往復＋Gloo/Python
+  オーバーヘッド，≈11ms/ホップ×50）＋ 最終 rank の lm_head・サンプリング・診断（compute dt 未計上分）** と分解すべきで，
+  「純粋な通信/待機オーバーヘッド」ではない．いずれにせよ residual は 7.6% と小さく，**支配項が compute であるという結論は
+  変わらない**．
+- まとめると，言い切れる確定事項は「**ITL≈7s/token は 50 段の逐次 CPU 計算（float32・4 コア GEMV）の累積が支配（≈92%）で，
+  通信（Gloo send/recv の生転送）は無視できる（≈0.3%）**」．残差 7.6% の内実は「段間同期＋最終 rank の未計上計算」であり，
+  通信のみではない．
+
+**3. 次レバーへの示唆: B1/B2 は支配項（92% の compute）に触れられず低効果．B3 のみが計算逐次性を攻める**
+
+- **B1（WORLD_SIZE 絞り込み 51→21/11）は計算律速下では低効果**: 60 層の総計算量はノード分割の粒度に依らず一定であり，
+  ホップ数を 50→10 に減らしても **Σcompute はほぼ不変**（ノードあたり層数が増え 1 段の計算時間は逆に増えるため，
+  積＝総和は保存）．B1 が削れるのは residual（段間同期部分＝7.6% の一部）と send（0.3%）の一部に限られ，**上限で数 %**．
+  かつ再デプロイ・実機 run・人間確認を要する．調査が B1 に与えていた「ホップ律速 vs 計算律速の弁別」という診断価値は
+  **B0 が既に解消済み**のため，B1 の残る意義は小さい．**優先度は下げる**．
+- **B2（毎ステップ診断ログ削減）も支配項に効かない**: 実コードで確認したところ，`compute dt` は f-string 評価順で
+  `_time.monotonic()-_t` が**先に確定**し，同一ログ行の `hidden_mean/std/min/max`（`:1598,1704`）はその**後**に走るため，
+  **診断リダクションは `compute dt`（92%）に含まれていない**．中間 rank の診断は `sent_to_next−compute`＝send バケット
+  （合計 21ms＝負担ゼロに近い）へ，最終 rank の全語彙 topk/診断（`:1605,1609,1616,1619`）は residual へ落ちる．よって B2 で
+  削減できるのは send（無視可能）と residual の一部（最終 rank 1 個ぶん）に限られ，**92% の compute には一切触れられない**．
+  「安価だが効果は残差の一部＝上限 1% 未満」であり，ホットパス改変＋再デプロイ＋人間確認のコストに見合わない．調査が
+  B2 に付けていた「compute dt に含まれる可能性が高い」という見立ては，実コード上は**否**（含まれない）と修正する．
+- **B3（speculative decoding）が計算律速に唯一整合する方向**: 支配項が「1 トークンずつ 50 段を逐次通過する CPU 計算」で
+  ある以上，レイテンシを下げるには**逐次性そのもの**を崩す必要がある．文献（FlowSpec/PipeDec）の 1.36–1.77× の出所は，
+  (i) 段間同期・パイプライン充填の固定費（residual 相当）を K トークンに 1 回へ**償却**，(ii) seq_len=1 の GEMV を K 位置
+  まとめた GEMM に変え **4 コア CPU の演算強度/キャッシュ利用効率を上げる**（K 位置は K× の単純逐次より安い），
+  (iii) draft がパイプラインをより多くの位置で稼働させ利用率（現状≒1/51）を上げる，の 3 点にある．**計算律速下でも
+  効く源が (ii) 演算強度改善という形で存在する**点が重要で，B1/B2 の「残差いじり」とは効きどころの桁が違う．ただし
+  実装規模は大（draft モデル追加・relay プロトコル大改修・検証木・再デプロイ）で，単一レバー原則には過大．
+
+**4. このイテレーション（B0）の採否: 採用（adopt）**
+
+- B0 は計測（診断）レバーで，計画（§3 成功条件 1〜6）・実装（`pytest` 45 passed・変更 3 ファイル厳守）・実機実証
+  （50/50 到達・内訳厳密一致・warning 無し）が全て揃い，目的「7s/token の計算 vs 通信内訳の確定」を達成した．
+  レイテンシは下げない性質のレバーだが，Iter1〜3 と同じ「収集ツールに閉じた非侵襲な基盤/診断」系として**採用で確定**．
+  追加反復は不要（内訳は決定的量で 3 run 安定，判定に曖昧さが無い）．
+
+**次イテレーションへの推奨（単一レバー，1 つ）**: **B3（speculative decoding）を Iteration 5 のレバー方向とする**．
+理由は，B0 で「92% が 50 段逐次 CPU 計算＝計算律速」が確定し，config `levers`／backlog の候補のうち**支配項（compute）を
+攻められるのは B3 のみ**（B1 は Σcompute 不変で残差止まり，B2 は compute dt に非含で残差の一部止まり）だからである．
+ただし B3 は実装規模が大きく単一レバー原則に対して過大なので，**考察・次計画フェーズは (a) 実機 deploy／プロトコル改修を
+伴うため Slack で人間の go/no-go を取り，(b) 最小サブレバー（例: rank0 に小 draft モデル＋K=2 の 1 往復検証プロトタイプを
+縮小 WORLD_SIZE で高速反復）へ分解する**ことを条件に据えること．B1/B2 は「残差 7.6%／送信 0.3% の一部を削る低効果レバー」
+として優先度を下げ，必要になれば後続で扱う．
+
+---
+
+### 実験 (Iter4)
+
+**担当**: 実験フェーズ subagent（2026-07-19）．実装済みの `--stage-timing` 拡張（本ブロック直下 `### 実装 (Iter4)`）を用い，
+稼働中の実機クラスタ（51 ノード）に対し計画 §2-D の正式手順で測定 run を実施した．コード変更・再デプロイは行っていない
+（既存稼働イメージのログ収集のみ）．
+
+**1. 事前確認**
+
+- `mise run status`（`uv run python tools/healthcheck.py`）: rank0（wafl-ctrl1）＋ rank1〜50（wafl100-139/200-209）の
+  **51/51 ノードが Healthy**（SSH／Docker daemon／`distributed-llm` container running／モデル重み配置／MTU=1500 すべて OK）．
+  再デプロイは不要と判断し，`mise run deploy` は実行していない．
+
+**2. 実行コマンド（n=3 回，固定構成，掃引なし）**
+
+```
+unset VIRTUAL_ENV && uv run python tools/collect_results.py --iter Iter4 --stage-timing --prompt "Hello!"
+```
+
+`mise run predict:demo` ではなく上記直接呼び出しを使用（申し送りどおり，`predict:demo` タスク自体には
+`--stage-timing` が渡されないため）．3 回とも正常終了（`appended 1 record to results/Iter4.jsonl`），
+`results/Iter4.jsonl` は 0 行 → 3 行へ増加（各回実行直後に行数を確認し 1 行ずつの追記を確認済み）．
+
+| run | timestamp (UTC) | tokens_per_sec | parse_ok |
+|---|---|---|---|
+| 1 | 2026-07-19T01:01:20Z | 0.0977 | True |
+| 2 | 2026-07-19T01:04:32Z | 0.0982 | True |
+| 3 | 2026-07-19T01:07:42Z | 0.0975 | True |
+
+**3. `timing_breakdown` の内訳（n_ranks_reporting は全 run で 50/50，欠損なし）**
+
+| run | compute_sum_ms_median | send_sum_ms_median | residual_ms_median | rank0_step_dt_median_ms | n_ranks_reporting |
+|---|---|---|---|---|---|
+| 1 | 6443.0 | 21.5 | 551.5 | 7016.0 | 50 |
+| 2 | 6482.0 | 22.5 | 534.5 | 7039.0 | 50 |
+| 3 | 6498.0 | 25.0 | 532.0 | 7055.0 | 50 |
+
+- **検算**（`compute_sum + send_sum + residual == rank0_step_dt`）: 3 run とも厳密一致（run1: 6443.0+21.5+551.5=7016.0，
+  run2: 6482.0+22.5+534.5=7039.0，run3: 6498.0+25.0+532.0=7055.0）．丸め誤差すら無く成立（`build_timing_breakdown` が
+  残差を減算で導出する実装のため定義上一致するが，入力側の中央値集計にバグが無いことの確認として有効）．
+- **比率換算**（参考，判定は分析(解釈)フェーズが行う）: compute 比率 91.8%/92.1%/92.1%，send 比率 0.31%/0.32%/0.35%，
+  residual 比率 7.86%/7.59%/7.54%．3 run でほぼ一定．
+- **run 間ばらつき**: `rank0_step_dt_median_ms` は 7016〜7055ms（幅 39ms，最大値の 0.55%）．`compute_sum_ms_median` は
+  6443〜6498ms（幅 55ms，0.85%）．`send_sum_ms_median` は 21.5〜25.0ms（幅 3.5ms）．いずれも粗く見て run 間変動は小さい
+  （詳細な統計判定は次フェーズに委ねる）．
+
+**4. 異常の有無**
+
+- `parse_warnings` は 3 run とも空配列（`[]`）．SSH 失敗・負差分除外の warning は一切無かった．
+- `n_ranks_reporting=50`（＝rank1〜50 の全 worker）が 3 run とも達成．計画の成功条件 4（`≥45`）を余裕をもって満たす．
+  50 ノード全到達という意味で，一部ノード到達不可等の障害も発生しなかった．
+- `schema_version=2`，`parse_ok=True`，`stage_timing`／`timing_breakdown` とも non-null を 3 run 全てで確認．
+- 想定外の障害・タイムアウト・コード上のエラーは無かった．各 run の所要時間は開始から完了通知まで概ね 3 分強
+  （ヘルスチェック含め全体で計 15 分弱）．
+
+---
+
+### 実装 (Iter4)
+
+**担当**: 実装フェーズ subagent（2026-07-19）．計画（本ブロック直下 `### 計画 (Iter4)` §2・§4）に従い，単一レバー
+「B0: per-stage compute/recv dt の内訳記録」を最小差分で実装した．`pipeline_inference.py`／`tools/predict.py`／
+`tools/common.py` は非改変（既存関数を import して再利用するのみ）．実機クラスタへの接続・deploy／推論実行は行っていない
+（コード実装とローカル単体テストのみ）．
+
+**1. 変更ファイル（3 つのみ，計画どおり）**
+
+- **`tools/collect_results.py`**:
+  - 正規表現 3 本を新設（`_COMPUTE_DT_RE`／`_RECV_HIDDEN_DT_RE`／`_SENT_TO_NEXT_DT_RE`）．秒→ms 変換定数
+    `_SEC_TO_MS = 1000.0` を追加（マジックナンバー回避）．
+  - `NodeStageTiming` dataclass（`rank`／`compute_dt_ms_by_step`／`recv_hidden_dt_ms_step0`／
+    `sent_to_next_dt_ms_by_step`）と純関数 `parse_node_stage_timing(log_text)` を追加．`_LOG_LINE_RE` で
+    `[R{rank} LEVEL] ...` の本文部分を取り出し，マッチしない行はそのまま本文として 3 正規表現に照合する
+    （RESULT のような複数行本文が絡まないため `_extract_rank0_messages` の継続行連結ロジックは不要と判断）．
+  - `StageTimingSummary` dataclass と集約関数 `aggregate_stage_timing(nodes)` を追加．send は同一 step の
+    `sent_to_next_dt − compute_dt`（中間 rank のみ．最終 rank は `sent_to_next` を持たないため自動除外）で近似．
+    差分が負になるケース（ログ欠損・step 対応ずれ）は 0 クランプせず，`(rank, step)` を除外して warning を積む
+    （黙って歪めない．計画 §2-B のとおり実装）．デコードステップ（`step ≥ _FIRST_DECODE_STEP = 1`）のみを
+    中央値集計の対象とし，step0（prefill）は `prefill_recv_ms_by_rank` に分離した．
+  - `build_timing_breakdown(step_dt, summary)` を追加．`residual_ms_median = rank0_step_dt_median_ms −
+    compute_sum_ms_median − send_sum_ms_median`（いずれかが `None` なら残差も `None`，捏造しない）．
+  - `build_record` に `stage_timing`／`timing_breakdown`（いずれも既定 `None`）フィールドを追加．
+    `SCHEMA_VERSION` を **1 → 2** に更新．`--stage-timing` 未指定（既定）では両フィールドとも `null` のまま
+    JSONL へ出力され，Iteration 1〜3 の v1 レコードと後方互換．
+  - `run_and_collect` に `stage_timing: bool = False` 引数を追加．`True` のときのみ
+    `collect_worker_stage_timing_logs(config, run_start)`（新設）を呼び，`read_hosts(config.hosts_file)` で
+    rank1 以降の worker（`hosts[i]` = rank i，rank0 は `collect_rank0_log` で取得済みのためスキップ）へ
+    `ssh_via_master(...)` 経由で `docker logs --since {since} distributed-llm 2>&1` を取得する．
+    `concurrent.futures.ThreadPoolExecutor(max_workers=_STAGE_TIMING_MAX_WORKERS=8)` で並列化し，個々の SSH
+    失敗は握りつぶさず `parse_warnings` に積んで成功ノードのみで集約を継続する．
+  - `main()` に `--stage-timing`（`action="store_true"`，既定 off）を追加し，`run_and_collect` へ伝播した．
+  - モジュール冒頭 docstring を `--stage-timing` の説明・使用例を含む形へ更新．
+
+- **`tests/test_collect_results.py`**: TS1〜TS6 を新設（計画の「任意」TS7 は，既存の
+  `test_build_record_contains_all_schema_keys_and_is_json_serializable` に `stage_timing`／`timing_breakdown`
+  が `None`（後方互換）であることの assert を追加する形で吸収し，別テストとしては独立させなかった）．
+  - TS1〜TS3: 3 正規表現の抽出・非衝突（`_COMPUTE_DT_RE` と `_SENT_TO_NEXT_DT_RE` の誤マッチ無し等）を確認．
+  - TS4: `[R7 INFO]` 形式の物理ログから `parse_node_stage_timing` が rank・compute/recv/send を ms 単位で正しく構築．
+  - TS5: `aggregate_stage_timing` が複数ノードの `NodeStageTiming` から step 別総和を計算し，最終 rank
+    （`sent_to_next_dt_ms_by_step={}`）が送信総和に含まれないことを確認．補足テストとして，
+    `sent_to_next < compute` の負差分ケースが 0 クランプされず除外・warning 付与されることも確認．
+  - TS6: `build_timing_breakdown` が返す `compute_sum_ms_median + send_sum_ms_median + residual_ms_median ==
+    rank0_step_dt_median_ms`（丸め許容）の検算が成立することを確認．
+  - 新規 `.log` フィクスチャファイルは作成せず，全てインライン文字列で与えた（Iter2 の `.gitignore` `*.log`
+    トラップ回避，計画の指示どおり）．
+
+- **`mise.toml`**: `[tasks."predict:demo"]` の `run` を
+  `'uv run python tools/collect_results.py --iter Iter1 --prompt "Hello!"'` から
+  `'uv run python tools/collect_results.py --iter "${ITER:-Iter1}" --prompt "Hello!"'` へ変更．
+  `ITER` 環境変数が無ければ既定 `Iter1`（後方互換・非破壊）．B0 の測定 run では `ITER=Iter4 mise run
+  predict:demo` あるいは `collect_results.py --iter Iter4 --stage-timing` を正式手順とする（計画 §2-D）．
+
+**2. 検証結果**
+
+- `uv run python -m py_compile tools/collect_results.py tests/test_collect_results.py`: エラー無し．
+- `unset VIRTUAL_ENV && uv run pytest tests/ -v`: **45 passed, 0 failed/error**（既存 38 件＋新規 TS1〜TS6
+  相当 6 件＋既存 `test_build_record_...` 1 件への assert 追加＝差分 7 件，合計 45 件．計画の「合計 44 件以上」を
+  満たす）．`VIRTUAL_ENV` が別リポジトリ（WAFL-PEFT）の `.venv` を指す環境変数汚染があったため `unset` してから
+  実行した（`uv run` 単体では warning が出るのみで実害は無いが，明示のため記録する）．
+- `git status --short`: 変更ファイルは `mise.toml`／`tests/test_collect_results.py`／`tools/collect_results.py`
+  の 3 つのみ（新規 `.log` 等の混入無し）．`.claude/research/journal.md`／`state.json` の差分は計画フェーズが
+  作業前から持ち込んでいた未コミット変更であり，本実装フェーズでは触れていない．
+
+**3. 気づいた点・申し送り**
+
+- `parse_node_stage_timing` は worker ログにブロック開始マーカー（`Rank 0: prompt=`）が無い前提のため，複数 run が
+  同一 `--since` 窓に混在すると компute/send が別 run のものと混ざる余地が残る（計画が明記した既知の限界．
+  `--iter` 変数化＋単発運用で回避する運用側の前提）．
+- `collect_worker_stage_timing_logs`／`run_and_collect` の `--stage-timing` 分岐は SSH を伴うため計画どおり
+  単体テスト対象外とした（Iter1〜3 の `run_and_collect` と同じ扱い．手動レビューで `read_hosts` の返す順序
+  （`hosts[i]` = rank i）と rank0 スキップのオフセット（`range(1, len(hosts))`）を確認済み）．
+- フェーズ4（実機 `--stage-timing` 測定 run）は計画のとおり，着手前に B1 の合意に基づき Slack で人間確認が必要
+  （本実装フェーズでは実施していない）．
+- **実験を開始してよい状態か**: コード実装・単体テストは完了しフェーズ4 に進める状態にあるが，フェーズ4 の着手
+  （51 ノードへの SSH 並列 `docker logs` 取得を伴う実機 run）自体は計画が明記したとおり別途人間確認が必要であり，
+  本実装フェーズの完了はその確認を代替しない．
+
+---
+
+### 計画 (Iter4)
+
+**担当**: 計画フェーズ subagent（2026-07-19）．単一レバー「B0: per-stage の compute/recv 時間内訳を results/Iter4.jsonl へ集約し，
+ITL≈7s/token の計算 vs 通信のボトルネックを診断する」（本ブロック下 `### 調査 (Iter4)` の推奨第一手，backlog B6）を，
+実コード（`pipeline_inference.py` の該当ログ行・`tools/collect_results.py` 全体・`tools/common.py` の SSH/hosts 機構・`mise.toml`）を
+Read して実装可能な粒度へ落とし込んだ．**本イテレーションのフェーズ2・3 はコード実装・単体テストのみで，実機クラスタへの
+deploy／推論実行は行わない**（フェーズ4は B1 の人間確認後にオーケストレータが着手する）．前担当（rc-planner）がセッション制限で
+中断したため引き継ぎ発見を実コードで再検証したうえでゼロから確定した．
+
+#### 0. コードで再検証した前提（計画の土台）
+
+- **per-stage の時間ログは rank0 ではなく中間 rank・最終 rank のログにのみ出る**（引き継ぎ発見①は正しい）．
+  - `compute dt`: 最終 rank `pipeline_inference.py:1598`，中間 rank `:1704`．物理行
+    `[R{N} INFO] Rank {N}: step {step} compute dt={x:.3f}s hidden_mean=... hidden_std=...`．**全デコードステップで出る**．
+  - `recv_hidden dt`: 最終 rank `:1573`，中間 rank `:1677`．物理行 `[R{N} INFO] Rank {N}: recv_hidden dt={x:.3f}s`．
+    **`is_first`（step0＝prefill 受信）でのみ出る**（step>0 の else 分岐 `:1574-1586`/`:1678-1692` には無い）．
+  - 中間 rank `sent to next dt`: `:1714`．物理行 `[R{N} INFO] Rank {N}: step {step} sent to next dt={x:.3f}s`．**毎ステップ出る**．
+    `_t`（`:1694`．irecv 完了後の計算開始）起点で計測されるため **compute+send を含み，recv 待ちは含まない**．
+  - rank0（`:1439-1540`）は per-stage の計算/受信時間を持たず，`Rank 0: step N done ... dt=...s`（`:1532`，現行 `step_dt` の源）＝
+    そのトークンの 51 段一周の総時間（≒7s）だけを出す．最終 rank の post-compute（final_norm+lm_head+argmax+送信+ACK）は
+    個別 INFO 行はあるが単一 dt では計時されない（残差に吸収する）．
+- **worker ノードへの到達手段は既存コードで足りる**（引き継ぎ発見②は正しい）．`tools/common.py:424 ssh_via_master(user,
+  master_addr, target_host, command)` が local→master→target の ProxyJump．`read_hosts(config.hosts_file)`（`:292`）は IP を
+  返し**行順＝rank 番号**（`hosts[i]` が rank i）．各ノードのコンテナ名は `distributed-llm`（`collect_rank0_log:527` が
+  `docker logs ... distributed-llm` を使用）．各コンテナは 1 プロセス＝1 rank なので，そのノードの `docker logs` には
+  当該 rank の `[R{i} ...]` 行しか出ない．
+- **B0 は `pipeline_inference.py` 改変・再デプロイ不要**．上記ログ行は Iter3 デプロイより前から存在し，稼働中イメージに
+  既に含まれる．よって B0 は **収集側（ローカル実行の `tools/collect_results.py`）の拡張だけ**で成立し，ホットパス非改変・
+  再デプロイ不要・冷開始交絡（再初期化 348s）なし．Iter1〜3 と同じ「収集ツールに閉じた・非侵襲」性質のイテレーションである．
+- **`mise.toml:123` の `predict:demo` は `--iter Iter1` 固定**（引き継ぎ発見③は正しい．backlog B6）．B0 の測定 run が
+  `results/Iter1.jsonl` に混在しないよう本計画で解消する（下記 §2-D）．
+
+#### 1. 仮説
+
+ITL≈7s/token を，非 rank0 全ノードの既存ログから **段別 compute 時間の総和 Σcompute と，段間 send 時間の総和 Σsend** に
+分解して記録すれば，rank0 の `step_dt`（≒7s）に対し **残差 residual = step_dt − Σcompute − Σsend**（recv 待ち＋ACK 往復＋
+Gloo/Python オーバーヘッド＋rank0/最終 rank の周辺処理）を算出でき，7s/token が **計算律速か通信律速かを 1 回の測定で確定** できる．
+これは調査の一次推定（「ホップ数×1 ホップ固定レイテンシ＋各段逐次 CPU 計算の和が支配的」）を実測で検証し，次イテレーション以降の
+レバー選択（通信律速なら B1: WORLD_SIZE 削減，計算律速なら B2: ホットループ診断ログ削減）を根拠づける土台になる．
+
+#### 2. 単一レバー・変更内容
+
+**単一レバー**: 「results に記録する情報を，rank0 単独の集計から **非 rank0 全ノードの per-stage 時間内訳へ拡張する**」の 1 点．
+**固定する構成（直近最良＝Iter3 の既定値，掃引しない）**: `WORLD_SIZE=51`，`NUM_MICRO_BATCHES=4`，`STAGGER_INTERVAL=3.0`，
+`SEQ_LEN=1`，prompt=`"Hello!"`，稼働中の 51 ノード実機（再デプロイなし）．B1（WORLD_SIZE 絞り込み）以降は本測定で内訳が確定した後の
+**次点候補**として温存する（本イテレーションでは振らない）．
+
+変更ファイルは **`tools/collect_results.py`（段別時間の収集・パース・記録を追加）**，**`tests/test_collect_results.py`（テスト追加）**，
+**`mise.toml`（`--iter` 変数化）** の 3 つのみ．**`pipeline_inference.py`／`tools/predict.py`／`tools/common.py` は非改変**（既存関数を
+import して再利用するのみ）．
+
+**(A) パース純関数の追加（`tools/collect_results.py`．既存 `_PROMPT_TOKENS_EMBED_RE` 群と同じ場所・同型で単体テスト可能に）**
+
+- 正規表現 3 本を新設する（`compute dt`/`sent to next dt` は行末に `hidden_...` が続くため `$` 終端にせず prefix マッチ）:
+  ```python
+  _COMPUTE_DT_RE      = re.compile(r"^Rank (\d+): step (\d+) compute dt=([\d.]+)s")
+  _RECV_HIDDEN_DT_RE  = re.compile(r"^Rank (\d+): recv_hidden dt=([\d.]+)s$")
+  _SENT_TO_NEXT_DT_RE = re.compile(r"^Rank (\d+): step (\d+) sent to next dt=([\d.]+)s$")
+  ```
+- 1 ノード分のログテキストから段別時間を抽出する純関数を新設する（既存 `_extract_rank0_messages` は `R0` 限定で流用できないため，
+  ANSI 除去＋`_LOG_LINE_RE` で全 rank の本文を取り出す軽量版を使うか，本文行の `Rank (\d+):` から rank を検出する）:
+  ```python
+  @dataclass
+  class NodeStageTiming:
+      rank: int | None                 # ログ本文 "Rank {N}:" から検出（ノード=1 rank）
+      compute_dt_ms_by_step: dict[int, float]     # step -> compute dt（ms）
+      recv_hidden_dt_ms_step0: float | None       # step0 の prefill 受信時間（ms）．無ければ None
+      sent_to_next_dt_ms_by_step: dict[int, float]  # 中間 rank のみ．最終 rank は空
+
+  def parse_node_stage_timing(log_text: str) -> NodeStageTiming: ...
+  ```
+  秒→ミリ秒は `round(sec * 1000, 3)` で保持（フィールド名も `_ms` 接尾辞で単位を明示）．マジックナンバー 1000 は
+  定数 `_SEC_TO_MS = 1000.0` として定義する．
+- **`--since {run_start}` 窓で当該 run に限定**するため，worker ログでも `collect_rank0_log` と同じ `--since` を使う（下記 C）．
+  worker ログには rank0 の `Rank 0: prompt='...'` 開始マーカーが無く `_split_into_blocks` は使えないが，単発プロンプトの診断 run
+  かつ `--since` で測定 run に絞るためブロック分割は不要（複数 run 混在は §2-D の `--iter` 変数化＋運用で回避）．この前提を
+  docstring に明記する．
+
+**(B) 集約・導出（純関数．単体テスト可能）**
+
+- 全ノードの `NodeStageTiming` を集約し，**デコードステップ（step≥1）** ごとに横断集計する（step0 は prefill/TTFT で桁が違うため分離）:
+  ```python
+  @dataclass
+  class StageTimingSummary:
+      n_ranks_reporting: int              # compute dt を報告できた非 rank0 rank 数
+      compute_sum_ms_by_step: dict[int, float]   # Σ_ranks compute（step 別）
+      send_sum_ms_by_step: dict[int, float]      # Σ_intermediate (sent_to_next − compute)（step 別）
+      # 代表値（デコードステップ中央値）
+      compute_sum_ms_median: float | None
+      send_sum_ms_median: float | None
+      prefill_recv_ms_by_rank: dict[int, float]  # step0 recv_hidden（rank 別．prefill 診断用）
+  ```
+  send は中間 rank の `sent_to_next_dt − compute_dt`（同 step）で近似する（`_t` 起点の差分＝送信区間）．最終 rank は send を
+  持たない（token_id を rank0 へ返すのみ）ため送信総和には含めない．
+- `build_record` 側で rank0 の `step_dt`（既存 `derived`/`parsed.step_dt`）と突き合わせ，**残差** を算出する:
+  `residual_ms_by_step[s] = step_dt[s]*1000 − compute_sum_ms_by_step[s] − send_sum_ms_by_step[s]`．
+  代表値として `timing_breakdown = {compute_sum_ms_median, send_sum_ms_median, residual_ms_median, rank0_step_dt_median_ms,
+  n_ranks_reporting}` を記録する（`compute+send+residual ≈ rank0_step_dt` が丸め誤差内で成立することを分析で検算できる）．
+
+**(C) 実機収集の拡張（`run_and_collect`．SSH を伴うため単体テスト対象外，Iter1〜3 と同じ扱い）**
+
+- `--stage-timing`（`action="store_true"`，既定 off）フラグを新設する．**off のとき現行挙動を完全に維持**（通常の `predict:demo`
+  相当 run を重くしない）．on のときのみ以下を追加実行する:
+  1. `hosts = read_hosts(config.hosts_file)` を取得（`hosts[i]`＝rank i）．rank0（`hosts[0]`＝master 自身）は既存 `collect_rank0_log`
+     が取得済みのためスキップし，**rank 1..len(hosts)-1** の worker から `ssh_via_master(config.ssh_user, config.master_addr,
+     hosts[i], f"docker logs --since {since} distributed-llm 2>&1", timeout=DOCKER_LOGS_SSH_TIMEOUT_SEC)` でログ取得する．
+  2. SSH は `concurrent.futures.ThreadPoolExecutor`（最大同時数は定数 `_STAGE_TIMING_MAX_WORKERS = 8` 程度）で並列化する
+     （50 ノード逐次×数秒は遅いため）．**個々のノードの SSH 失敗は握りつぶさず** `parse_warnings` に
+     `f"failed to fetch rank {i} docker logs: {stderr}"` を積み，成功ノードのみで集約を続行する（一部欠損を許容）．
+  3. 集約結果を `stage_timing`（rank 別の per-step 内訳．JSON 量が過大なら rank 別に compute の中央値＋step0 recv のみへ間引く．
+     初版は raw dict を保持し，肥大化が問題なら間引く方針を docstring に記す）と `timing_breakdown`（§2-B の代表値）として record へ追加する．
+- **スキーマ変更**: 新規フィールド `stage_timing`／`timing_breakdown` を追加し，`--stage-timing` off の run では両者を `null` とする
+  （既存 Iter1〜3 の v1 レコードと後方互換）．`SCHEMA_VERSION` を **2** へ上げ，v2＝段別時間フィールドを含み得ることを示す
+  （`build_record` の docstring も更新する）．
+
+**(D) `mise.toml` の `--iter` 変数化（backlog B6 の解消．非破壊）**
+
+- `mise.toml:123` を `--iter Iter1` 固定から env 上書き可能へ変更する（既定は Iter1 のまま＝後方互換）:
+  `run = 'uv run python tools/collect_results.py --iter "${ITER:-Iter1}" --prompt "${PROMPT:-Hello!}"'`．
+  B0 の測定 run は `ITER=Iter4 mise run predict:demo` あるいは
+  `uv run python tools/collect_results.py --iter Iter4 --stage-timing --prompt "Hello!"` を正式手順とする（フェーズ4 の実験計画で採用）．
+  これで複数 run が `Iter1.jsonl` に混在する実害（B6）を絶つ．**公開タスクの semantics 変更**にあたるため実装フェーズは既定値維持
+  （非破壊）を厳守すること．
+
+#### 3. 成功条件（measurable）
+
+本イテレーションのフェーズ2・3（実装・単体テスト）の完了条件は決定的で，以下を全て満たすこと:
+
+1. **単体テスト（新規，最低 6 件）が green，既存 38 件が回帰なし**（合計 44 件以上 passed，failed/error 0）:
+   - TS1: `_COMPUTE_DT_RE` が `Rank 7: step 3 compute dt=0.123s hidden_mean=...` から `(rank=7, step=3, dt=0.123)` を取り出す．
+   - TS2: `_RECV_HIDDEN_DT_RE` が `Rank 7: recv_hidden dt=1.234s` を取り出し，step>0 行（recv_hidden 無し）では None．
+   - TS3: `_SENT_TO_NEXT_DT_RE` が `Rank 7: step 3 sent to next dt=0.456s` を取り出す（`compute dt` 行と誤マッチしない）．
+   - TS4: `parse_node_stage_timing` が `[R7 INFO] ...` を含む 1 ノードログ全体から rank=7・compute_dt_ms_by_step・
+     recv_hidden_dt_ms_step0・sent_to_next_dt_ms_by_step を正しく構築し，単位が ms（秒×1000）で入る．
+   - TS5: 集約 `StageTimingSummary` が複数ノードから `compute_sum_ms_by_step`／`send_sum_ms_by_step` を step 別に加算し，
+     `send = sent_to_next − compute` の差分が負にならない健全ケースで正の値を返す（最終 rank が send 総和に含まれない）．
+   - TS6: 残差計算が `residual = rank0_step_dt_ms − compute_sum_ms − send_sum_ms` を返し，
+     `compute_sum + send_sum + residual == rank0_step_dt_ms`（丸め許容）を満たす．
+   - （任意）TS7: `--stage-timing` off 相当で `stage_timing`／`timing_breakdown` が `null`，かつ既存レコード形と後方互換．
+2. `uv run python -m py_compile tools/collect_results.py tests/test_collect_results.py` がエラー無し．
+3. コード変更が `tools/collect_results.py`／`tests/test_collect_results.py`／`mise.toml` の **3 ファイルのみ**
+   （`pipeline_inference.py`／`tools/predict.py`／`tools/common.py` 非改変，`git status` に新規 `.log` フィクスチャ混入なし）．
+
+フェーズ4（実機測定．B1 の人間確認後）での成功条件（本計画が指定，判定は analyst）:
+
+4. `ITER=Iter4 ... --stage-timing` の測定 run 後，`results/Iter4.jsonl` の当該レコードに `stage_timing`／`timing_breakdown` が
+   非 null で入り，**`timing_breakdown.n_ranks_reporting ≥ 45`**（50 worker 中，SSH/欠損の許容幅 5）で
+   compute_dt が集まっていること．
+5. `timing_breakdown` から **「ITL≈7s/token のうち計算（Σcompute）が X%・送信（Σsend）が Y%・残差（recv 待ち＋ACK＋
+   オーバーヘッド）が Z%」を数値で言明でき**，`X+Y+Z=100%`（丸め誤差内，`compute_sum+send_sum+residual ≈ rank0_step_dt` が
+   成立）していること．これにより「7s/token は計算律速か通信律速か」が判定可能になる＝B0 の目的達成．
+6. 測定は稼働中クラスタに対し `--stage-timing` run を **n≥3 回**（再デプロイなし＝冷開始交絡なし）実施し，代表値は中央値を採る
+   （run 間ばらつきの把握）．step0（prefill/TTFT）は `prefill_recv_ms_by_rank` で別枠診断する．
+
+#### 4. 実装フェーズ（rc-implementer）への申し送り
+
+- **対象ファイルと設定キー**:
+  - `tools/collect_results.py`: (A) 正規表現 `_COMPUTE_DT_RE`/`_RECV_HIDDEN_DT_RE`/`_SENT_TO_NEXT_DT_RE`・`NodeStageTiming`・
+    `parse_node_stage_timing`，(B) `StageTimingSummary`・集約/残差の純関数，(C) `run_and_collect` に `--stage-timing` 分岐と
+    ThreadPoolExecutor 並列 SSH（定数 `_STAGE_TIMING_MAX_WORKERS`・`_SEC_TO_MS`），`build_record` へ `stage_timing`/
+    `timing_breakdown` フィールド追加，`SCHEMA_VERSION=2`，`main()` に `--stage-timing` 引数追加．
+  - `tests/test_collect_results.py`: TS1〜TS6（＋任意 TS7）．物理ログは `[R{N} INFO] ...` プレフィックス付きインライン文字列で与え，
+    **新規 `.log` フィクスチャは作らない**（Iter2 の `*.log` gitignore トラップ回避）．
+  - `mise.toml`: `[tasks."predict:demo"]` の `run` を `--iter "${ITER:-Iter1}"`（＋任意で `--prompt "${PROMPT:-Hello!}"`）へ変数化
+    （既定値維持＝非破壊）．
+- **注意点**:
+  - `pipeline_inference.py` は**触らない**（ログは既存・稼働中イメージに含まれる＝再デプロイ不要）．これにより B0 はホットパス
+    非改変で，フェーズ4 は再デプロイなしの `--stage-timing` run のみで足りる（冷開始 348s を回避）．
+  - `send = sent_to_next_dt − compute_dt` の差分が負になる（ログ欠損・step 対応ずれ）ケースは 0 クランプせず warning を積み，
+    当該 step を集約から除外する（黙って歪めない）．
+  - worker ログにブロック開始マーカーが無いため `--since {run_start}` で run を限定する前提を守る（複数 run 混在は `--iter`
+    変数化＋単発運用で回避）．
+  - **フェーズ4（実機 `--stage-timing` 測定 run）は B1 の合意通り着手前に Slack で人間確認が必須**（再デプロイは不要だが 51 ノードへ
+    SSH で `docker logs` を並列取得するため，B1 のスコープに含める）．フェーズ2・3（実装・単体テスト）はローカルのみで進行可能．
+
+---
+
+### 調査 (Iter4)
+
+**担当**: 調査フェーズ subagent（2026-07-18）．ユーザー指示⑤（先行研究調査に基づく推論パイプライン高速化）に向け，
+(A) `pipeline_inference.py` を実際に読んで現行の通信方式・バッチング方式・レイヤー分割方式を確認し，
+(B) tavily で分散パイプライン並列推論の高速化手法を文献調査した．実機クラスタへの接続・deploy/推論実行は一切していない
+（コード読み取りと Web 調査のみ）．次フェーズ（計画）が単一レバーとして選べる改善候補を末尾に整理した．
+
+**問い**
+1. 「ITL≈7s/token」の主要因は何か（通信オーバーヘッド／CPU 計算／同期待機／アイドル）．コードから一次推定する．
+2. 分散パイプライン並列推論の高速化手法（バブル削減・通信オーバーラップ・KV 最適化・量子化・continuous batching・
+   speculative decoding 等）の候補を洗い出し，本リポジトリ構成への適用難易度を評価する．
+3. 次フェーズ（計画）が単一レバーとして選べる具体候補（概要・期待効果・実装規模・リスク）を用意する．
+
+**A. 現行アーキテクチャの実測確認（コード出典＝リポジトリ内 ファイル:行）**
+
+- **これは GPU クラスタではなく CPU クラスタである（分析の前提を規定する最重要点）**．`COMPUTE_DTYPE = torch.float32`
+  （`pipeline_inference.py:38`）で，コメント（`:36-37`）に「Intel i5-8350U は AVX-512 BF16 非対応のため bfloat16 は
+  内部で float32 変換されオーバーヘッド．float32 直用で BLAS（OpenBLAS/MKL）を活かす」と明記．重みロードも `map_location="cpu"`
+  （`:770`），スレッドは `torch.set_num_threads(os.cpu_count())`（`:404`．i5-8350U は 4 コア／cpuset 0-3，`:401-402`）．
+  → **各ノードは 4 コアの弱い CPU**．GPU 前提の高速化手法（NCCL・TensorRT-LLM・PagedAttention の GPU 実装等）は
+  そのままは効かない．
+- **モデルは Gemma-4-31B-it（`config.json`）: `num_hidden_layers=60`，`hidden_size=5376`，heads=32/kv=16**．これを
+  **WORLD_SIZE=51 ノード**に分割する（`get_assigned_layers`，`:345-350`．60 層 ÷ 51 ノード ≒ 大半のノードが 1 層，
+  9 ノードが 2 層）．
+- **通信バックエンドは Gloo（TCP，物理 NIC 固定）**．`dist.init_process_group(backend="gloo", ...)`（`:547-548`），
+  物理 NIC 固定は `:408,424-434`．GPU/NCCL は不使用．
+- **デコードは「1 トークンずつ・単一マイクロバッチ・51 段を厳密逐次通過」**．生成本体 `_relay_request`（`:1275-1740`）は，
+  rank0 が 1 トークン分の embed（step0 は prompt 全体，`batch_size=1`／`seq_len=1`）を rank1 に `dist.send`（`:1466-1468`），
+  中間 rank が `recv → 自分の層を計算 → 次 rank へ send`（`:1655-1714`），最終 rank が `final_norm+lm_head → argmax →
+  token_id を rank0 へ send`（`:1600-1621`）．**`NUM_MICRO_BATCHES` を使うマイクロバッチ機構（`process_microbatch`
+  `:964-1000`／`_pipeline_loop` `:1109-1147`）はこの自己回帰デコード経路では使われていない**（別経路・実質ウォームアップ相当）．
+  つまり `NUM_MICRO_BATCHES` レバーは現状の 1 リクエスト生成レイテンシには効かない可能性が高い．
+- **通信は同期ブロッキング（`dist.send`/`dist.recv`）**．step>0 のみ seq_len スカラと hidden を `irecv` 2 本で受ける（`:1577-1580`,
+  `:1681-1684`）が，これは 2 値の受信並列化にとどまり，段間（stage i と i+1）の計算オーバーラップではない．
+- **段間同期は send/recv に加えて TCP の ACK チェーン**（`_RELAY_ACK_PORT`，永続接続 `:1344-1425`）と，リクエスト毎の
+  `dist.barrier()`（`:1298-1307`）がある．barrier はリクエスト毎 1 回で許容範囲だが，**ACK はステップ毎に段間で往復**する
+  （`:1478-1486`, `:1628-1642`, `:1716-1728`）．
+- **ホットループ内で毎ステップ・毎 rank に診断ログが多数**（テンソル全体の `.mean()/.std()/.min()/.max()` や `torch.topk` を
+  毎回計算）．最終 rank は `:1598,1605,1609,1616-1617,1619`，中間 rank は `:1704`．これらは `.item()`／全要素リダクションを
+  ホットパスで強制発火させる．
+- **通信ペイロードは小さい**: hidden は (1,1,5376) float32 = 5376×4 ≒ **21 KB/ホップ**（step0 の prefill のみ seq_len≒prompt 長で
+  数百 KB）．50 ホップでも総転送量は小さく，**生帯域は律速ではない**．効くのは「50 回の逐次ホップ × 1 ホップあたりの固定
+  レイテンシ（send/recv + ACK 往復 + Gloo/Python オーバーヘッド）＋各段の CPU 計算」の累積である．
+
+**A の一次推定（ITL≈7s/token の主要因）**
+
+- **根本原因は「単一リクエストのパイプライン並列は本質的にレイテンシを下げない」構造**にある．seq_len=1・単一マイクロバッチの
+  自己回帰デコードでは，段 i+1 は段 i の出力を待つ厳密依存のため，**任意時刻に 51 段のうち 1 段しか稼働しない**（利用率
+  ≒1/51≒2%）．7s/token を 51 段で割ると **1 段あたり≒140ms**．内訳は「1〜2 層の CPU 計算（float32・4 コア）＋ 21KB の
+  send/recv ＋ ACK 往復 ＋ 毎ステップ診断ログのリダクション」．**通信の生帯域ではなく，ホップ数（=段数）× 1 ホップ固定
+  レイテンシと，各段の逐次 CPU 計算の和**が支配的と一次推定する．
+- **確度の注意**: コード読みだけの推定である．コードは各 rank で `compute dt`（`:1598,1704`）と `recv_hidden dt`（`:1573,1677`）を
+  既にログ出力しているが，**現状 `results/Iter{n}.jsonl` は step_dt 集計しか保存しておらず，計算 vs 通信の内訳は未記録**．
+  内訳の確定にはこの per-stage ログを 1 度パースする（計画候補 B0 参照）．
+
+**B. 文献調査（Web 出典付き）**
+
+- **この構成特有の問題は文献で定式化済み**．FlowSpec（Sang et al., arXiv:2507.02620, 2025,
+  https://arxiv.org/html/2507.02620v1 ）は「エッジの分散パイプライン推論は**リクエストが疎（sparse）だとパイプライン利用率が
+  低くレイテンシ低減の恩恵が消える**」と本リポジトリと同じ根本問題を指摘し，pipeline-parallel な**木構造 speculative decoding**で
+  対処．実機で **1.36×–1.77× の速度向上**を報告（コード公開 https://github.com/Leosang-lx/FlowSpec ）．
+- **PipeDec / SpecPipe**（Chen et al., arXiv:2504.04104, 2025, https://arxiv.org/html/2504.04104v2 ）は「単一タスクのパイプライン
+  推論レイテンシを下げるため**パイプライン全体を使って後続の複数トークンをデコード**する」= 51 段を 1 往復するたびに複数
+  トークンを検証する方向で，本構成の token-by-token レイテンシに直接効く系譜．
+- **Prima.cpp**（Li et al., arXiv:2504.08791, 2025, https://arxiv.org/html/2504.08791v2 ）は**低リソース・ヘテロなホームクラスタ**
+  （まさに CPU 主体）で 30–70B を動かす研究で，「Wi-Fi 等の**高レイテンシ網では P2P 通信が少ない PP がむしろ適する**」とし，
+  層割当・メモリ配置の最適化を扱う．本リポジトリと最も環境が近い．
+- **Zero Bubble Pipeline Parallelism**（Qi et al., ICLR 2024, arXiv:2401.10241, https://github.com/sail-sg/zero-bubble-pipeline-parallelism ）
+  はバブル削減の代表だが**学習（forward/backward スケジューリング）主眼**で，単一リクエスト推論デコードには直接は効かない
+  （バブル削減はマイクロバッチ／複数リクエストが同時に流れて初めて効く）．
+- **OSS の同種プロジェクト**: llama.cpp RPC モード・exo・Petals・distributed-llama（https://github.com/b4rtaz/distributed-llama ）が
+  ホームクラスタ分散推論の実装例．コミュニティ知見（https://localaimaster.com/blog/distributed-inference-local-ai ,
+  r/LocalLLaMA）は「ボトルネックは多くの場合ネットワーク」「CPU-only は動くが遅い」とし，PP は低帯域向き，TP は高帯域向きと整理．
+- **CPU 量子化の効き方（本ハードで重要）**: INT8 の x86 高速化は主に **VNNI / DL Boost（第 2 世代 Xeon Scalable 以降）**に依存
+  （Intel, https://community.intel.com/t5/Blogs/... ; PyTorch x86 INT8, https://pytorch.org/blog/int8-quantization ）．**i5-8350U
+  (Kaby Lake R, 2017) は VNNI も AVX-512 も非搭載**のため，INT8 演算そのものの高速化は期待薄．一方 llama.cpp/llamafile の
+  手書き量子化カーネル（justine.lol/matmul, https://justine.lol/matmul ）は CPU で q8_0/q4 に対し実速度向上を出しており，
+  **CPU での量子化の主効果は「演算の INT8 化」より「重みのメモリ帯域削減」**である点に注意（ただし本リポは PyTorch float32
+  BLAS 経路で llama.cpp カーネルは未使用）．
+- **continuous batching / PagedAttention（vLLM, Sarathi-Serve 等）**: スループット・尾レイテンシ改善が主目的で，**単一リクエストの
+  ITL は下げない**（USENIX OSDI'24 Sarathi-Serve, https://www.usenix.org/system/files/osdi24-agrawal.pdf ）．現行ベンチが
+  1 プロンプト単発である限り本命ではない（目的がスループットに移れば有効）．
+
+**次フェーズ（計画）への示唆＝単一レバー候補（概要／期待効果／実装規模／リスク）**
+
+- **B0（計測・最小・最推奨の第一手）: per-stage の `compute dt` と `recv_hidden dt` を results に集約し，7s の計算 vs 通信内訳を確定**．
+  概要: rank ログに既に出ている段別時間（`:1573,1598,1677,1704`）を `collect_results.py` でパースし JSONL に追記（②の感度分析の
+  土台にもなる）．期待効果: レイテンシは下げないが「どのレバーを振るべきか」を確定させる．実装規模: 小（収集ツールに閉じ・実機
+  非接触寄り，Iter1〜3 と同性質）．リスク: 低．**根本原因が通信律速か計算律速か未確定な現状，最初にこれを潰すのが単一レバー
+  原則にも合致**．
+- **B1（既存レバー・診断価値大）: WORLD_SIZE を絞る（51→例 21/11）**．概要: 60 層を少数ノードに厚く割当（11 ノードなら≒5.5 層/
+  ノード）．期待効果: **逐次ホップ数が 50→10 に激減**し，1 ホップ固定レイテンシ×ホップ数の累積が減る（通信/ホップ律速なら大，
+  計算律速なら小＝B0 と合わせて根本原因を弁別できる）．実装規模: 小（config `levers` に既存，コード変更なし）．リスク: 各ノードの
+  層数増→メモリ/計算増（60 層が収まる下限は `:316-323` で制約），再デプロイ要・実機 run 要（B1/フェーズ4 で人間確認）．
+- **B2（安価なコード改善）: デコードホットループの毎ステップ診断ログ（全要素リダクション・topk）を削減／デバッグフラグ化**．
+  概要: `:1598,1605,1609,1616-1617,1704` 等の毎ステップ統計計算を抑制．期待効果: 各段の CPU オーバーヘッド×50 段×ステップを削減
+  （小〜中，計算律速なら効く）．実装規模: 小（`pipeline_inference.py` 内）．リスク: ホットパス改変＝再デプロイ・人間確認要（B1）．
+  ログを消すと分析材料が減るためフラグ化が無難．
+- **B3（本命＝文献の主流だが大規模）: speculative decoding（rank0 に小さな draft モデル，51 段 1 往復で K トークン検証）**．
+  概要: FlowSpec/PipeDec の方式．token-by-token の 51 段逐次通過を「K トークンまとめて検証」に置換しレイテンシを分割償却．
+  期待効果: 文献ベースで 1.36–1.77×（FlowSpec）〜それ以上．実装規模: **大**（draft モデル追加・relay プロトコルの大改修・検証木・
+  再デプロイ）．リスク: 高（単一レバーとしては過大．north star として位置づけ，まず B0/B1 で根本原因を確定してから段階的に）．
+- **不採用寄り**: continuous batching / PagedAttention（単発 ITL には効かない・スループット向き），純粋な INT8 量子化（本 CPU は
+  VNNI 非搭載で演算高速化は期待薄），学習向けの 1F1B/Zero-Bubble（単一リクエスト推論には非該当），段間計算オーバーラップ
+  （単一トークン・単一マイクロバッチでは重ねる相手がなく非該当）．
+
+**②（マイクロバッチ感度分析）との統合メモ**: 現行コードでは `NUM_MICRO_BATCHES` が自己回帰デコード経路で未使用のため，②を
+そのまま回しても ITL は動かない公算が大きい（上記 A）．したがって計画は，②を「B0 で内訳を確定 → B1（WORLD_SIZE）で
+ホップ数律速か計算律速かを弁別」という形に吸収するのが合理的．人間判断が要る論点（実機 deploy を伴う B1/B2 の掃引着手）は
+既に backlog B1/B6 で「フェーズ4 直前に Slack 確認必須」と登録済みで，本調査で新たな人間判断事項は増えていない．
+
+---
+
 ## Iteration 3
 
 ### 考察・次計画 (Iter3)

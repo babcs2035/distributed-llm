@@ -236,6 +236,13 @@ class ClusterConfig:
             os.environ.get("STAGGER_INTERVAL") or "3.0"
         )
 
+        # --- microbatch bench (research-cycle Iter7) ---
+        # 未設定なら空文字のまま保持し，deploy.py 側で `-e` フラグ自体を省略する
+        # （コンテナ内 pipeline_inference.py の既定値 `MICROBATCH_BENCH_STEPS=0` に委ねるため）．
+        self.microbatch_bench_steps = os.environ.get("MICROBATCH_BENCH_STEPS", "")
+        self.microbatch_bench_warmup_steps = os.environ.get("MICROBATCH_BENCH_WARMUP_STEPS", "")
+        self.microbatch_bench_repeats = os.environ.get("MICROBATCH_BENCH_REPEATS", "")
+
         # --- model ---
         model_cfg = c.get("model", {})
         self.model_name = (

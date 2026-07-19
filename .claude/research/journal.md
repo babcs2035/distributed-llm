@@ -6,6 +6,749 @@ research-cycle が読み書きする実験ジャーナル．**新しいイテレ
 
 ---
 
+## Iteration 7
+
+### 考察・次計画 (Iter7)
+
+**担当**: 考察・次計画 subagent（2026-07-20 JST）．`### 分析(解釈) (Iter7)` の判定（反証条件に実質的に近い中間事例，
+機構＝段間オーバーラップ欠如の confidence 高・収束方向 confidence 中〜高）を受け，単一レバー **`NUM_MICRO_BATCHES`
+（research_frontier② のスループット感度）**の採否を reflector として確定し，次イテレーション（Iteration 8）の方向を
+決めた．実機への新規接続・実行はしていない（journal・`results/Iter7.jsonl` の読み取りと commit 操作のみ）．
+
+**1. 採否判定: 不採用（仮説棄却）＝このレバーは現実装で収束（reject / converged）**
+
+- **判定**: `### 検討・計画 (Iter7)` の仮説「m を増やすとパイプラインバブルが償却されスループットが上がる（p=51 で
+  m=8→51 は約 3.6 倍・m=204 は約 5.8 倍）」は**棄却**する．実測は m=8→51 で **1.12 倍**（2.8478→3.1772→3.2102
+  microbatch/s），計画の採用側閾値 1.5 に遠く未達で，理論予測（3.6 倍）と 1 桁近く乖離した．よって
+  `NUM_MICRO_BATCHES` は「現行 bench 実装（blocking Gloo・逐次 mb ループ・二重バッファ無し）の下では集約スループットの
+  実効的なレバーにならない」と判定し，**このレバーは収束**（同じ問いへ m を再び振っても新情報は得られない）とする．
+- **中間事例の解釈と reflector としての最終判断**: analyst が留保したとおり，形式的には成功条件 1 の一部（有意な単調
+  増加＝2σ の 40〜75 倍）を満たし，厳密な反証条件（3 水準が 2σ 内で平坦）そのものは満たさない．しかし reflector は
+  「形式条件の機械的当てはめ」ではなく「レバーが目的（バブル低減によるスループット向上）を達成したか」で判定する．
+  観測された 1.12 倍は，コードと step 時間スケーリングの二重証拠（§2-i）から**バブル低減ではなく固定オーバーヘッド
+  償却の副作用**と機構が特定されており，仮説が想定した効き源とは別物である．効果の向きが正でも「仮説の機構で効いて
+  いない」以上，レバーとしては不採用が妥当と判断した．**「有意だが機構が仮説と異なり効果量も閾値未達」＝実質的な反証**
+  であり，analyst の収束・振り替え推奨を採用する．
+- **追加反復の要否**: 不要．m=204 の repeats 補完（n=1→3）は，主要結論（機構＝オーバーラップ欠如・成功条件 2 未達）が
+  m=8/m=51 の n=3 データと `_process_microbatch` のコード構造だけで確定しており（analyst §4），かつ throughput が
+  漸近値 ≈3.23 に張り付いている以上，覆らない見込み．約 6.3 時間（既定 repeats=3）のコスト対効果が低く見送る．
+
+**2. 非自明な学び（次の自分向け）**
+
+- **(i) 本パイプラインには段間の通信・計算オーバーラップが構造的に存在しない（今回の最重要の学び）**: bench 経路
+  `_run_microbatch_bench`→`_process_microbatch` は各マイクロバッチを (A) blocking `dist.recv` → (B) compute →
+  (C) blocking `dist.send` で**同期・逐次**に処理し，二重バッファも async `irecv`/`isend` も持たない（async は serving
+  relay 経路 :1706-1813 にのみ存在）．このため `time_per_step ≈ 0.31×m + 0.35`（限界コスト 0.31s/microbatch が m に
+  依らず一定）と**m にほぼ比例して step 時間が増える**逐次型モデルが適合し，GPipe/バブル式 `(p−1)/(m+p−1)` が前提とする
+  「t_stage 一定・fill/drain 償却」は実装上・実測上いずれも成立しない．**「マイクロバッチ数を増やせばバブルが埋まる」
+  という一般的直観は，段間オーバーラップを実装して初めて成り立つ**——本リポジトリの bench 経路はその前提を満たさない．
+- **(ii) 観測された 1.12 倍は latency 悪化と引き換えの見かけ上の微増**: 集約スループットの微増は固定オーバーヘッド
+  （≈0.35s/step，rank0 の乱数生成・`_reset_kv_cache_for_bench`・drain 等）が m 本に償却される副次効果で，
+  `microbatch_per_s = m/(0.31m+0.35)` が m→∞ で 1/0.31≈3.23 へ漸近する（m=204 の 3.21 は既に漸近値近傍）．一方
+  step あたり latency は m に線形に悪化する（m=8:2.8s→m=204:63.5s）ため，**m を増やす実利は事実上ない**．
+- **(iii) この学びは research_frontier⑤（高速化）の具体的な次の一手を指し示す**: 「もしバブル式を本当に効かせたいなら，
+  レバー変更ではなく `_process_microbatch` を async `isend`/`irecv`＋二重バッファ化する**実装変更**（serving 経路
+  :1706-1813 の既存 irecv パターンの転用）が前提」という analyst の示唆は，そのまま⑤の「通信・計算オーバーラップ」
+  という具体的な高速化軸である．ただしこれは `pipeline_inference.py` ホットパス改変を伴い単一レバーの範囲を超える
+  可能性が高く，B9/SL3（relay 改修）に隣接する不可逆側の判断を含みうる．**自動実装はせず，Iter8 の調査フェーズの
+  起点（seed）として扱う**（§4，B14）．
+- **(iv) recv/send 例外握り潰しは pipeline 全体の設計弱点として記録（B13 の申し送り事項）**: バグ A の副作用として
+  発見された `_process_microbatch` の `dist.recv`/`dist.send` の例外握り潰し（通信断を「正常完了」に見せかける）は，
+  bench 固有ではなく `pipeline_inference.py` 全体の設計弱点でありうる（B13 が reflector 判断に委ねた点）．本 Iteration の
+  直接スコープ外だが，⑤（高速化）の実装で async 通信へ踏み込む際には**通信断の検知・伝播**が信頼性の前提になるため，
+  ⑤の調査・計画時に併せて検討すべき将来課題として記録する（今回は変更しない）．
+
+**3. B9（B3 本体＝relay プロトコル改修＝SL3 の go/no-go）の扱い: needs-human のまま維持（今回 reflector では自動判定しない）**
+
+- 依頼どおり B9 は温存する．B9 は「不可逆・大規模な relay プロトコル改修」の go/no-go であり research-cycle の自律判断
+  ポリシー（不可逆/大規模は人間判断）に該当する不可逆判断のため，本 reflector では自動選択しない．Iter6 完了時に既に
+  Slack（`<@U08GLKY1QCW>` mention 付き）で報告済みで，今回の通常サマリー投稿では重複 mention を避ける．なお §2-iii の
+  ⑤（通信オーバーラップ）は speculative decoding（B9/SL3）とは**別軸**（通信・計算の重なり vs トークン投機）であり，
+  B9 とは直交する（B9 の判断を先取りしない）．
+
+**4. 次に振るレバーの決定（Iteration 8）: research_frontier⑤（通信・計算オーバーラップを起点とする高速化）の調査を自動選定**
+
+- **決定（自律判断・可逆）**: Iteration 8 は **research_frontier⑤（先行研究調査に基づく推論パイプライン高速化）**を，
+  Iter7 で判明した「段間オーバーラップの構造的欠如」（§2-i）を具体的な起点として着手する．state は `phase="investigate"`・
+  `current_lever=null` とし，調査フェーズ（rc-investigator）が「分散パイプライン並列推論における通信・計算オーバーラップ
+  （async `isend`/`irecv`・二重バッファ・GPipe 型スケジューリングの CPU/Gloo 上での有効性）」を主軸に，KV キャッシュ
+  最適化・量子化・continuous batching 等の⑤候補も併せて文献調査し，計画フェーズが**単一レバー原則で 1 つの具体案へ
+  絞り込む**．
+- **analyst 推奨（STAGGER_INTERVAL への振り替え）に対する reflector の判断**: analyst は config `levers` の次候補
+  `STAGGER_INTERVAL` を推奨したが，reflector は⑤（通信オーバーラップ調査）を優先する．理由: (1) `STAGGER_INTERVAL` は
+  「起動時 thundering herd 回避の待機間隔」で**定常状態のスループット/レイテンシに直接効かない**（Iter4 で ITL は
+  compute 律速＝92% と確定済み，起動時交絡は Iter6 までに warm-up で除去済み）ため，振っても Iter7 と同様「効かない
+  ことの確認」に 1 イテレーションを費やす公算が高く期待値が低い．(2) 対して Iter7 は「段間オーバーラップが無い」という
+  **具体的で行動可能な発見**を残しており，これは⑤の中核候補（通信・計算オーバーラップ）を直接指す．同じ「待ち時間を
+  無駄にしない自律実行可能な項目」でも，調査・計画フェーズはコードのみ・実機非接続・可逆で，期待値が明確に高い方
+  （⑤）を選ぶのが妥当．(3) config の levers 優先順位は目安であり，⑤はユーザーの明示指示（2026-07-18）による常設項目で
+  「②③④と重複する場合は一本化」と規定されている——②（今回のマイクロバッチ感度）の結果が⑤の一軸（通信オーバー
+  ラップ）を名指しした以上，⑤へ一本化するのが config の意図に沿う．
+- **見送り（非選定）の理由と扱い**: `STAGGER_INTERVAL`/`SEQ_LEN`/`WORLD_SIZE` は config `levers` に残置し，⑤の調査で
+  行動可能な単一レバー案が得られない，または不可逆な実装変更が必要で人間判断待ちになった場合の**フォールバック候補**
+  として温存する（特に `STAGGER_INTERVAL` は次の軽量 config レバー）．SL3/B3 本体は §3 のとおり B9（人間判断待ち）．
+  backlog に `## B14 [auto-decided 2026-07-20]` として本決定を記録した（⑤優先は levers 優先順位からの逸脱を含むため
+  要レビュー扱い）．
+
+**次イテレーションへの結論**: Iteration 7（`NUM_MICRO_BATCHES` のスループット感度）を**不採用（仮説棄却）・このレバーは
+現実装で収束**と確定した（実測 1.12 倍で採用閾値 1.5 に遠く未達，かつ微増の機構はバブル低減ではなく固定オーバーヘッド
+償却の副作用で仮説と異なる＝実質的な反証）．最重要の学びは「本パイプラインの bench 経路には段間の通信・計算オーバー
+ラップが構造的に存在しない（blocking Gloo・逐次 mb ループ）」ことで，これが research_frontier⑤（高速化）の具体的な次の
+一手（async 通信＋二重バッファによる通信・計算オーバーラップ）を名指しした．Iteration 8 は⑤の調査を，この発見を起点に
+開始する（analyst 推奨の STAGGER_INTERVAL はフォールバックとして温存）．B9（SL3 go/no-go）は不可逆判断のため
+`[needs-human]` のまま維持する．
+
+### 実験 (Iter7, 再実行)
+
+**担当**: 実験フェーズ subagent（2026-07-19T20:22〜2026-07-20T01:23 JST，約 5 時間 1 分）．`### 実装 (Iter7, 差し戻し後)`
+§5 の手順に従い，バグ A・B 修正後の m=8 パイロット再確認 → m∈{8, 51, 204} の本掃引 → クラスタ復元まで**完走した**．
+`uv run pytest tests/` を作業開始前に再確認し 93 passed（回帰なし）．
+
+**1. m=8 パイロット再確認（`MICROBATCH_BENCH_STEPS=5, WARMUP=2`）**
+
+- 事前に 51 ノード健全性確認（`mise run status` 相当）→ 51/51 healthy．
+- deploy 51/51 成功（約 52 秒）．bench 実行中・実行後ともログにクラッシュ（`TypeError: ... missing 1 required
+  positional argument: 'position_ids'`）・ハングは再発せず，`[R50 RESULT] MICROBATCH_BENCH m=8 ... microbatch_per_s=
+  {2.8644, 2.9188, 2.7892}`（3 repeat）が正常に出力された．バグ A・B の修正は実機で有効と確認．
+
+**2. 本掃引（m∈{8, 51, 204}，`MICROBATCH_BENCH_STEPS=100`，warmup/repeats は既定 20/3）**
+
+- **m=8**: deploy 51/51 成功．3 repeat 完走，クラッシュ・エラーなし．
+  `microbatch_per_s = {2.8429, 2.8480, 2.8525}`（平均 2.8478，母標準偏差 σ≈0.0039，CV≈0.14%）．
+  `results/Iter7.jsonl` へ 3 レコード追記．
+- **m=51**: deploy 51/51 成功．3 repeat 完走．**1 repeat あたり measure=100 ステップの所要時間が elapsed_s≈1605s
+  （m=8 の elapsed_s≈281s の約 5.7 倍）**と，`(p-1)/(m+p-1)` バブル式が予測する緩やかな短縮ではなく m にほぼ比例して
+  増加する挙動を観測した（後述 §4）．全 3 repeat の途中，`docker stats` で全ランクの CPU 使用率（90〜250%）を複数回
+  確認し，ハングでないこと（実際に計算が進行していること）を確かめた上で待機を継続した．クラッシュ・エラーなし．
+  `microbatch_per_s = {3.1758, 3.1755, 3.1802}`（平均 3.1772，σ≈0.0021，CV≈0.068%）．`results/Iter7.jsonl` へ
+  3 レコード追記．
+- **m=204（計画からの逸脱・要報告）**: deploy 前に pre-flight を実施——(a) RAM: `free -m` で全ノード空きメモリ
+  数百 MB〜数 GB を確認，実際の通信バッファ確保は 8.37 MB（deploy 後のログで実測）で計画の見積もり
+  （約 17MB 以内）を下回り，RAM リスクは想定どおり無し．(b) **実行時間**: m=8→m=51 の実測から
+  「measure=100 の所要時間が m にほぼ比例して伸びる」ことが判明したため，m=204 へ進む前に
+  `MICROBATCH_BENCH_STEPS=5, WARMUP=2, REPEATS=1` の小規模タイミングパイロットを実施した．結果
+  elapsed_s=317.7s（measure=5 ステップ，63.5s/step）．これは m=51 の 16.06s/step のほぼ 4 倍（m 比 204/51=4 と
+  ほぼ一致）で，**既定 `REPEATS=3, MICROBATCH_BENCH_STEPS=100` のまま本掃引すると 1 repeat あたり約 127 分
+  （(20+100)×63.5s），3 repeat で約 6.3 時間**かかると見積もられた．これは `### 検討・計画 (Iter7)` §5 の
+  pre-flight リスク（RAM のみ想定）には無かった，実行時間に関する未想定のリスクである．m=51 の 3 repeat
+  完走に実測約 93 分要した実績と比べても著しく長いため，**`MICROBATCH_BENCH_REPEATS=1`（既定 3 から削減，
+  `MICROBATCH_BENCH_STEPS=100`・`WARMUP` は既定 20 のまま変更なし）に縮退して 1 repeat のみ実行する判断を，
+  実験フェーズの裁量で行った**（水準自体を落とす計画済みの縮退案「OOM なら {8,51} の 2 水準へ」とは異なり，
+  m=204 という水準は維持しつつ，実行時間超過という新たに判明したリスクに対して repeats のみを縮退した）．
+  deploy 51/51 成功，comm buffer 実測 8.37MB．約 105 分後（elapsed_s=6354.7s，63.55s/step，pilot の 63.5s/step と
+  ほぼ一致）に `[R50 RESULT] MICROBATCH_BENCH m=204 p=51 warmup=20 measure=100 elapsed_s=6354.7024
+  steps_per_s=0.0157 microbatch_per_s=3.2102` を取得．クラッシュ・エラーなし．`results/Iter7.jsonl` へ 1 レコード
+  追記（**n=1，σ・CV は算出不可**．m=8/m=51 の 3 repeat と異なり，このレベルのみ反復数が異なる点に注意）．
+
+**3. 完了条件（`### 検討・計画 (Iter7)` §4）との対比**
+
+- (i) `results/Iter7.jsonl` への構造化保存: **達成**（m=8: 3 レコード，m=51: 3 レコード，m=204: 1 レコード，計 7
+  レコード）．ただし m=204 のみ `repeats≥3` を満たしていない（上記 §2 の縮退による．理由は明記のとおり）．
+- (ii) 既存パーサ単体テスト green・回帰なし: 作業開始前に再確認済み（93 passed，本フェーズ中はコード変更なし）．
+- (iii) bench 分岐が env 既定で非改変: クラスタ復元後に `docker inspect` で `NUM_MICRO_BATCHES=4` かつ
+  `MICROBATCH_BENCH_*` 系 env が一切設定されていないことを確認．`healthcheck.py` で 51/51 healthy を確認済み．
+
+**4. 成功条件（`### 検討・計画 (Iter7)` §4）への当てはめ（数値の提示のみ，良否判定は analyst に委ねる）**
+
+- throughput(m=8)=2.8478，throughput(m=51)=3.1772，throughput(m=204)=3.2102（いずれも microbatch_per_s 平均，
+  m=204 は n=1）．
+- 単調増加は成立（2.8478 < 3.1772 < 3.2102）．throughput(m=51)−throughput(m=8)=0.3294 は m=8/m=51 双方の 2σ
+  （それぞれ約 0.0078／0.0043）を大きく上回る．
+- throughput(m=51)/throughput(m=8) = 1.1157（計画の閾値 1.5 との比較は analyst 判断事項として提示のみ）．
+- throughput(m=204)/throughput(m=51) = 1.0104（m=204 が m=51 をわずかに上回る）．
+- **実行時間スケーリングの観測（副次的だが重要な事実）**: measure=100 の所要時間は m=8: 281.4s（2.814s/step），
+  m=51: 1605.9s 平均（16.06s/step），m=204: 6354.7s（63.55s/step）であった．step 時間の比は m=8→51 で 5.71 倍
+  （m 比 6.375），m=51→204 で 3.96 倍（m 比 4.0）と，いずれも **`(p-1)/(m+p-1)` バブル式が予測する「段間オーバー
+  ラップによる緩やかな短縮」ではなく，step あたりの所要時間が m にほぼ比例して増加するパターン**を示した．
+
+**5. 分析フェーズへの申し送り**
+
+- 上記 §4 の実行時間スケーリングの事実（time_per_step ∝ m にほぼ比例）は，`_process_microbatch` が m 個の
+  マイクロバッチを段間オーバーラップなく逐次処理している可能性（バブル式 A-1 が前提とする「複数マイクロバッチが
+  異なる段で同時に稼働する」状態になっていない可能性）を示唆する．集約スループット `microbatch_per_s` 自体は
+  m とともに増加しているが，計画が予測した比率（m=51/m=8 で 3.6 倍）には遠く届かず（実測 1.12 倍），
+  `### 検討・計画 (Iter7)` §4 の「定量整合（ratio≥1.5）」は満たしていない．一方「単調増加＋2σ超過」の条件は
+  満たしている．analyst はこの中間的な結果（効果はある方向だが理論の予測より著しく小さい）を，成功条件・
+  反証条件のいずれにも完全には当てはまらない事例として扱い，実行時間スケーリングの事実（オーバーラップ欠如の
+  可能性）と合わせて判定すること．
+- m=204 のみ `repeats=1`（他 2 水準は `repeats=3`）である点は，CV 比較の際に注意が必要（m=204 の測定誤差幅は
+  不明．ただし pilot の 63.5s/step と本番の 63.55s/step が高精度で一致しており，測定自体の再現性は高いと推測
+  される）．
+- `results/Iter7.jsonl` は本フェーズで新規作成（7 レコード，全て `record_type=microbatch_bench`）．
+- git commit/push はこのフェーズでは行っていない．
+
+**6. クラスタの状態**
+
+- 全 3 水準の deploy・bench・collect 完了後，env 未設定（bench 無効・`NUM_MICRO_BATCHES=4` 既定）で全 51 ノードを
+  再 deploy し，`docker inspect` で `NUM_MICRO_BATCHES=4` かつ bench 系 env 未設定を確認，`healthcheck.py` で
+  51/51 healthy を確認済み．**健全な serving 状態に復元済み**．
+
+---
+
+### 分析(解釈) (Iter7)
+
+**担当**: 分析(解釈)フェーズ subagent（2026-07-20 JST）．`### 実験 (Iter7, 再実行)` の生データ（`results/Iter7.jsonl`
+7 レコード）を検算し，成功条件・反証条件のどちらに近いかを，`pipeline_inference.py` のコード読解と合わせて分析した．
+最終判定（採用/不採用）は reflector の役割のため，ここでは「事実としてどちらに近いか」「原因は何か」に留める．
+
+**1. 集計値の検算（journal 記載値と完全一致）**
+
+- `results/Iter7.jsonl` を直接読み，`microbatch_per_s` を再集計した．m=8: mean=2.8478，母 σ=0.0039，n=3．
+  m=51: mean=3.1772，母 σ=0.0021，n=3．m=204: 3.2102，n=1．いずれも journal §4 の記載値と一致（不一致なし）．
+- `microbatch_per_s = m × 100 / elapsed_s` を各レコードから逆算しても記録値と一致（m=8→2.8478，m=51→3.1772，
+  m=204→3.2102）．比率も一致: throughput(m=51)/throughput(m=8)=1.1157，差=0.3294，throughput(m=204)/throughput(m=51)=1.0104．
+
+**2. ノイズか有意かの判定**
+
+- throughput(m=51)−throughput(m=8)=0.3294 は m=8/m=51 双方の 2σ（0.0078／0.0043）を約 40〜75 倍上回る．
+  **単調増加は統計的に有意でありノイズではない**（成功条件 1 の「2σ 超過」は形式的に成立）．
+- ただし変化の**大きさ**は 1.12 倍にすぎず，成功条件 2 の定量閾値 1.5 に遠く届かない．反証条件の平坦しきい値
+  （ratio ≤ ~1.1）を辛うじて上回るのみで，計画が予測した 3.6 倍とは 1 桁近く乖離する．「ノイズではないが，
+  理論が要求する効果量には達しない有意微増」と整理できる．
+
+**3. 段間オーバーラップの有無（コードによる原因切り分け・確信度高）**
+
+- **step 時間スケーリングの定量診断**: time_per_step は m=8:2.809s，m=51:16.052s，m=204:63.547s．線形回帰すると
+  `time_per_step ≈ 0.31×m + 0.35`（1 マイクロバッチ当たり限界コスト ≈0.31s が m に依らずほぼ一定；区間傾き
+  m=8→51 で 0.308，m=51→204 で 0.310 と一致）．
+  - **オーバーラップ型モデル（GPipe/バブル式）は棄却される**: 理論では step_time=(m+p−1)×t_stage で t_stage は m に
+    依らず一定のはず．実測から t_stage を逆算すると m=8:0.048s，m=51:0.159s，m=204:0.250s と m とともに増大し，
+    一定にならない．つまり `(p−1)/(m+p−1)` バブル式が前提とする「t_stage 一定・fill/drain 償却」は成立していない．
+  - **逐次型モデルが適合**: 限界コスト 0.31s/microbatch が一定（51 段全体の 1 貫通 ≈6ms/段）＝マイクロバッチが
+    段間オーバーラップなく 1 本ずつ 51 段を貫通してから次が始まる挙動と整合する．
+- **コード上の根拠**: bench 経路 `_pipeline_loop`（:1192 bench 分岐）→ `_run_microbatch_bench`（:1237-1262）は各 step で
+  `for mb in range(num_micro_batches): self._process_microbatch(mb, ...)` と**マイクロバッチを同期・逐次ループ**する．
+  `_process_microbatch`（:1019-1050）は各 mb について (A) `dist.recv`（:1024，blocking）→ (B) 全 my_layers を compute →
+  (C) `dist.send`（:1048，blocking）を行い，**二重バッファリングも async 通信も無い**．async の `dist.irecv`/`wait()` は
+  serving relay 経路（:1706-1813）にのみ存在し，bench 経路には一切使われていない（grep 確認済み）．したがって各 rank は
+  mb を送出（blocking send）し終えるまで mb+1 の受信を開始できず，Gloo の blocking send/recv が段間の
+  オーバーラップを構造的に潰す．**「複数マイクロバッチが異なる段で同時稼働する」状態は実装上発生しない**．
+- **1.12 倍の微増の解釈**: 実測の微増は，バブル低減ではなく step 固定オーバーヘッド（≈0.35s／step，rank0 の
+  乱数生成・`_reset_kv_cache_for_bench`・drain 等）が m 本のマイクロバッチに償却されることによる副次効果と
+  考えられる（`microbatch_per_s = m/(0.31m+0.35)` が m→∞ で 1/0.31≈3.23 へ漸近；m=204 の 3.21 は既に漸近値近傍）．
+  効果の向きは正だが，機構は計画の仮説（パイプライン充填）とは異なる．
+
+**4. m=204 が n=1 であることの確信度への影響**
+
+- 上記 3 の「オーバーラップ欠如」の結論は，主に n=3 の m=8・m=51 の step 時間（2.809s／16.052s）と
+  `_process_microbatch` のコード構造に依拠しており，m=204 の値には依存しない．m=204 は「限界コスト一定」の
+  傾向を 3 点目として補強するのみで，pilot（63.5s/step）と本番（63.55s/step）の高精度一致から測定再現性は
+  高いと推測される．したがって n=1 は主要結論（機構・成功条件 2 未達）の確信度を実質的に下げない．
+- ただし throughput(m=204)/throughput(m=51)=1.0104 という**微差そのもの**は，m=204 の σ が不明なため
+  「m=204 が m=51 を有意に上回るか」までは断定できない（成功条件 2 後段「m=204 ≥ m=51」は点推定では成立するが
+  誤差幅は未確認）．もっとも寛容にノイズ幅を見積もっても 1.01/1.12 を 1.5 に到達させることはできないため，
+  この不確かさは全体判定を左右しない．
+
+**5. 成功条件・反証条件のどちらに近いか（confidence 付き・最終判定は reflector）**
+
+- **反証条件（このレバーは本ハードで無効＝収束・振り替え）に実質的に近い**と分析する．根拠: (1) 効果量 1.12 倍は
+  平坦しきい値 ~1.1 の直上にすぎず，採用側閾値 1.5 に遠く未達．(2) コードと step 時間スケーリングの双方から，
+  計画の仮説が依拠するバブル式の前提（段間オーバーラップ）が実装上・実測上いずれも成立していないことが確認された．
+  (3) m を p の 4 倍（204）まで増やしても throughput は漸近値 ≈3.23 に張り付き，増分に対し latency のみが線形悪化する．
+- ただし**厳密な反証条件（3 水準が互いに 2σ 内で平坦）そのものは満たさない**（単調増加は 2σ を大きく超え有意）．
+  よって「成功条件 1 の一部（有意な単調増加）は満たすが，成功条件 2（効果量・機構）は満たさず，機構は仮説と異なる」
+  という中間事例であり，形式条件の機械的当てはめでは決着しない．
+- **confidence**: 「段間オーバーラップが起きていない（＝バブル式が本実装で成立しない）」はコード＋定量スケーリングの
+  二重証拠により **高**．「レバーとして収束方向」は効果量が閾値の 1/1.5 未満である事実に基づき **中〜高**．
+- **次フェーズ（reflector）への示唆**: 現行 bench 実装（blocking Gloo・逐次 mb ループ・オーバーラップ無し）の下では
+  `NUM_MICRO_BATCHES` は集約スループットに実効的に効かず，**このレバーは収束と扱い次候補 `STAGGER_INTERVAL` へ
+  振り替える**のが妥当と考えられる．追加反復（m=204 の repeats 補完）は，主要結論を覆さない見込みのためコスト対効果が
+  低い．一方，もし「バブル式が成り立つか」を本気で問うなら，レバー変更ではなく `_process_microbatch` を async
+  `isend`/`irecv`＋二重バッファ化する**実装変更**（serving 経路の :1706-1813 に既存する irecv パターンの bench 転用）が
+  前提となる——これは単一レバーの範囲を超え，可逆性・スコープを reflector/planner が別途判断する必要がある（断定は避ける）．
+
+---
+
+### 実装 (Iter7, 差し戻し後)
+
+**担当**: 実装フェーズ subagent（2026-07-19 JST）．backlog.md B13（`[auto-decided 2026-07-19]`）の判断に従い，
+単一レバー `NUM_MICRO_BATCHES` 自体は変更せず，`### 実験 (Iter7)` が発見したバグ A・B のみを修正した．
+実機クラスタへの接続・deploy・SSH は一切行っていない（コード編集とローカル `uv run pytest tests/` のみ）．
+
+**1. バグ A（`position_ids` 欠落によるクラッシュ）の修正**
+
+- `_process_microbatch`（pipeline_inference.py :1029-1035 付近）で，`hidden_state.shape[1]` から
+  `_seq_len` を取り出し，`position_ids = torch.arange(mb * _seq_len, (mb + 1) * _seq_len,
+  dtype=torch.long).unsqueeze(0)` を構築，`is_first = (mb == 0)` を添えて
+  `layer(hidden_state, position_ids=position_ids, is_first=is_first)` と明示的にキーワード渡しする形に
+  変更した（旧: `layer(hidden_state)`）．
+- **設計判断（単調増加 vs 固定値）**: 「単調増加」を採用した．理由は，バグ B の対処（後述）で
+  `_run_microbatch_bench` が各ステップ冒頭に KV キャッシュと write_pos をゼロリセットするため，
+  1 ステップ内では `_process_microbatch` が `mb=0,1,...,num_micro_batches-1` の順に呼ばれるたびに
+  write_pos が `0, seq_len, 2*seq_len, ...` と累積していく（serving 経路のトークン逐次生成と同じ
+  「cache 書き込み位置＝RoPE 位置」の対応関係）．position_ids を固定値（例えば全 mb で 0）にすると，
+  この対応が崩れ（sliding window マスクの `_row`/`_col` 比較や `_apply_rope` の絶対位置が cache の
+  実書き込み位置と食い違う），bench が計測する attention コストが実際の書き込みパターンと乖離し，
+  「定常状態のスループット測定」という bench の意図と矛盾する．単調増加はこの対応を厳密に保ち，かつ
+  serving 経路（:1719, :1726 等の `positions = torch.arange(recv_seq_len, ...)` パターン）と一貫した
+  「絶対位置」の扱いになるため，実装上も自然（追加の特別扱いが不要）と判断した．
+
+**2. バグ B（KV キャッシュ write_pos オーバーフロー）の修正**
+
+- 対応案は 2 択（申し送り (b)）のうち，**「bench 専用に各ステップ前に KV キャッシュ本体と write_pos を
+  ゼロリセットする」**（`_reset_kv_cache_for_bench` 新設メソッド，pipeline_inference.py :971-995）を採用した．
+  理由: (1) `_broadcast_prompt_and_wait`（実リクエスト開始時のリセット，:1514-1522 付近）が既に
+  「kv_cache 本体と `_kv_cache_write_pos_ref` を揃えてゼロクリアする」同一イディオムを持っており，
+  それを bench 経路にも適用するだけで済み実装が最小差分になる．(2) 「kv_cache 書き込み自体をバイパス」
+  する案は，`_process_microbatch`／layer.forward 内部（バグ A 修正後も維持している既存の cache 書き込み
+  コードパス）に bench 専用の分岐を新設する必要があり，serving 経路と bench 経路で forward の挙動が
+  分岐する（＝改変範囲が `_build_transformer_layer` 内部に及ぶ）ため，最小差分の原則に反すると判断した．
+- `_run_microbatch_bench`（新設，:1221-1275 付近）は warmup・measure 双方のループで，各ステップの
+  `_process_microbatch` 呼び出し前に必ず `self._reset_kv_cache_for_bench()` を呼ぶ．これにより，
+  1 ステップ内で write_pos が到達しうる最大値は構造的に `num_micro_batches * seq_len` に収まり，
+  `repeats × (warmup+measure)` がいくら大きくても（本番設定 `MICROBATCH_BENCH_STEPS=100` で
+  `num_micro_batches=204` の場合でも既定 `SEQ_LEN=1` なら `204*1=204 ≪ max_gen_tokens=2048`）
+  write_pos が `max_gen_tokens` を跨がない．
+- **副次確認（コードレビュー，bench 計算量の定常性）**: 毎ステップリセットにより，非 sliding 層の
+  attention 計算量（`cache_end` に比例）もステップを跨いで同一パターンで再現されるため，
+  「定常状態のスループット計測」という bench の前提とも整合する（journal.md `### 実験 (Iter7)` が
+  指摘した「計算量がステップごとに単調に伸びる」問題も同時に解消）．
+
+**3. 再発防止テスト（新規）**
+
+- `tests/test_pipeline_microbatch_bugfix.py`（新設，5 ケース）を追加した．`FullyOptimizedPipelineNode.__init__`
+  は分散プロセスグループ初期化・safetensors 読み込みを要するため呼ばず，`object.__new__` で最小構成の
+  単一ノード（`prev_rank=next_rank=None` で `dist.recv`/`dist.send` を経由しない）を組み立て，実 forward の
+  シグネチャ（`position_ids` に既定値なし）と KV キャッシュ書き込みパターン（`write_pos:write_pos+sl`）だけを
+  模した `fake_layer` で検証する．
+  - バグ A: `position_ids` を渡さないと `TypeError` になるシグネチャに対し，`_process_microbatch` が
+    実際に `TypeError` を起こさず呼べること／`position_ids` が `mb*seq_len` を起点に正しくオフセットする
+    ことを検証（2 ケース）．
+  - バグ B: (i) reset を挟まずに `_process_microbatch` を連続呼び出しすると `max_gen_tokens` を超えて
+    実際に `RuntimeError`（shape 不一致）になること（対処前の挙動の再現，1 ケース），(ii)
+    `_reset_kv_cache_for_bench` が KV キャッシュ本体・write_pos の双方をゼロへ戻すこと（1 ケース），(iii)
+    `_run_microbatch_bench` が `max_gen_tokens` ちょうどの境界値・多数ステップでも例外にならず完走し，
+    各呼び出し直前の write_pos が常に `mb*seq_len` の範囲に収まること（1 ケース）．
+- `tests/conftest.py` にリポジトリルートを `sys.path` へ追加する行を 1 行追加した（`pipeline_inference.py` は
+  リポジトリ直下にあり，既存の `tools/` 追加行だけでは import できないため．最小差分）．
+- `uv run pytest tests/` 実行結果: **93 passed**（既存 88 + 新規 5，回帰なし）．
+
+**4. 完了条件チェック**
+
+- serving ホットパス（`process_pipeline_inference`／`_broadcast_prompt_and_wait`／`_relay_request` 系）は
+  **非改変**（`git diff pipeline_inference.py` の全 hunk が bench 用定数・`_process_microbatch`・
+  `_reset_kv_cache_for_bench`・`_pipeline_loop`・`_run_microbatch_bench`・`main()` の bench ゲートのみに
+  限定されることを diff で確認済み）．`MICROBATCH_BENCH_STEPS=0`（既定）での挙動は変更していない
+  （bench ゲート自体は前フェーズで実装済みの `if microbatch_bench_steps > 0:` のまま）．
+- 単一レバー原則: `NUM_MICRO_BATCHES` の値・既定・levers 定義は一切変更していない．
+- `uv run pytest tests/` 93 passed（回帰なし，新規再発防止テスト green）．
+- `tools/common.py`／`tools/deploy.py`（bench env 転送修正）は `### 実験 (Iter7)` が既に自律修正・検証済みの
+  ため本フェーズでは触れていない（journal 記載のとおり残置）．
+
+**5. 実験フェーズへの申し送り（再掃引の手順）**
+
+- バグ A・B は修正済みのため，`### 実験 (Iter7)` §5 で打ち切った m=8 パイロット（`MICROBATCH_BENCH_STEPS=5,
+  MICROBATCH_BENCH_WARMUP_STEPS=2`）から**再開してよい**．まず m=8 の小規模パイロットで実クラッシュが
+  再発しないことを確認してから，`### 検討・計画 (Iter7)` §2 の本掃引（m∈{8,51,204}，
+  `MICROBATCH_BENCH_STEPS=100`，warmup/repeats は既定 20/3）に進むこと．
+- `_process_microbatch` の `dist.recv`/`dist.send` の例外握り潰し（バグ A の副作用として発見された，
+  通信断を隠蔽する設計の弱点）は本 Iteration のスコープ外のまま（journal 既存の将来課題として維持．
+  今回も変更していない）．m=8 パイロット時，rank クラッシュ時にこの握り潰しが下流 rank の異常検知を
+  妨げないか，pilot 実行中はログを注視すること．
+- pre-flight 確認事項（m=204 の通信バッファ RAM 見積もり等）は `### 実験 (Iter7)` §4 で既に解消済み
+  （再確認不要）．
+
+---
+
+### 実験 (Iter7)
+
+**担当**: 実験フェーズ subagent（2026-07-19T17:05〜17:26 JST，約 21 分）．`### 実装 (Iter7)` §5 の手順に従い
+m=8 でのパイロット（`MICROBATCH_BENCH_STEPS=5`, `MICROBATCH_BENCH_WARMUP_STEPS=2`）を実行しようとしたが，
+**2 件のブロッキング実装バグを発見し，3 水準の本掃引には進めなかった**．実機 51 ノードは現在健全な
+serving 状態（bench 無効・`NUM_MICRO_BATCHES=4` 既定）に復元済み．
+
+**1. 事前に発見・修正したデプロイ経路の欠落（可逆・低リスクと判断し自律修正）**
+
+- `tools/deploy.py` の `docker run` コマンドは `NUM_MICRO_BATCHES`/`STAGGER_INTERVAL` は `-e` 転送していたが，
+  Iter7 実装で追加された `MICROBATCH_BENCH_STEPS`/`MICROBATCH_BENCH_WARMUP_STEPS`/`MICROBATCH_BENCH_REPEATS`
+  は**一切コンテナへ転送されていなかった**（deploy 実行元シェルで export しても無効化されたまま＝
+  `MICROBATCH_BENCH_STEPS` 既定 "0" が常にコンテナに渡り bench は起動しない）．`tools/common.py`
+  `ClusterConfig` に 3 フィールドを追加し，`tools/deploy.py::deploy_single_node` の `docker run` へ
+  未設定時は `-e` 行ごと省略する形で条件付き転送する変更を加えた（`git diff` で確認可能，2 ファイルのみ）．
+  `uv run pytest tests/` 88 passed（回帰なし）．**この修正がないと bench は原理的に一度も起動しないため，
+  実験を進めるための必須の前提修正**として自律判断で実施した（可逆・deploy スクリプトの追加のみ・
+  serving ホットパス非改変）．
+
+**2. パイロット実行（m=8, MICROBATCH_BENCH_STEPS=5）で発見したブロッキングバグ**
+
+- 51 ノード健全性確認 → `NUM_MICRO_BATCHES=8 MICROBATCH_BENCH_STEPS=5 MICROBATCH_BENCH_WARMUP_STEPS=2 mise run
+  deploy` 実行（deploy 自体は 54 秒で完了，51/51 成功）．
+- **バグ A（クラッシュ）**: 実レイヤーを 1 枚以上持つ rank（rank1 で確認）が bench 開始直後に例外で fatal crash：
+  ```
+  TypeError: FullyOptimizedPipelineNode._build_transformer_layer.<locals>.forward()
+  missing 1 required positional argument: 'position_ids'
+  ```
+  原因: `_process_microbatch`（pipeline_inference.py:995 付近）が `layer(hidden_state)` を **位置引数
+  `position_ids` なしで**呼び出しているが，`_build_transformer_layer` が返す `forward`（:829）の実シグネチャは
+  `forward(hidden_state, position_ids, is_first=True)` で `position_ids` に既定値が無い．serving 経路
+  （:1682, :1788）は常に `layer(hidden_state, position_ids=positions, is_first=is_first)` と呼んでおり，
+  `_process_microbatch` はこの引数追加に追従していなかった（既存のデッドコードのバグで，Iter7 が初めて
+  このパスを実行して顕在化させた）．
+- **バグ A の副作用（サイレント伝播）**: `_process_microbatch` の `dist.recv`/`dist.send` は
+  `except Exception: return`/`pass` で例外を握りつぶす設計のため，rank1 がクラッシュ＆再起動（restart
+  policy）した後，**下流 rank は通信断を検知できず**，rank0/rank2 のように compute 0 層 or 通信断が
+  即座に return するランクは 21 ステップを「正常完了」したように見えてしまう（実際は乱数を右へ受け流した
+  だけで実計算をしていない）．一方 rank3 以降の実レイヤー保持 rank は `dist.recv` がブロックしたまま
+  停止（`GLOO_SOCKET_TIMEOUT_MS=3600000`＝1 時間のタイムアウト待ち）し，6 分以上ログが進行しなかった．
+  → **この完了 vs ハングの非対称性自体が，bench 分岐の結果を無条件に信用してはいけないことを示す**
+  （最終 rank が RESULT を出したとしても，途中区間の通信が実際に成立していたかは別途要検証）．
+- **バグ B（構造的・未クラッシュ確認だがコードレビューで確定）**: `_process_microbatch` が使う KV キャッシュの
+  `write_pos`（:879, `_kv_cache_write_pos[layer_idx] += _sl`）は**マイクロバッチ間で共有**され，かつ
+  bench の各 repeat/step 間でリセットされない．`KV-cache initialized: ... max_gen_tokens=2048` に対し，
+  1 回の bench 呼び出し総数は `repeats × (warmup+measure) × num_micro_batches` 回（本番設定
+  `MICROBATCH_BENCH_STEPS=100` なら m=8 で `3×120×8=2880`，m=51/204 はさらに大きい）で，**いずれも 2048 を
+  超え** `key_cache[:, :, write_pos:write_pos+1, :] = k` の代入が範囲外スライスで shape 不一致エラーになる
+  見込み（バグ A を直しても本番設定では別クラッシュに至る）．さらに range 内でも非 sliding 層の attention は
+  `cache_end`（=蓄積済み位置）に比例して計算量が増えるため，bench 中の 1 ステップの所要時間が単調に伸びる
+  ＝「定常状態のスループット」という前提そのものと矛盾する（warmup で吸収できない）．
+
+**3. 対応**
+
+- パイロットを打ち切り，bench 無効（`MICROBATCH_BENCH_STEPS` 未設定＝既定 0）で全 51 ノードを再 deploy し，
+  健全な serving 状態（`micro_batches=4` 既定）へ復元済み（`mise run status`＝51/51 healthy を確認）．
+  **m=51/204 の本掃引は実施していない**（バグ A がある限り実レイヤー保持 rank は必ず同じ形でクラッシュ／
+  ハングするため，先に進めても同じ結果になると判断し，時間を消費しなかった）．
+  M=204 の RAM 事前懸念（`### 実装 (Iter7)` §5）は，`BATCH_SIZE`/`SEQ_LEN` がいずれも deploy 経路で未設定
+  （コンテナ内既定 "1"）であることをコードで確認し，通信バッファは `hidden_size(5376) × 4B × 2 × m` で
+  m=204 でも約 8.4 MB（実測 rank50 ログ `Comm buffers allocated: 0.33 MB` は m=8 分．m=204 相当は 51 倍
+  ≈16.9MB）と算出，RAM リスクは実質無い（懸念は解消，別途要確認は不要）．
+- バグ A・B は `_process_microbatch`/`_run_microbatch_bench`（D-1a で「生きている」と判断されたコード）の
+  **domain 知識（RoPE position_ids の意味・KV キャッシュ容量設計）を要する修正**であり，deploy.py の env
+  転送漏れ（機械的な配線ミス）とは性質が異なると判断し，本フェーズでは着手しなかった（実験フェーズの
+  役割を超えるため）．`results/Iter7.jsonl` は 0 件のまま（record_type=microbatch_bench のレコードは
+  1 件も取得できていない）．
+
+**4. 完了条件チェック（`### 検討・計画 (Iter7)` §4）との対比**
+
+- (i) `results/Iter7.jsonl` への構造化保存: **未達成**（0 件．バグ A/B により bench が実測データを生成しない）．
+- (ii)/(iii)（テスト green・env 既定での非改変）: 実装フェーズ時点の確認は有効（本フェーズでは変更していない）．
+  ただし deploy.py の修正後も `uv run pytest tests/` 88 passed を再確認済み．
+
+**5. 次フェーズへの申し送り**
+
+- rc-planner/rc-implementer での再検討が必要な事項:
+  (a) `_process_microbatch` の `layer(hidden_state)` 呼び出しに `position_ids`（と，必要なら `is_first`）を
+  明示的に渡す修正（RoPE 用に単調増加または固定値のいずれが steady-state 測定として妥当かは設計判断）．
+  (b) bench 中の KV キャッシュ書き込み位置が `max_gen_tokens` を超えないための対処（例: bench 専用に
+  write_pos を各 step 前にリセットする，または `_process_microbatch` の bench 経路では kv_cache 書き込み
+  自体をバイパスして「毎回同じ固定長キャッシュに対する attention」に固定し，計算量を一定に保つ）．
+  (c) `_process_microbatch` の recv/send 例外握り潰しが，通信断を「正常完了」に見せかける問題（bench の
+  結果の信頼性に関わる．最終 rank の RESULT が出ても，途中区間が実際に通信できていた保証がない）．
+- 本フェーズの副産物として `tools/common.py`/`tools/deploy.py` の bench env 転送修正は残置（次回の bench
+  再挑戦時に必要）．git diff 未コミット（このフェーズでは commit/push を行っていない．次フェーズ以降の
+  判断に委ねる）．
+
+---
+
+### 実装 (Iter7)
+
+**担当**: 実装フェーズ subagent（2026-07-19 JST）．`### 検討・計画 (Iter7)` §2「変更ファイル・設定キー」に従い，
+**単一レバー `NUM_MICRO_BATCHES` のスループット感度分析用 bench モード**を実装した．実機クラスタへの接続・deploy・
+SSH・推論実行は一切行っていない（コード編集とローカル `pytest` のみ）．
+
+**1. `pipeline_inference.py` の変更**
+
+- `DEFAULT_MICROBATCH_BENCH_WARMUP=20`／`DEFAULT_MICROBATCH_BENCH_MEASURE=100`／`DEFAULT_MICROBATCH_BENCH_REPEATS=3`
+  を `DEFAULT_NUM_MICRO_BATCHES` 近傍（旧 :63 近傍）に追加．
+- `_pipeline_loop()`: `warmup_steps`/`measure_steps`/`repeats`（すべて既定 `None`）を引数化．3 つとも非 `None` の
+  ときのみ bench 分岐（`_run_microbatch_bench` 新設）へ入り，従来の無限ループ（`while not _shutdown_requested and
+  not _pipeline_stopped`）は else 節としてそのまま温存．bench 分岐は `repeats` 回，各回 `warmup_steps` を捨てたあと
+  `measure_steps` の wall-clock を計測し，**最終 rank（`next_rank is None`）でのみ**
+  `[R{rank} RESULT] MICROBATCH_BENCH m=... p=... warmup=... measure=... elapsed_s=... steps_per_s=... microbatch_per_s=...`
+  を出力する（既存 `_log`/RESULT 形式に準拠）．
+- `main()`: 新 env `MICROBATCH_BENCH_STEPS`（既定 `"0"`）を読み，`int(...) > 0` のときのみ `node._pipeline_loop(
+  warmup_steps=..., measure_steps=microbatch_bench_steps, repeats=...)` を**同期的に**実行してから
+  `process_pipeline_inference()` へフォールスルーする分岐を追加．**既定値 0 では if 分岐自体が実行されず，
+  `process_pipeline_inference()` の呼び出しは変更前と完全に同一**（可逆性の担保．コードレビューで確認済み，
+  該当 diff は `if microbatch_bench_steps > 0:` ブロックの追加のみで既存行の変更なし）．
+- **計画からの実装判断（申し送り）**: 計画は `MICROBATCH_BENCH_STEPS` を「bench の有効化ゲート」とのみ記述し，
+  warmup/measure/repeats の env 分割は明記していなかった．env サーフェスを最小に保つため，**`MICROBATCH_BENCH_STEPS`
+  自体を `measure_steps` としても兼用**し（0 で無効化，>0 の値がそのまま計測ステップ数になる），warmup/repeats は
+  追加の任意 env（`MICROBATCH_BENCH_WARMUP_STEPS`／`MICROBATCH_BENCH_REPEATS`，既定は上記定数）で上書き可能にした．
+  `DEFAULT_MICROBATCH_BENCH_MEASURE`（100）はこの設計では直接コードから参照されず，operator 向けの推奨値ドキュメント
+  （`MICROBATCH_BENCH_STEPS=100` を使う場合の目安）としてコメントに残した．実験フェーズは
+  `MICROBATCH_BENCH_STEPS=100`（推奨）を基本に，`m∈{8,51,204}` ごとに `NUM_MICRO_BATCHES=m` と併せて設定すること．
+
+**2. `tools/collect_results.py` の変更**
+
+- `_MICROBATCH_BENCH_RE` を追加し，`MicrobatchBenchRecord`（dataclass）・`parse_microbatch_bench_log`（純関数．
+  `[R{rank} RESULT] MICROBATCH_BENCH ...` 行を全件抽出，1 行 = 1 計測窓）・`build_microbatch_bench_record`（JSONL
+  レコード組み立て．`record_type="microbatch_bench"` で通常の serving レコードと区別）を新設．
+- オーケストレーション: `collect_last_rank_log`（`world_size - 1` の host から `docker logs` を SSH 取得．
+  `MICROBATCH_BENCH` は最終 rank でのみ出力されるため rank0 ではなくこちらを対象にする）・
+  `run_microbatch_bench_collect`（ログ取得 → 全計測窓パース → レコード化，プロンプト送信は行わない）を追加．
+- CLI: `main()` に `--microbatch-bench`（プロンプト送信をスキップし bench 収集のみ行う）・`--since`（`docker logs
+  --since` を絞り込む任意 ISO8601．省略時はコンテナの全ログを取得するため，**同一デプロイに対して複数回 collect
+  すると `MICROBATCH_BENCH` 行が重複記録され得る**点を `--help` とコード内コメントに明記．実験フェーズは m ごとに
+  再 deploy する運用のため実害は小さいが，同一 deploy で複数回 collect する場合は `--since` を使うこと）．
+
+**3. テスト**
+
+- `tests/fixtures/microbatch_bench_sample.log`（実 ESC バイト付き ANSI 混入 2 行＋非混入 1 行の RESULT，他 rank・
+  非 RESULT 行のノイズを含む）を新設．
+- `tests/test_microbatch_bench.py`（5 ケース）: `parse_microbatch_bench_log` の全件抽出・フィールド正確性・ANSI
+  有無両対応・0 件時の空リスト，`build_microbatch_bench_record` の必須フィールド網羅．
+- `uv run pytest tests/` 実行結果: **88 passed**（既存 83 件 + 新規 5 件，回帰なし）．
+
+**4. 完了条件チェック（`### 検討・計画 (Iter7)` §4「完了条件」）**
+
+- (i) `results/Iter7.jsonl` への構造化保存: 実装済み（`--microbatch-bench` 実行で `record_type=microbatch_bench`
+  レコードが 1 計測窓 = 1 行で追記される）．**実データはまだ無い**（実機 deploy 未実施，これは実験フェーズの担当）．
+- (ii) 新パーサ単体テスト green・既存回帰なし: **満たした**（88 passed）．
+- (iii) `MICROBATCH_BENCH_STEPS=0`（既定）で現行 serving 挙動を変えない: **コードレビューで確認**（`main()` の
+  追加分岐は `if microbatch_bench_steps > 0:` の中にのみ新規コードがあり，既定 `"0"` では従来どおり
+  `node.process_pipeline_inference()` のみが呼ばれる．`_pipeline_loop()` も引数 3 つとも `None` のとき else 節で
+  従来の無限ループ実装を一字一句保持）．serving ホットパス（`process_pipeline_inference`／`_broadcast_prompt_and_wait`／
+  `_relay_request` 系）は非改変（diff に含まれない）．
+
+**5. 実験フェーズへの申し送り（env 設定・deploy 手順の要点）**
+
+- 各 `m∈{8,51,204}` について，deploy 時の env に `NUM_MICRO_BATCHES=m` と `MICROBATCH_BENCH_STEPS=100`（推奨．
+  warmup/repeats は既定 20/3 のままでよい）を設定し `mise run deploy` する．`predict:demo` の実行は不要（bench は
+  コンテナ起動時に自動実行される）．
+- 収集は `uv run python tools/collect_results.py --iter Iter7 --microbatch-bench` を各 deploy 後に 1 回実行する
+  （最終 rank ＝ `WORLD_SIZE - 1` の docker logs を SSH 取得しパースする．`WORLD_SIZE=51` 固定なら rank50）．
+- **要 pre-flight 確認（`### 検討・計画 (Iter7)` §5 のリスク）**: `m=204` はバッファを既定比 51 倍確保する
+  （`_allocate_communication_buffers`）．worker ノードの RAM で収まるか deploy 前に見積もること．OOM の兆候があれば
+  `m=204` を外し `{8, 51}` の 2 水準に縮退する．
+
+---
+
+### 検討・計画 (Iter7)
+
+**担当**: 計画フェーズ subagent（2026-07-19 JST）．`### 調査 (Iter7)` の結論（A-2 の 51 段バブル数値・B-2 主指標の差し替え・
+C-1〜C-3 のデッドコード事実・D-1a/b/c の 3 択・D-2〜D-5 の申し送り）を精読し，単一レバー **`NUM_MICRO_BATCHES`
+（research_frontier② のスループット感度）**の実験を実装可能な粒度へ落とし込んだ．本フェーズは実機クラスタへの接続・
+deploy・推論を一切行わない（`pipeline_inference.py` のコード読み取りのみ）．**確認したコード事実**: `main`（:2001-2032）が
+呼ぶのは `process_pipeline_inference`（relay serving 経路）のみで，`num_micro_batches` を実消費する `_pipeline_loop`
+（:1109-1147）→`_process_microbatch`（:963-1002）は serving 経路から起動されない＝**現状デッドコード**．`_process_microbatch` は
+乱数入力（`recv_buffers[mb].normal_`, :976）で，`_relay_active` 中は即 return（:970-972）．バッファは `num_micro_batches` 本
+線形確保（:609-624）．`_pipeline_stopped` は定義（:101）と参照（:1127）のみで真になる箇所は無い．
+
+#### 0. 採用する案と選定理由（D-1a を選択）
+
+調査 D-1a/b/c のうち **(案 D-1a: 生きている `_pipeline_loop` を明示起動し，乱数パイプラインの集約スループットが m で
+どう変わるかを測る)** を採用する．理由: (1) **可逆・低リスク**（serving 経路 `process_pipeline_inference`/`_relay_request` を
+一切改変せず，現状デッドコードの `_pipeline_loop` を env ゲートで明示起動するだけ．env 既定では現行挙動と完全に同一）．
+(2) **バブル式 A-1 `(p−1)/(m+p−1)` が実 51 段 Gloo/CPU 上で成り立つかの独立した検証価値**があり，②（マイクロバッチ数の
+スループット感度）という当初目的そのものに合致する．(3) **B12 が想定した「過大なら振り替え」の分岐に忠実**——(案 D-1b:
+relay の in-flight batching ホットパス改変) は SL3/B9 隣接の不可逆・大規模で `[needs-human]` 送りになるため今回は選ばない．
+(案 D-1c: SEQ_LEN/STAGGER への振り替え) は②の感度分析という目的から外れるため選ばない．D-1a は単一レバー原則に最も忠実．
+
+#### 1. 仮説
+
+51 段（p=WORLD_SIZE=51）の実 Gloo/CPU パイプラインで，乱数入力の `_pipeline_loop` を回して**集約マイクロバッチ・
+スループット（microbatch/sec ＝ 最終 rank が単位時間に完了させる隠れ状態テンソル数）**を測ると，m を増やすほどパイプラインの
+fill/drain バブルが償却されてスループットが上がるはずである（GPipe/Megatron の効率 `1 − bubble = m/(m+p−1)`）．p=51 での
+予測効率は **m=8→0.138／m=51→0.505／m=204→0.803**（対応バブル 86.2%／49.5%／19.7%）．したがって理論が実機で成り立てば
+**throughput(m=51) は throughput(m=8) の約 3.6 倍，throughput(m=204) は約 5.8 倍**へ単調増加する（compute-ceiling `1/t_stage`
+へ漸近）．逆に，Gloo の blocking send/recv が段間オーバーラップを潰す，または CPU 計算律速（Iter4，ITL の 92% が compute）で
+早々に飽和する場合は，m を振っても throughput がノイズ内で**平坦**になる．前者なら②のレバーは意味を持ち（採用方向），
+後者なら本ハードでは `NUM_MICRO_BATCHES` は集約スループットにも効かない（収束＝次レバーへ振り替え）と判定できる．
+
+#### 2. 単一レバー・変更内容
+
+**単一レバー**: **`NUM_MICRO_BATCHES` の値のみ**を `{8, 51, 204}` の 3 水準で振る．他は直近最良／既定に固定する（下記 §3）．
+
+- **レバー値の選定（過去値と非重複）**: config の既定候補 `[2, 4, 8]` は 51 段には桁不足（A-2）で，かつ serving 経路では
+  一度も実際に掃引されていない（C-2，デッドコードのため）．**`{8, 51, 204}`＝{旧 config 上限, p, 4p}** に拡張する．8 を
+  低アンカー（旧 config 上限と重複させ連続性を担保），51=p（バブル 50%），204=4p（GPipe「ほぼ無視可」域）とし，予測効率が
+  0.138 : 0.505 : 0.803 と大きく開くため，理論の成否をノイズ上で明瞭に弁別できる．いずれも過去反復で未掃引の新規値．
+
+- **主指標の差し替え（D-2 の申し送りを反映）**: 主指標を Iter6/B6 が指定していた単発 ITL/TTFT から
+  **集約マイクロバッチ・スループット `microbatch_per_s = m × measure_steps / elapsed_s`（最終 rank，warmup 除外区間）**へ
+  更新する．乱数パイプラインにはトークンが無いため，D-2 が求めた「集約 tokens/sec」の**乱数入力アナログ**が microbatch/sec で
+  ある（各 microbatch＝shape (batch, seq_len, hidden) の隠れ状態が 51 段を貫通する 1 単位）．単発 ITL はバブル充填で原理的に
+  下がらない（B-2）ため主指標にしない．副指標: `steps_per_s`，および含意 `t_stage = elapsed_s / measure_steps / (m + p − 1)`
+  （compute-ceiling 整合の確認用，D-4）．
+
+**変更ファイル・設定キー（rc-implementer 向け・具体箇所）**:
+
+- `pipeline_inference.py`:
+  - `main()`（:2025-2032）: 新 env `MICROBATCH_BENCH_STEPS`（int, 既定 0＝無効）が >0 のとき，`process_pipeline_inference()`
+    の代わりに（または前段で）全 rank が `_pipeline_loop` をバウンド実行する bench 分岐を追加する．**既定 0 では現行挙動と
+    完全に同一**（可逆性の担保）．bench 完了後は結果行をログに出し，コンテナを健全に保つため `process_pipeline_inference()`
+    へフォールスルー（idle serving）してログ収集可能な状態を維持する案を推奨（rc-implementer 判断可）．
+  - `_pipeline_loop()`（:1109-1147）: 現在は `_shutdown_requested/_pipeline_stopped` まで無限ループ．**`warmup_steps`・
+    `measure_steps`・`repeats` を引数（既定 None＝現行の無限ループを保持）として追加**し，bench 時は「warmup 区間を捨て →
+    measure 区間の wall-clock を計測」を `repeats` 回繰り返す．**最終 rank（`next_rank is None`）でのみ**，各 measure 窓ごとに
+    構造化行 `[R{rank} RESULT] MICROBATCH_BENCH m={m} p={world_size} warmup={W} measure={M} elapsed_s={t} steps_per_s={M/t}
+    microbatch_per_s={m*M/t}` を出力する（既存の `[R{rank} LEVEL] message` 形式・RESULT ブロック規約に沿わせる）．全 rank が
+    同一 env から同一 `warmup/measure/repeats` を読むためロックステップは blocking send/recv で保たれる（recv は timeout で
+    自己回復，:978-982）．
+  - 新定数（マジックナンバー回避・CLAUDE.md 準拠）: `DEFAULT_MICROBATCH_BENCH_WARMUP`（例 20）・`_MEASURE`（例 100）・
+    `_REPEATS`（例 3）を `DEFAULT_NUM_MICRO_BATCHES`（:63）近傍に定義．env 読み取りは `PipelineConfig`（:294 近傍）または
+    `main` 内で行う．
+- `tools/collect_results.py`: `MICROBATCH_BENCH` RESULT 行をパースして **`results/Iter7.jsonl`** へ追記する処理を追加
+  （フィールド: `num_micro_batches, world_size, warmup_steps, measure_steps, elapsed_s, steps_per_s, microbatch_per_s, rank`）．
+  既存の `--stage-timing`（B7 で追加した並列 SSH `docker logs` 取得）で全 rank ログを引ける前提で，最終 rank の
+  `MICROBATCH_BENCH` 行を拾う．純関数パーサの単体テストを `tests/` に追加（回帰なしを確認）．
+- serving ホットパス（`process_pipeline_inference`・`_broadcast_prompt_and_wait`・`_relay_request` 系）は**非改変**．
+
+**掃引手順（実験フェーズ用）**: 各 m∈{8,51,204} について，env `NUM_MICRO_BATCHES=m` と `MICROBATCH_BENCH_STEPS>0`（＋
+warmup/measure/repeats）で `mise run deploy` → コンテナ起動時に bench が自動実行 → `tools/collect_results.py --iter Iter7
+--stage-timing` で最終 rank の結果行を回収．**`predict:demo` の HTTP プロンプト投入は bench では不要**なため，B6(i) 申し送りの
+`mise.toml` `predict:demo` の `--iter Iter1` ハードコード問題を回避できる（`collect_results.py --iter Iter7` を直接呼ぶ）．
+各 m で bench は `repeats(≥3)` の measure 窓を出すので **1 deploy あたり n≥3 反復**が得られ（B6(iv) 充足），冷開始（再デプロイ後の
+プロセスグループ再初期化）は warmup 区間で除外する（B6(ii) 充足）．
+
+#### 3. 固定する構成（直近最良／既定に固定）
+
+- `WORLD_SIZE=51`（p=51 固定．段数を変えるとバブルは m/p 比で決まり第 2 レバーになる＝単一レバー原則違反，A-2）．
+- `STAGGER_INTERVAL`＝既定 3.0（起動時 thundering herd 用で bench 定常スループットに寄与せず，固定）．
+- `SEQ_LEN`・`BATCH_SIZE`＝現行既定（バッファ shape を固定して m のみを独立変数に保つ）．モデル・重み・`COMPUTE_DTYPE` 不変．
+- serving 経路・relay プロトコル不変（本 bench は乱数パイプラインのみを測り，実プロンプト serving は変えない）．
+
+#### 4. 期待効果・成功条件（measurable）
+
+- **ノイズ幅の見積もり**: 各 m で `repeats≥3` の measure 窓から `microbatch_per_s` の平均と標準偏差 σ（相対 CV）を出す．
+  過去反復の交絡（冷開始 348s・Iter3 の ttft 81.6s 突出）は warmup 除外で排除済みのため，ここでのノイズは定常区間の
+  step 時間ばらつきのみ．CV は未実測だが，仮に 20〜30% でも予測分離（3.6 倍）を優に下回る．**ノイズ band ≡ 2σ**．
+- **成功条件（②の感度が実在＝レバー採用方向）**:
+  1. `microbatch_per_s` が m について**単調増加**し，かつ **throughput(m=51) − throughput(m=8) > 2σ**（ノイズを超えて増加）．
+  2. 定量整合: **throughput(m=51)/throughput(m=8) ≥ 1.5**（予測 3.6 倍に対し保守的閾値．1（平坦＝無効果）から明瞭に離れることを
+     要求）．さらに throughput(m=204) ≥ throughput(m=51)（compute-ceiling への漸近・単調性）．
+  → この場合，バブル式 A-1 が実 51 段でも成立＝`NUM_MICRO_BATCHES` は集約スループットに効くレバーだと確認（採用方向）．
+     ただし D-4 の CPU 計算律速の天井（全段常時稼働時の最遅段計算時間 `1/t_stage`）で頭打ちする現実値として報告する
+     （段数倍の理論上限をそのまま期待効果とはしない）．
+- **反証条件（②のレバーは本ハードで無効＝収束・振り替え方向）**:
+  - 3 水準の `microbatch_per_s` が互いに 2σ 内で**平坦**（throughput(m=51)/throughput(m=8) ≤ ~1.1）．
+  → Gloo blocking の段間非オーバーラップ，または CPU 計算律速の早期飽和により，本ハードでは `NUM_MICRO_BATCHES` は
+     集約スループットにも効かないと判定．**このレバーは収束**とし，次は config `levers` の次候補 `STAGGER_INTERVAL`（②の
+     stagger 側）へ振り替える（B12 の「過大／無効なら振り替え」分岐に合致）．
+- **完了条件（実装・実験が満たすべき最低限）**: (i) `results/Iter7.jsonl` に 3 水準 × repeats≥3 の `microbatch_per_s` が
+  構造化保存される，(ii) `tools/collect_results.py` の新パーサ単体テストが green（既存回帰なし），(iii) bench 分岐が env 既定
+  （`MICROBATCH_BENCH_STEPS=0`）で現行 serving 挙動を変えないことをコード上で担保．
+
+#### 5. 人間判断の要否・リスク
+
+- **自律実行可（needs-human 不要）**: 本案 D-1a は可逆・低リスクで，serving ホットパス・relay プロトコルを改変しない．実機
+  deploy/collect は B7 の包括承認（非破壊 SSH/deploy）の範囲内で破壊的操作を含まない．`[needs-human]` 登録は不要（D-5 と一致）．
+- **要確認リスク（実験フェーズで pre-flight）**: m=204 でバッファは m=4 既定比 51 倍（:619-624 の `buffer_bytes` 式）．
+  worker ノードの RAM で `2 × 204 × batch × seq_len × hidden × dtype_bytes` が収まるか，deploy 前に見積もること（hidden=5376．
+  seq_len・batch 既定次第だが数百 MB〜1 GB 級の見込み．収まらなければ m=204 を落とすか seq_len を一時縮小＝ただし縮小は
+  別レバーになるので慎重に）．OOM の兆候があれば m=204 を外し `{8, 51}` の 2 水準で単調性のみ確認する縮退案を許容する．
+
+---
+
+### 調査 (Iter7)
+
+**担当**: 調査フェーズ subagent（2026-07-19T17:00 頃 JST）．単一レバー **`NUM_MICRO_BATCHES`（research_frontier② の
+スループット感度）**の計画に向け，(A) パイプライン並列でのマイクロバッチ数とパイプラインバブル（段間の遊び）・スループットの
+関係，(B) その感度を測定するために必要なワークロード条件（複数リクエスト同時投入・in-flight/continuous batching 等），
+(C) 本リポジトリのコード上でこのレバーが実際に何に効くか，を調べた．実機クラスタへの接続・deploy・推論実行は一切していない
+（`pipeline_inference.py` のコード読み取りと tavily での文献調査のみ）．
+
+#### 調査の問い
+
+1. パイプライン並列でマイクロバッチ数 m を増やすとバブルはどれだけ減るか（定式化）．本リポジトリの 51 段構成で config 候補
+   `m∈{2,4,8}` はバブル低減に足りるか．
+2. 自己回帰デコードでバブルを埋めるのに必要なワークロード条件は何か（何リクエスト程度の同時投入が要るか，continuous/in-flight
+   batching・GPipe 系マイクロバッチ理論の適用限界）．測定の主指標は何にすべきか（ITL/TTFT か集約スループットか）．
+3. 本リポジトリのコード上，`NUM_MICRO_BATCHES` は現状どの経路で消費され，掃引すると実際に何が変わるか．
+
+#### A. 分かったこと（バブル理論・出典付き）
+
+- **A-1 バブル率の定式化（planner が真っ先に使うべき式）**: マイクロバッチ pipeline のバブル率（アイドル割合）は
+  **`bubble = (p − 1) / (m + p − 1)`**（p＝パイプライン段数，m＝マイクロバッチ数）．Megatron-LM の 1T パラメータ論文で明示され，
+  GPipe と同型（出典: Megatron-LM 経由の解説 perform.digital/blogs/pipeline-parallelism-microbatch；PipeFill, CMU PDL,
+  arxiv.org/abs/2410.07192；GPipe, Huang et al. 2019, arxiv.org/abs/1811.06965）．**GPipe の経験則: m ≥ 4×p でバブルはほぼ無視
+  できる水準になる**（GPipe 原論文 Table 2；medium 解説も同旨）が，**m を増やしても効果は逓減しゼロにはならない**（16 段・
+  128 マイクロバッチでもバブル ≈10.5%，mbrenndoerfer.com/writing/pipeline-parallelism-stages-micro-batching-gpipe-1f1b）．
+- **A-2 本リポジトリの 51 段への当てはめ（決定的に重要な数値）**: `p=WORLD_SIZE=51` を式に入れると，config 候補の
+  **`m=2→バブル 96.2%`／`m=4→92.6%`／`m=8→86.2%`**．**候補 3 水準ではバブルはほとんど動かない**（96%→86%，10 ポイント差）．
+  バブルを 50% まで下げるには m≈51（＝p），GPipe 基準の「ほぼ無視」まで下げるには **m≈204（4p）が必要**．すなわち **現行 config の
+  `levers: NUM_MICRO_BATCHES: [2,4,8]` は 51 段構成に対して桁が 1〜2 つ小さく，そのまま掃引しても（たとえワークロードが理想でも）
+  スループット差はほぼ出ない**という理論的予測になる．バブルは m/p の比で決まるため，段数を減らす（WORLD_SIZE を絞る）と
+  同じ m でも比が上がり効きやすくなる（例 p=11 なら m=8 でバブル 56%）が，それは第 2 のレバーであり単一レバー原則に抵触する．
+- **A-3 GPipe のマイクロバッチ理論は「学習（forward+backward）」前提で，推論デコードには直接は移らない**: 上式の m は
+  学習で 1 ミニバッチを分割した並列作業単位を指す（Iter4 調査で引いた Zero-Bubble も学習主眼）．**自己回帰デコードは
+  step ごとに seq_len=1 で，1 リクエスト内には並列に流せる作業がない**．したがってデコードでバブルを埋める「マイクロバッチ」に
+  相当するのは **同時に飛んでいる複数リクエスト**である（各デコード step で各段が別リクエストのトークンを処理する）．
+
+#### B. 分かったこと（デコードのバブルを埋めるワークロード条件・出典付き）
+
+- **B-1 デコードのバブル充填は「並列マイクロバッチ」ではなく「同時リクエスト数（concurrency）」で行う**: 推論の PP では各
+  デコード step で各段が KV ストレージ内の系列の 1/PP を処理し，同時リクエストを増やすほど段が埋まる（Seesaw, Cao et al.,
+  arxiv.org/abs/2503.06433；HF blog「Prefill and Decode for Concurrent Requests」, huggingface.co/blog/tngtech/…）．**深さ p の
+  パイプラインを埋めるには最低でも p のオーダーの同時リクエストが要る**（1 段 1 リクエストでも p 本，通信・ACK 往復の遊びまで
+  覆うにはそれ以上）．本リポジトリでは **数十本規模（p=51 に対し ≳51 本）の同時投入**が「バブルが埋まる状況」の目安になる．
+- **B-2 主指標はスループット（集約 tokens/sec）であって単発 ITL/TTFT ではない**: continuous batching は per-request の
+  レイテンシを下げるのではなく，早期終了スロットに待機リクエストを詰めて**集約スループット**を上げる仕組み（デコードは
+  s=1 で 1 リクエストでは計算を飽和できず，多数バッチで初めて飽和：haoailab.com CSE234 講義ノート；mbrenndoerfer.com/writing/
+  continuous-batching）．**Iter6 の B6 申し送りが主指標を ITL/TTFT としていた点は，②（スループット感度）では集約 tokens/sec へ
+  差し替えるべき**．単発 ITL は concurrency を上げても下がらない（むしろ僅かに悪化しうる）ため，ITL のまま測ると「効果なし」と
+  誤判定する．
+- **B-3 PP と continuous batching を組んでもバブルは残り，prefill/decode の混在が新たな段間不均衡を生む**: TD-Pipe
+  （arxiv.org/abs/2506.10470）は「continuous batching＋PP は依然バブルに苦しむ」とし，prefill と decode の混在でマイクロバッチ間の
+  仕事量が偏り，速い段が遅い段を待つと指摘．SARATHI 系の chunked prefill は prefill チャンクに decode を相乗り（piggyback）させて
+  PP バブルを縮める（donmoon.medium.com；bentoml.com；IoT 規模の動的マイクロバッチ/トークン予算スケジューリング, MDPI Sensors
+  26(4):1101, mdpi.com/1424-8220/26/4/1101）．**prefill は計算律速でリクエスト間依存が無く 1 リクエストでも段利用率が高い**一方，
+  **バブルが問題になるのは decode 相**という切り分けが重要（Seesaw §2.3；haoailab）．
+- **B-4 CPU クラスタ特有の留意点（本リポジトリの支配項＝計算律速との相互作用）**: 上記文献は GPU（decode がメモリ律速ゆえ
+  バッチ追加が「ほぼ無料」）を前提とする．**本リポジトリは Iter4 で「ITL の 92% が CPU 計算（float32・4 コア）」＝計算律速**と
+  確定済みで，GPU のようなメモリ律速ではない．したがって同時リクエストを段に足すと **各段の GEMM がバッチ次元で線形に重くなり，
+  バッチ追加は「ほぼ無料」にならない**可能性が高い（BLAS の演算強度改善で多少は逓減するが，SL1 の GEMM(K) 測定＝ratio が 1 を
+  大きく下回らなかった傾向と整合）．**それでも throughput は上がりうる**: 現状はどの瞬間も 51 段中 1 段しか働かず利用率 ≒1/51≒2%
+  （Iter4）で，残り 98% は純粋なアイドルだから，同時リクエストでこのアイドルを実仕事に変換できれば集約スループットは段数オーダーで
+  伸びる余地がある．**上限は「全段が常時稼働したときの 1 step 時間＝最遅段の計算時間」**で決まり，計算律速ゆえその天井は
+  GPU ほど高くない，というのが本ハード特有の見立て（推測を含むが Iter4 の計算律速確定と B-2 の理論から導かれる）．
+
+#### C. 本リポジトリのコード上での `NUM_MICRO_BATCHES` の実際の効き（コード読み取り・確定事実）
+
+- **C-1 レバーの唯一の消費者（`_process_microbatch`/`_pipeline_loop`）は serving 経路から呼ばれない＝実質デッドコード**:
+  `NUM_MICRO_BATCHES` を実際に使うのは `_process_microbatch`（`pipeline_inference.py:963-1002`）と，それを
+  `for mb in range(self.config.num_micro_batches)` で回す `_pipeline_loop`（`:1109-1147`）のみ．しかし**実行時の本体ループ
+  `process_pipeline_inference`（`:1004-1107`，`main` が呼ぶのはこちら＝`:2032`）は `_pipeline_loop` を一切呼ばず**，HTTP で来た
+  プロンプトを relay（`_broadcast_prompt_and_wait`→`_relay_request`）でトークン毎・逐次処理するだけである（`:1092-1107`）．
+  さらに `_process_microbatch` は先頭で **`if _relay_active: return`（`:970-972`）** と relay 中は即 return し，リクエストが無い
+  ときの入力は乱数（`recv_buffers[mb].normal_(...)`, `:976`）＝実プロンプトではない．
+- **C-2 したがって現状 `NUM_MICRO_BATCHES` を掃引しても，リクエスト処理のスループットにも ITL にも一切効かない**: 実際に
+  変わるのは (i) `recv_buffers`/`send_buffers` を `num_micro_batches` 本 事前確保するバッファサイズ（`:611-623`）と (ii) 起動ログ 1 行
+  （`:1020`）だけ．**`mise run predict:demo`（relay 経路を叩く）で m を振っても，単発でも複数リクエストでも差はゼロ**というのが，
+  A-2 の「51 段では m∈{2,4,8} は理論上も効かない」よりさらに強い結論（そもそもレバーの消費者が serving 経路で起動しない）．
+- **C-3 relay 経路は 1 リクエスト直列**: `_request_prompt` グローバル 1 個と `_relay_active` ゲートで，リクエストは 1 本ずつ順に
+  処理される（`:1096-1107, 1290, 1739`）．**複数リクエスト同時投入で段を埋めるには relay 経路自体に in-flight batching（複数系列の
+  KV を保持し各 step で段へ相乗り）を実装するホットパス改変が必須**で，これは B12 が警告した「`pipeline_inference.py` ホットパス
+  改変を要する過大設計」に該当し，規模的に SL3/B9（relay プロトコル改修）に隣接する．
+
+#### D. 次フェーズ（rc-planner）への具体的示唆
+
+- **D-1（最重要・方針の岐路）**: 「`NUM_MICRO_BATCHES` を振ってスループット差を測る」を**現行コードのまま実機で回すと差はゼロ**
+  （C-2）．planner は次のいずれかを選ぶ必要がある．
+  - **(案 D-1a) レバー値を 51 段に合わせて拡張し，かつ「レバーが生きている」経路で測る**: config の `[2,4,8]` は 51 段には桁不足
+    （A-2）なので，測るなら m を `{8, 51, 204}`（＝1/p/4p 近傍）まで広げる．ただし生きている消費者は warmup 相当の `_pipeline_loop`
+    だけなので，これを serving 本体から明示的に起動して**乱数パイプラインの集約スループット（step/sec）が m でどう変わるか**を測る
+    小改修に留める案（実プロンプト serving は変えない＝ホットパス非改変寄り）．バブル式 A-1 が実 51 段 Gloo/CPU 上で成り立つかの
+    検証になり，可逆・低リスク．**単一レバー原則に最も忠実**．
+  - **(案 D-1b) 実リクエストのスループットを測るなら in-flight batching のホットパス改変が要る**: relay を複数系列同時処理へ拡張
+    （C-3）．これは規模的に SL3/B9 隣接で **`[needs-human]` 登録が妥当**．B12 が「過大なら SEQ_LEN/STAGGER へ振り替えるか backlog
+    登録」と指示済みの分岐に当たる．
+  - **(案 D-1c) レバーを振り替える**: B12 の代替どおり `SEQ_LEN`（④，KV 上限と品質/メモリ）や `STAGGER_INTERVAL` へ移す．ただし
+    STAGGER は起動時 thundering herd 用で単発 ITL 寄与は小（Iter6 §4 で既述）．
+- **D-2 主指標を ITL/TTFT から集約スループット（tokens/sec, 全同時リクエスト合算）へ差し替える申し送り**: B6 が②の主指標を
+  ITL/TTFT としていたが，②（バブル低減＝スループット）では単発 ITL は原理的に動かない（B-2）．**バブル充填の効果は集約 tokens/sec
+  でしか観測できない**ので，planner は主指標を明示的に集約スループットへ更新すること．
+- **D-3 ワークロード設計の定量目安**: もし実リクエスト concurrency を作る（D-1b）なら，**同時リクエスト数 N を段数オーダー
+  （p=51 に対し 8→32→64 など）で振り**，バブルが N とともに埋まって集約スループットが飽和に向かう曲線を測るのが筋（B-1）．
+  N を段数未満に留めると効果が出ずに「効果なし」と誤判定する（B-2 と同じ落とし穴）．
+- **D-4 CPU 計算律速の天井を明記して過大評価を避ける**: 本ハードは decode がメモリ律速でなく計算律速（Iter4）ゆえ，同時リクエスト
+  追加は各段 GEMM を線形に重くし，GPU のような「バッチはほぼ無料」は成り立たない（B-4）．throughput 向上の天井は「全段常時稼働時の
+  最遅段計算時間」で決まると見立て，planner は期待値を段数倍（理論上限）ではなく計算律速で頭打ちする現実値として設計・報告すること．
+- **D-5 人間判断の要否**: 案 D-1a・D-1c は可逆・低リスクで自律実行可．**案 D-1b（in-flight batching のホットパス改変）を選ぶ場合は
+  規模が SL3/B9 隣接のため `[needs-human]` 登録が妥当**（新規の needs-human 事項候補として planner/reflector へ申し送る）．
+
+**出典**: バブル率 (p−1)/(m+p−1)・GPipe「m≥4×p で無視可」＝ Huang et al. 2019, arxiv.org/abs/1811.06965（GPipe）／Megatron-LM 経由
+解説 perform.digital／PipeFill, arxiv.org/abs/2410.07192／mbrenndoerfer.com（16 段でも 10.5% 残る）；デコードは同時リクエストで
+段を埋める＝ Seesaw, arxiv.org/abs/2503.06433／HF blog tngtech「Prefill and Decode for Concurrent Requests」／haoailab.com CSE234
+講義ノート；continuous batching は集約スループット向上策＝ mbrenndoerfer.com/writing/continuous-batching／bentoml.com；PP＋
+continuous batching のバブル残存・prefill/decode 混在＝ TD-Pipe, arxiv.org/abs/2506.10470／SARATHI chunked prefill, donmoon.medium.com／
+動的マイクロバッチ・トークン予算, MDPI Sensors 26(4):1101, mdpi.com/1424-8220/26/4/1101；コード事実＝
+`pipeline_inference.py:611-623,963-1002,970-972,976,1004-1107,1020,1109-1147,1092-1107,1290,1739,2032`；本リポジトリの計算律速 92%・
+利用率 ≒1/51 ＝ journal Iter4 `### 調査/分析(解釈) (Iter4)`．
+
+---
+
 ## Iteration 6
 
 ### 考察・次計画 (Iter6)
@@ -935,597 +1678,6 @@ GEMV の帯域律速が緩和されるため）．逆に演算強度が上がら
   この追試はクラスタ本体（分散推論）に触れないが SSH を伴うため，実施時は B7 の包括承認（非破壊 SSH は自律可）の範囲内で行う．
 - **やらないこと**: 実機 relay・deploy・`pipeline_inference.py` 改変・推論実行は本イテレーションでは一切行わない．B3 本体
   （SL3: relay プロトコル改修）は backlog B9 として温存し，本 SL1 の `ratio` 結果を添えて別途人間に go/no-go を諮る．
-
----
-
-## Iteration 4
-
-### 考察・次計画 (Iter4)
-
-**担当**: 考察・次計画 subagent（2026-07-19）．分析(解釈) の結論（本ブロック `### 分析(解釈) (Iter4)`）を受け，
-単一レバー「B0: per-stage compute/recv dt の内訳記録」の採否を確定し，次イテレーション（Iteration 5）の方向を決めた．
-実機への新規接続・実行はしていない（記録の読み取りとコミット操作のみ）．
-
-**1. 採否判定: 採用（adopt）**
-
-- **判定根拠**: B0 は診断（計測）レバーであり，判定対象は「7s/token の計算 vs 通信内訳を確定できたか」．計画 §3 の
-  成功条件 4〜6 を実機 3 run で全て充足した（条件4: `n_ranks_reporting=50/50`×3，条件5: `compute+send+residual ==
-  rank0_step_dt` が丸め誤差すら無く厳密一致・X/Y/Z 数値言明可，条件6: 再デプロイなし n=3・中央値集計・step0 分離）．
-  実装フェーズも `pytest` 45 passed（既存 38＋差分 7）・変更 3 ファイル厳守・`pipeline_inference.py` 非改変を満たす．
-  実測（3 run 中央値）は **compute≈92.0%・send≈0.32%・residual≈7.6%** で，「ITL≈7s/token は計算律速」を確定した．
-- **追加反復の要否**: 不要．内訳比率は決定的（純関数集計）な量で run 間ばらつきが 1pp 未満（compute% レンジ 0.27pp），
-  弁別したい「compute ≫ residual ≫ send」の桁違いの大小関係はノイズの数十〜数百倍大きく，n=3 で判定は反転しない．
-- **非自明な学び（次の自分向け）**: (i) **residual 7.6% は「純粋な通信/待機」ではない**．実コード上，最終 rank の
-  final_norm＋lm_head（5376×語彙数の行列積）＋argmax＋全語彙 topk/診断（`pipeline_inference.py:1600-1622`）は
-  `compute dt` にも `send` にも計上されず全て residual に落ちる．正しくは residual ＝段間同期（recv 待ち＋ACK 往復＋
-  Gloo/Python オーバーヘッド）＋最終 rank の未計上計算，と分解すべき．(ii) 調査(Iter4)が B2（診断ログ削減）へ付けていた
-  「compute dt に含まれる可能性が高い」という見立ては**実コード上は否**（f-string 評価順で `compute dt` が先に確定し，
-  `hidden_mean/std/...` はその後に走るため 92% の compute には非含）．これらは B1/B2 の期待効果を大きく下げる知見である．
-
-**2. このレバーの収束状況**
-
-- B0 で「支配項は 50 段の逐次 CPU 計算（float32・4 コア GEMV）で 92%，通信（生転送）は 0.3% で無視できる」が確定し，
-  **「計算律速か通信律速かの弁別」という診断課題は完了（収束）**した．Iter1〜4 と続いた「収集ツールに閉じた非侵襲な
-  基盤/診断」系レバー（①永続化 → (a)RESULT 照合 → (b)levers 堅牢化 → B0 内訳診断）は，ここでやり切った．
-- したがって次は「診断」を離れ，**支配項（92% の compute）そのものを攻めるレバー**へ移す段である．ただし B0 が明らかにした
-  副次事実（residual の内実＝段間同期＋最終 rank の未計上計算）から，B1（WORLD_SIZE 絞り込み）は Σcompute 不変で
-  残差止まり，B2（診断ログ削減）は compute dt 非含で残差の一部止まり，といずれも支配項に効かないことが確定した．
-
-**3. 次に振るレバーの決定（Iteration 5）: B3 を最小サブレバーへ分解し，SL1（compute 上限の local マイクロベンチ）を自動選定**
-
-- **状況**: 分析(解釈) の推奨は B3（speculative decoding）＝支配項の「逐次性」を崩せる唯一の候補．ただし B3 本体は
-  実装規模が大きい（draft モデル追加・relay プロトコル大改修・検証木・51 ノード再デプロイ）．research-cycle の自律判断
-  ポリシー（可逆/小規模は自動選択・不可逆/大規模は人間判断）に照らし，B3 を**そのまま Iteration 5 の単一レバーには
-  しない**．まず実装規模を落とした最小サブレバーへ分解した（複数案，下記）．
-- **B3 の最小サブレバー分解案（実装規模の小さい順）**:
-  - **SL1（採用＝Iteration 5）: compute 側上限の local マイクロベンチ**．目的は，分析(解釈) が挙げた B3 の効き源
-    (ii)「seq_len=1 の GEMV を K 位置まとめた GEMM に変え，4 コア CPU の演算強度/キャッシュ効率を上げる」が
-    **この実機（i5-8350U・4 コア・float32・OpenBLAS/MKL）で実在するか**を，クラスタ本体・relay プロトコルに一切触れず
-    測ること．具体的には，本モデルの実次元（`hidden_size=5376`，ノードあたり 1〜2 層相当の GEMM 形状）で
-    `torch.set_num_threads(4)`・float32 のもと，seq_len=1（GEMV）と seq_len=K（K=2,4,8 の GEMM）の**1 トークンあたり
-    実行時間**を比較する．規模: **小**（単一プロセスのローカル計測スクリプト・重み不要のランダムテンソルで足りる，
-    `pipeline_inference.py` 非改変・再デプロイ不要・破壊的操作なし＝完全に可逆）．リスク: 低．決定価値: **大**．
-    もし GEMM(K) の 1 トークンあたりコストが GEMV とほぼ同じなら B3 の compute 側利得は実在し，大投資の根拠になる．
-    逆に GEMM(K)≈K×GEMV（この CPU では演算強度が上がらない）なら B3 の天井は残差償却（≈7.6% ぶん＝上限 1.08 倍程度）に
-    縮み，**大規模な relay プロトコル改修に見合わない**ことが判明する＝B3 本体 go/no-go の決定的入力になる．
-  - **SL2: draft 戦略の受理率オフライン検証**（prompt-lookup/n-gram draft か小 draft モデル）．K トークン提案の受理率を
-    既存ログ/参照出力で見積もる．規模: 中（参照出力の取得に実機推論を要する場合あり）．relay プロトコル改修は不要だが
-    B3 本体の期待値算定に必要．
-  - **SL3: relay プロトコル改修（K トークン運搬＋検証を 1 往復で行う本体実装）**．規模: **大**・`pipeline_inference.py`
-    ホットパス改変・51 ノード再デプロイを伴い**不可逆側**．どの draft 戦略でも実レイテンシ低減にはこれが避けられない．
-- **決定（自律判断・path (a)）**: Iteration 5 の単一レバーを **SL1** とする．理由は，(1) B3 の最大の不確実性（compute 側
-  利得がこの CPU で実在するか）を near-zero コストかつクラスタ非接触で潰せ，(2) B0 と同じ「作る前に測る」診断の系譜で
-  単一レバー原則に整合し，(3) 完全に可逆で破壊的操作を含まないため**自律判断の範囲内**だからである．backlog に
-  `## B8 [auto-decided 2026-07-19]` として記録した．
-- **人間判断の申し送り（不可逆側の温存）**: SL3（relay プロトコル改修・再デプロイを伴う B3 本体）は**不可逆・大規模**で
-  自律判断の範囲外であり，backlog に `## B9 [needs-human 2026-07-19]` として温存した．**SL1 の結果（compute 側利得の
-  実在有無）を添えて，B3 本体着手の go/no-go を人間に諮る**方針．今回は path (a)（十分小さいサブレバーを自動選定）に
-  該当するため `status="blocked"` にはせず `running` で進める．ただし透明性のため Slack 完了サマリーで
-  `<@U08GLKY1QCW>` に「B3 本体は SL1 の結果を見て別途 go/no-go を諮る」旨を明記し，異論があれば上書きできるようにする．
-- **可逆性**: 次に振るレバーの選定（SL1）であり可逆．破壊的操作を含まない（自動判断とした）．
-
-**次イテレーションへの結論**: Iteration 4（B0 内訳診断）を採用で確定・収束（「7s/token は計算律速・compute 92%」を確定）．
-Iteration 5 は，B3 を最小サブレバーへ分解した SL1（compute 側上限の local マイクロベンチ）を自動選定して開始する．
-B3 本体（SL3: relay プロトコル改修）は不可逆・大規模のため needs-human として温存し，SL1 の結果を添えて go/no-go を諮る．
-
----
-
-### 分析(解釈) (Iter4)
-
-**担当**: 分析(解釈) subagent（2026-07-19）．`## Iteration 4` の全ブロック（調査・計画・実装・実験）と
-`results/Iter4.jsonl`（3 run）を読み，さらに `pipeline_inference.py:1560-1729`（最終 rank／中間 rank の
-per-stage 計時と診断ログの実コード）を Read して，単一レバー「B0: per-stage compute/recv dt の内訳記録」の
-成否・調査一次推定との整合・次レバーへの示唆を解釈した．実機への新規接続・実行はしていない（記録の読み取りのみ）．
-
-**前提（判定の枠組み）**: 本イテレーションの判定対象は「診断（計測）レバーが目的（7s/token の計算 vs 通信内訳の確定）を
-達成したか」であり，レバー効果によるスループット改善そのものではない（B0 はホットパス非改変・掃引なしの計測 run）．
-したがって Iter1 の「n が小さくノイズ幅未知でレバー効果を弁別できない」論点は，ここでは「内訳比率が run 間で安定し，
-バケット間の大小関係が一意に読めるか」という形に置き換わる．
-
-**1. 有意性・再現性: 3 run で内訳比率は安定，成功条件 4〜6 を全て充足．計算律速の判定はノイズに対して頑健**
-
-- **run 間ばらつきはノイズ相当で小さい**: `rank0_step_dt_median_ms` は 7016〜7055ms（幅 39ms＝最大値の 0.55%），
-  `compute_sum_ms_median` は 6443〜6498ms（幅 55ms＝0.85%），`send_sum_ms_median` は 21.5〜25.0ms（幅 3.5ms）．
-  比率換算では compute 91.83%/92.09%/92.10%，send 0.31%/0.32%/0.35%，residual 7.86%/7.59%/7.54% で，**3 run とも
-  compute≈92%・send≈0.3%・residual≈7.6% にほぼ一定**（compute% のレンジ 0.27pp，residual% のレンジ 0.32pp）．
-- **判定は測定ノイズに対して頑健**: 弁別したい命題は「compute ≫ residual ≫ send」という**桁違いの大小関係**であり，
-  その差（92% 対 7.6% 対 0.3%）は run 間変動（1pp 未満）の数十倍〜数百倍大きい．n=3 でも判定が反転する余地は無く，
-  「計算律速」の結論は有意（noise ではなく signal）と断定できる．内訳比率という決定的（純関数集計）な量である点も，
-  Iter1 型のノイズ問題を持ち込まない．
-- **計画 §3 の成功条件（フェーズ4，判定は analyst）を全て充足**:
-  - 条件 4（`n_ranks_reporting ≥ 45`）: 3 run とも **50/50**．許容幅 5 を使わず全 worker が報告．**充足**．
-  - 条件 5（`compute_sum+send_sum+residual ≈ rank0_step_dt` の丸め内成立と，X/Y/Z の数値言明）: 3 run とも
-    **厳密一致**（丸め誤差すら無し．`residual` を減算で導出する実装のため定義上一致するが，入力側集計にバグが無い
-    ことの傍証）．「ITL≈7s/token のうち計算 Σcompute≈92.0%・送信 Σsend≈0.32%・残差≈7.6%」と数値言明でき，
-    `X+Y+Z=100%`．**充足**＝B0 の目的（計算律速か通信律速かの確定）を達成．
-  - 条件 6（`--stage-timing` を n≥3 回・再デプロイなし・代表値中央値・step0 は `prefill_recv_ms_by_rank` 別枠）:
-    3 run 実施・冷開始交絡なし・中央値集計・step0 分離を確認．**充足**．
-- 異常無し（`parse_warnings=[]`×3，`parse_ok=True`，`schema_version=2`，一部ノード到達不可・言語崩れ・発散・OOM 等の
-  想定外挙動は無し）．
-
-**2. 調査(Iter4)一次推定との整合: 「計算律速」を確定．ただし residual の内実は一部修正が要る**
-
-- 調査の一次推定「ホップ数×1 ホップ固定レイテンシ＋各段逐次 CPU 計算の和が支配的．生帯域は律速でない」は，**支配項が
-  各段逐次 CPU 計算である点は実測で確定**した（Σcompute≈6.47s が 7.02s の 92%）．seq_len=1・単一マイクロバッチの
-  自己回帰デコードで 50 段を厳密逐次通過し，任意時刻に 1 段しか稼働しない構造が，そのまま「50 段の float32・4 コア
-  GEMV の和」として ITL に現れている．**通信（send）は 0.3%＝無視できるほど小さい**（21KB/ホップ×50 の生転送は
-  一次推定どおり律速でない）．
-- **修正が要る点（residual の帰属）**: 「残差 7.6%＝recv 待ち＋ACK 往復＋Gloo/Python オーバーヘッド」と**単純に言い切ることは
-  できない**．実コードを読むと，(i) 段間計時の起点 `_t`（`:1588,1694`）は layer ループ直前で，`compute dt`（`:1598,1704`）は
-  layer ループ直後に確定する．(ii) 最終 rank の **final_norm＋lm_head（`F.linear(final_hidden, _lm_head)`＝5376×語彙数の
-  行列積）＋argmax＋全語彙 topk/診断**（`:1600-1622`）は `compute dt` にも `send`（最終 rank は `sent to next` を持たない）
-  にも計上されず，**全て residual に落ちる**．4 コア float32 での lm_head 行列積は非自明なコストであり，residual≈551ms の
-  一部は「未計上の最終 rank 計算」である．したがって正確には **residual ＝ 段間同期（recv 待ち＋ACK 往復＋Gloo/Python
-  オーバーヘッド，≈11ms/ホップ×50）＋ 最終 rank の lm_head・サンプリング・診断（compute dt 未計上分）** と分解すべきで，
-  「純粋な通信/待機オーバーヘッド」ではない．いずれにせよ residual は 7.6% と小さく，**支配項が compute であるという結論は
-  変わらない**．
-- まとめると，言い切れる確定事項は「**ITL≈7s/token は 50 段の逐次 CPU 計算（float32・4 コア GEMV）の累積が支配（≈92%）で，
-  通信（Gloo send/recv の生転送）は無視できる（≈0.3%）**」．残差 7.6% の内実は「段間同期＋最終 rank の未計上計算」であり，
-  通信のみではない．
-
-**3. 次レバーへの示唆: B1/B2 は支配項（92% の compute）に触れられず低効果．B3 のみが計算逐次性を攻める**
-
-- **B1（WORLD_SIZE 絞り込み 51→21/11）は計算律速下では低効果**: 60 層の総計算量はノード分割の粒度に依らず一定であり，
-  ホップ数を 50→10 に減らしても **Σcompute はほぼ不変**（ノードあたり層数が増え 1 段の計算時間は逆に増えるため，
-  積＝総和は保存）．B1 が削れるのは residual（段間同期部分＝7.6% の一部）と send（0.3%）の一部に限られ，**上限で数 %**．
-  かつ再デプロイ・実機 run・人間確認を要する．調査が B1 に与えていた「ホップ律速 vs 計算律速の弁別」という診断価値は
-  **B0 が既に解消済み**のため，B1 の残る意義は小さい．**優先度は下げる**．
-- **B2（毎ステップ診断ログ削減）も支配項に効かない**: 実コードで確認したところ，`compute dt` は f-string 評価順で
-  `_time.monotonic()-_t` が**先に確定**し，同一ログ行の `hidden_mean/std/min/max`（`:1598,1704`）はその**後**に走るため，
-  **診断リダクションは `compute dt`（92%）に含まれていない**．中間 rank の診断は `sent_to_next−compute`＝send バケット
-  （合計 21ms＝負担ゼロに近い）へ，最終 rank の全語彙 topk/診断（`:1605,1609,1616,1619`）は residual へ落ちる．よって B2 で
-  削減できるのは send（無視可能）と residual の一部（最終 rank 1 個ぶん）に限られ，**92% の compute には一切触れられない**．
-  「安価だが効果は残差の一部＝上限 1% 未満」であり，ホットパス改変＋再デプロイ＋人間確認のコストに見合わない．調査が
-  B2 に付けていた「compute dt に含まれる可能性が高い」という見立ては，実コード上は**否**（含まれない）と修正する．
-- **B3（speculative decoding）が計算律速に唯一整合する方向**: 支配項が「1 トークンずつ 50 段を逐次通過する CPU 計算」で
-  ある以上，レイテンシを下げるには**逐次性そのもの**を崩す必要がある．文献（FlowSpec/PipeDec）の 1.36–1.77× の出所は，
-  (i) 段間同期・パイプライン充填の固定費（residual 相当）を K トークンに 1 回へ**償却**，(ii) seq_len=1 の GEMV を K 位置
-  まとめた GEMM に変え **4 コア CPU の演算強度/キャッシュ利用効率を上げる**（K 位置は K× の単純逐次より安い），
-  (iii) draft がパイプラインをより多くの位置で稼働させ利用率（現状≒1/51）を上げる，の 3 点にある．**計算律速下でも
-  効く源が (ii) 演算強度改善という形で存在する**点が重要で，B1/B2 の「残差いじり」とは効きどころの桁が違う．ただし
-  実装規模は大（draft モデル追加・relay プロトコル大改修・検証木・再デプロイ）で，単一レバー原則には過大．
-
-**4. このイテレーション（B0）の採否: 採用（adopt）**
-
-- B0 は計測（診断）レバーで，計画（§3 成功条件 1〜6）・実装（`pytest` 45 passed・変更 3 ファイル厳守）・実機実証
-  （50/50 到達・内訳厳密一致・warning 無し）が全て揃い，目的「7s/token の計算 vs 通信内訳の確定」を達成した．
-  レイテンシは下げない性質のレバーだが，Iter1〜3 と同じ「収集ツールに閉じた非侵襲な基盤/診断」系として**採用で確定**．
-  追加反復は不要（内訳は決定的量で 3 run 安定，判定に曖昧さが無い）．
-
-**次イテレーションへの推奨（単一レバー，1 つ）**: **B3（speculative decoding）を Iteration 5 のレバー方向とする**．
-理由は，B0 で「92% が 50 段逐次 CPU 計算＝計算律速」が確定し，config `levers`／backlog の候補のうち**支配項（compute）を
-攻められるのは B3 のみ**（B1 は Σcompute 不変で残差止まり，B2 は compute dt に非含で残差の一部止まり）だからである．
-ただし B3 は実装規模が大きく単一レバー原則に対して過大なので，**考察・次計画フェーズは (a) 実機 deploy／プロトコル改修を
-伴うため Slack で人間の go/no-go を取り，(b) 最小サブレバー（例: rank0 に小 draft モデル＋K=2 の 1 往復検証プロトタイプを
-縮小 WORLD_SIZE で高速反復）へ分解する**ことを条件に据えること．B1/B2 は「残差 7.6%／送信 0.3% の一部を削る低効果レバー」
-として優先度を下げ，必要になれば後続で扱う．
-
----
-
-### 実験 (Iter4)
-
-**担当**: 実験フェーズ subagent（2026-07-19）．実装済みの `--stage-timing` 拡張（本ブロック直下 `### 実装 (Iter4)`）を用い，
-稼働中の実機クラスタ（51 ノード）に対し計画 §2-D の正式手順で測定 run を実施した．コード変更・再デプロイは行っていない
-（既存稼働イメージのログ収集のみ）．
-
-**1. 事前確認**
-
-- `mise run status`（`uv run python tools/healthcheck.py`）: rank0（wafl-ctrl1）＋ rank1〜50（wafl100-139/200-209）の
-  **51/51 ノードが Healthy**（SSH／Docker daemon／`distributed-llm` container running／モデル重み配置／MTU=1500 すべて OK）．
-  再デプロイは不要と判断し，`mise run deploy` は実行していない．
-
-**2. 実行コマンド（n=3 回，固定構成，掃引なし）**
-
-```
-unset VIRTUAL_ENV && uv run python tools/collect_results.py --iter Iter4 --stage-timing --prompt "Hello!"
-```
-
-`mise run predict:demo` ではなく上記直接呼び出しを使用（申し送りどおり，`predict:demo` タスク自体には
-`--stage-timing` が渡されないため）．3 回とも正常終了（`appended 1 record to results/Iter4.jsonl`），
-`results/Iter4.jsonl` は 0 行 → 3 行へ増加（各回実行直後に行数を確認し 1 行ずつの追記を確認済み）．
-
-| run | timestamp (UTC) | tokens_per_sec | parse_ok |
-|---|---|---|---|
-| 1 | 2026-07-19T01:01:20Z | 0.0977 | True |
-| 2 | 2026-07-19T01:04:32Z | 0.0982 | True |
-| 3 | 2026-07-19T01:07:42Z | 0.0975 | True |
-
-**3. `timing_breakdown` の内訳（n_ranks_reporting は全 run で 50/50，欠損なし）**
-
-| run | compute_sum_ms_median | send_sum_ms_median | residual_ms_median | rank0_step_dt_median_ms | n_ranks_reporting |
-|---|---|---|---|---|---|
-| 1 | 6443.0 | 21.5 | 551.5 | 7016.0 | 50 |
-| 2 | 6482.0 | 22.5 | 534.5 | 7039.0 | 50 |
-| 3 | 6498.0 | 25.0 | 532.0 | 7055.0 | 50 |
-
-- **検算**（`compute_sum + send_sum + residual == rank0_step_dt`）: 3 run とも厳密一致（run1: 6443.0+21.5+551.5=7016.0，
-  run2: 6482.0+22.5+534.5=7039.0，run3: 6498.0+25.0+532.0=7055.0）．丸め誤差すら無く成立（`build_timing_breakdown` が
-  残差を減算で導出する実装のため定義上一致するが，入力側の中央値集計にバグが無いことの確認として有効）．
-- **比率換算**（参考，判定は分析(解釈)フェーズが行う）: compute 比率 91.8%/92.1%/92.1%，send 比率 0.31%/0.32%/0.35%，
-  residual 比率 7.86%/7.59%/7.54%．3 run でほぼ一定．
-- **run 間ばらつき**: `rank0_step_dt_median_ms` は 7016〜7055ms（幅 39ms，最大値の 0.55%）．`compute_sum_ms_median` は
-  6443〜6498ms（幅 55ms，0.85%）．`send_sum_ms_median` は 21.5〜25.0ms（幅 3.5ms）．いずれも粗く見て run 間変動は小さい
-  （詳細な統計判定は次フェーズに委ねる）．
-
-**4. 異常の有無**
-
-- `parse_warnings` は 3 run とも空配列（`[]`）．SSH 失敗・負差分除外の warning は一切無かった．
-- `n_ranks_reporting=50`（＝rank1〜50 の全 worker）が 3 run とも達成．計画の成功条件 4（`≥45`）を余裕をもって満たす．
-  50 ノード全到達という意味で，一部ノード到達不可等の障害も発生しなかった．
-- `schema_version=2`，`parse_ok=True`，`stage_timing`／`timing_breakdown` とも non-null を 3 run 全てで確認．
-- 想定外の障害・タイムアウト・コード上のエラーは無かった．各 run の所要時間は開始から完了通知まで概ね 3 分強
-  （ヘルスチェック含め全体で計 15 分弱）．
-
----
-
-### 実装 (Iter4)
-
-**担当**: 実装フェーズ subagent（2026-07-19）．計画（本ブロック直下 `### 計画 (Iter4)` §2・§4）に従い，単一レバー
-「B0: per-stage compute/recv dt の内訳記録」を最小差分で実装した．`pipeline_inference.py`／`tools/predict.py`／
-`tools/common.py` は非改変（既存関数を import して再利用するのみ）．実機クラスタへの接続・deploy／推論実行は行っていない
-（コード実装とローカル単体テストのみ）．
-
-**1. 変更ファイル（3 つのみ，計画どおり）**
-
-- **`tools/collect_results.py`**:
-  - 正規表現 3 本を新設（`_COMPUTE_DT_RE`／`_RECV_HIDDEN_DT_RE`／`_SENT_TO_NEXT_DT_RE`）．秒→ms 変換定数
-    `_SEC_TO_MS = 1000.0` を追加（マジックナンバー回避）．
-  - `NodeStageTiming` dataclass（`rank`／`compute_dt_ms_by_step`／`recv_hidden_dt_ms_step0`／
-    `sent_to_next_dt_ms_by_step`）と純関数 `parse_node_stage_timing(log_text)` を追加．`_LOG_LINE_RE` で
-    `[R{rank} LEVEL] ...` の本文部分を取り出し，マッチしない行はそのまま本文として 3 正規表現に照合する
-    （RESULT のような複数行本文が絡まないため `_extract_rank0_messages` の継続行連結ロジックは不要と判断）．
-  - `StageTimingSummary` dataclass と集約関数 `aggregate_stage_timing(nodes)` を追加．send は同一 step の
-    `sent_to_next_dt − compute_dt`（中間 rank のみ．最終 rank は `sent_to_next` を持たないため自動除外）で近似．
-    差分が負になるケース（ログ欠損・step 対応ずれ）は 0 クランプせず，`(rank, step)` を除外して warning を積む
-    （黙って歪めない．計画 §2-B のとおり実装）．デコードステップ（`step ≥ _FIRST_DECODE_STEP = 1`）のみを
-    中央値集計の対象とし，step0（prefill）は `prefill_recv_ms_by_rank` に分離した．
-  - `build_timing_breakdown(step_dt, summary)` を追加．`residual_ms_median = rank0_step_dt_median_ms −
-    compute_sum_ms_median − send_sum_ms_median`（いずれかが `None` なら残差も `None`，捏造しない）．
-  - `build_record` に `stage_timing`／`timing_breakdown`（いずれも既定 `None`）フィールドを追加．
-    `SCHEMA_VERSION` を **1 → 2** に更新．`--stage-timing` 未指定（既定）では両フィールドとも `null` のまま
-    JSONL へ出力され，Iteration 1〜3 の v1 レコードと後方互換．
-  - `run_and_collect` に `stage_timing: bool = False` 引数を追加．`True` のときのみ
-    `collect_worker_stage_timing_logs(config, run_start)`（新設）を呼び，`read_hosts(config.hosts_file)` で
-    rank1 以降の worker（`hosts[i]` = rank i，rank0 は `collect_rank0_log` で取得済みのためスキップ）へ
-    `ssh_via_master(...)` 経由で `docker logs --since {since} distributed-llm 2>&1` を取得する．
-    `concurrent.futures.ThreadPoolExecutor(max_workers=_STAGE_TIMING_MAX_WORKERS=8)` で並列化し，個々の SSH
-    失敗は握りつぶさず `parse_warnings` に積んで成功ノードのみで集約を継続する．
-  - `main()` に `--stage-timing`（`action="store_true"`，既定 off）を追加し，`run_and_collect` へ伝播した．
-  - モジュール冒頭 docstring を `--stage-timing` の説明・使用例を含む形へ更新．
-
-- **`tests/test_collect_results.py`**: TS1〜TS6 を新設（計画の「任意」TS7 は，既存の
-  `test_build_record_contains_all_schema_keys_and_is_json_serializable` に `stage_timing`／`timing_breakdown`
-  が `None`（後方互換）であることの assert を追加する形で吸収し，別テストとしては独立させなかった）．
-  - TS1〜TS3: 3 正規表現の抽出・非衝突（`_COMPUTE_DT_RE` と `_SENT_TO_NEXT_DT_RE` の誤マッチ無し等）を確認．
-  - TS4: `[R7 INFO]` 形式の物理ログから `parse_node_stage_timing` が rank・compute/recv/send を ms 単位で正しく構築．
-  - TS5: `aggregate_stage_timing` が複数ノードの `NodeStageTiming` から step 別総和を計算し，最終 rank
-    （`sent_to_next_dt_ms_by_step={}`）が送信総和に含まれないことを確認．補足テストとして，
-    `sent_to_next < compute` の負差分ケースが 0 クランプされず除外・warning 付与されることも確認．
-  - TS6: `build_timing_breakdown` が返す `compute_sum_ms_median + send_sum_ms_median + residual_ms_median ==
-    rank0_step_dt_median_ms`（丸め許容）の検算が成立することを確認．
-  - 新規 `.log` フィクスチャファイルは作成せず，全てインライン文字列で与えた（Iter2 の `.gitignore` `*.log`
-    トラップ回避，計画の指示どおり）．
-
-- **`mise.toml`**: `[tasks."predict:demo"]` の `run` を
-  `'uv run python tools/collect_results.py --iter Iter1 --prompt "Hello!"'` から
-  `'uv run python tools/collect_results.py --iter "${ITER:-Iter1}" --prompt "Hello!"'` へ変更．
-  `ITER` 環境変数が無ければ既定 `Iter1`（後方互換・非破壊）．B0 の測定 run では `ITER=Iter4 mise run
-  predict:demo` あるいは `collect_results.py --iter Iter4 --stage-timing` を正式手順とする（計画 §2-D）．
-
-**2. 検証結果**
-
-- `uv run python -m py_compile tools/collect_results.py tests/test_collect_results.py`: エラー無し．
-- `unset VIRTUAL_ENV && uv run pytest tests/ -v`: **45 passed, 0 failed/error**（既存 38 件＋新規 TS1〜TS6
-  相当 6 件＋既存 `test_build_record_...` 1 件への assert 追加＝差分 7 件，合計 45 件．計画の「合計 44 件以上」を
-  満たす）．`VIRTUAL_ENV` が別リポジトリ（WAFL-PEFT）の `.venv` を指す環境変数汚染があったため `unset` してから
-  実行した（`uv run` 単体では warning が出るのみで実害は無いが，明示のため記録する）．
-- `git status --short`: 変更ファイルは `mise.toml`／`tests/test_collect_results.py`／`tools/collect_results.py`
-  の 3 つのみ（新規 `.log` 等の混入無し）．`.claude/research/journal.md`／`state.json` の差分は計画フェーズが
-  作業前から持ち込んでいた未コミット変更であり，本実装フェーズでは触れていない．
-
-**3. 気づいた点・申し送り**
-
-- `parse_node_stage_timing` は worker ログにブロック開始マーカー（`Rank 0: prompt=`）が無い前提のため，複数 run が
-  同一 `--since` 窓に混在すると компute/send が別 run のものと混ざる余地が残る（計画が明記した既知の限界．
-  `--iter` 変数化＋単発運用で回避する運用側の前提）．
-- `collect_worker_stage_timing_logs`／`run_and_collect` の `--stage-timing` 分岐は SSH を伴うため計画どおり
-  単体テスト対象外とした（Iter1〜3 の `run_and_collect` と同じ扱い．手動レビューで `read_hosts` の返す順序
-  （`hosts[i]` = rank i）と rank0 スキップのオフセット（`range(1, len(hosts))`）を確認済み）．
-- フェーズ4（実機 `--stage-timing` 測定 run）は計画のとおり，着手前に B1 の合意に基づき Slack で人間確認が必要
-  （本実装フェーズでは実施していない）．
-- **実験を開始してよい状態か**: コード実装・単体テストは完了しフェーズ4 に進める状態にあるが，フェーズ4 の着手
-  （51 ノードへの SSH 並列 `docker logs` 取得を伴う実機 run）自体は計画が明記したとおり別途人間確認が必要であり，
-  本実装フェーズの完了はその確認を代替しない．
-
----
-
-### 計画 (Iter4)
-
-**担当**: 計画フェーズ subagent（2026-07-19）．単一レバー「B0: per-stage の compute/recv 時間内訳を results/Iter4.jsonl へ集約し，
-ITL≈7s/token の計算 vs 通信のボトルネックを診断する」（本ブロック下 `### 調査 (Iter4)` の推奨第一手，backlog B6）を，
-実コード（`pipeline_inference.py` の該当ログ行・`tools/collect_results.py` 全体・`tools/common.py` の SSH/hosts 機構・`mise.toml`）を
-Read して実装可能な粒度へ落とし込んだ．**本イテレーションのフェーズ2・3 はコード実装・単体テストのみで，実機クラスタへの
-deploy／推論実行は行わない**（フェーズ4は B1 の人間確認後にオーケストレータが着手する）．前担当（rc-planner）がセッション制限で
-中断したため引き継ぎ発見を実コードで再検証したうえでゼロから確定した．
-
-#### 0. コードで再検証した前提（計画の土台）
-
-- **per-stage の時間ログは rank0 ではなく中間 rank・最終 rank のログにのみ出る**（引き継ぎ発見①は正しい）．
-  - `compute dt`: 最終 rank `pipeline_inference.py:1598`，中間 rank `:1704`．物理行
-    `[R{N} INFO] Rank {N}: step {step} compute dt={x:.3f}s hidden_mean=... hidden_std=...`．**全デコードステップで出る**．
-  - `recv_hidden dt`: 最終 rank `:1573`，中間 rank `:1677`．物理行 `[R{N} INFO] Rank {N}: recv_hidden dt={x:.3f}s`．
-    **`is_first`（step0＝prefill 受信）でのみ出る**（step>0 の else 分岐 `:1574-1586`/`:1678-1692` には無い）．
-  - 中間 rank `sent to next dt`: `:1714`．物理行 `[R{N} INFO] Rank {N}: step {step} sent to next dt={x:.3f}s`．**毎ステップ出る**．
-    `_t`（`:1694`．irecv 完了後の計算開始）起点で計測されるため **compute+send を含み，recv 待ちは含まない**．
-  - rank0（`:1439-1540`）は per-stage の計算/受信時間を持たず，`Rank 0: step N done ... dt=...s`（`:1532`，現行 `step_dt` の源）＝
-    そのトークンの 51 段一周の総時間（≒7s）だけを出す．最終 rank の post-compute（final_norm+lm_head+argmax+送信+ACK）は
-    個別 INFO 行はあるが単一 dt では計時されない（残差に吸収する）．
-- **worker ノードへの到達手段は既存コードで足りる**（引き継ぎ発見②は正しい）．`tools/common.py:424 ssh_via_master(user,
-  master_addr, target_host, command)` が local→master→target の ProxyJump．`read_hosts(config.hosts_file)`（`:292`）は IP を
-  返し**行順＝rank 番号**（`hosts[i]` が rank i）．各ノードのコンテナ名は `distributed-llm`（`collect_rank0_log:527` が
-  `docker logs ... distributed-llm` を使用）．各コンテナは 1 プロセス＝1 rank なので，そのノードの `docker logs` には
-  当該 rank の `[R{i} ...]` 行しか出ない．
-- **B0 は `pipeline_inference.py` 改変・再デプロイ不要**．上記ログ行は Iter3 デプロイより前から存在し，稼働中イメージに
-  既に含まれる．よって B0 は **収集側（ローカル実行の `tools/collect_results.py`）の拡張だけ**で成立し，ホットパス非改変・
-  再デプロイ不要・冷開始交絡（再初期化 348s）なし．Iter1〜3 と同じ「収集ツールに閉じた・非侵襲」性質のイテレーションである．
-- **`mise.toml:123` の `predict:demo` は `--iter Iter1` 固定**（引き継ぎ発見③は正しい．backlog B6）．B0 の測定 run が
-  `results/Iter1.jsonl` に混在しないよう本計画で解消する（下記 §2-D）．
-
-#### 1. 仮説
-
-ITL≈7s/token を，非 rank0 全ノードの既存ログから **段別 compute 時間の総和 Σcompute と，段間 send 時間の総和 Σsend** に
-分解して記録すれば，rank0 の `step_dt`（≒7s）に対し **残差 residual = step_dt − Σcompute − Σsend**（recv 待ち＋ACK 往復＋
-Gloo/Python オーバーヘッド＋rank0/最終 rank の周辺処理）を算出でき，7s/token が **計算律速か通信律速かを 1 回の測定で確定** できる．
-これは調査の一次推定（「ホップ数×1 ホップ固定レイテンシ＋各段逐次 CPU 計算の和が支配的」）を実測で検証し，次イテレーション以降の
-レバー選択（通信律速なら B1: WORLD_SIZE 削減，計算律速なら B2: ホットループ診断ログ削減）を根拠づける土台になる．
-
-#### 2. 単一レバー・変更内容
-
-**単一レバー**: 「results に記録する情報を，rank0 単独の集計から **非 rank0 全ノードの per-stage 時間内訳へ拡張する**」の 1 点．
-**固定する構成（直近最良＝Iter3 の既定値，掃引しない）**: `WORLD_SIZE=51`，`NUM_MICRO_BATCHES=4`，`STAGGER_INTERVAL=3.0`，
-`SEQ_LEN=1`，prompt=`"Hello!"`，稼働中の 51 ノード実機（再デプロイなし）．B1（WORLD_SIZE 絞り込み）以降は本測定で内訳が確定した後の
-**次点候補**として温存する（本イテレーションでは振らない）．
-
-変更ファイルは **`tools/collect_results.py`（段別時間の収集・パース・記録を追加）**，**`tests/test_collect_results.py`（テスト追加）**，
-**`mise.toml`（`--iter` 変数化）** の 3 つのみ．**`pipeline_inference.py`／`tools/predict.py`／`tools/common.py` は非改変**（既存関数を
-import して再利用するのみ）．
-
-**(A) パース純関数の追加（`tools/collect_results.py`．既存 `_PROMPT_TOKENS_EMBED_RE` 群と同じ場所・同型で単体テスト可能に）**
-
-- 正規表現 3 本を新設する（`compute dt`/`sent to next dt` は行末に `hidden_...` が続くため `$` 終端にせず prefix マッチ）:
-  ```python
-  _COMPUTE_DT_RE      = re.compile(r"^Rank (\d+): step (\d+) compute dt=([\d.]+)s")
-  _RECV_HIDDEN_DT_RE  = re.compile(r"^Rank (\d+): recv_hidden dt=([\d.]+)s$")
-  _SENT_TO_NEXT_DT_RE = re.compile(r"^Rank (\d+): step (\d+) sent to next dt=([\d.]+)s$")
-  ```
-- 1 ノード分のログテキストから段別時間を抽出する純関数を新設する（既存 `_extract_rank0_messages` は `R0` 限定で流用できないため，
-  ANSI 除去＋`_LOG_LINE_RE` で全 rank の本文を取り出す軽量版を使うか，本文行の `Rank (\d+):` から rank を検出する）:
-  ```python
-  @dataclass
-  class NodeStageTiming:
-      rank: int | None                 # ログ本文 "Rank {N}:" から検出（ノード=1 rank）
-      compute_dt_ms_by_step: dict[int, float]     # step -> compute dt（ms）
-      recv_hidden_dt_ms_step0: float | None       # step0 の prefill 受信時間（ms）．無ければ None
-      sent_to_next_dt_ms_by_step: dict[int, float]  # 中間 rank のみ．最終 rank は空
-
-  def parse_node_stage_timing(log_text: str) -> NodeStageTiming: ...
-  ```
-  秒→ミリ秒は `round(sec * 1000, 3)` で保持（フィールド名も `_ms` 接尾辞で単位を明示）．マジックナンバー 1000 は
-  定数 `_SEC_TO_MS = 1000.0` として定義する．
-- **`--since {run_start}` 窓で当該 run に限定**するため，worker ログでも `collect_rank0_log` と同じ `--since` を使う（下記 C）．
-  worker ログには rank0 の `Rank 0: prompt='...'` 開始マーカーが無く `_split_into_blocks` は使えないが，単発プロンプトの診断 run
-  かつ `--since` で測定 run に絞るためブロック分割は不要（複数 run 混在は §2-D の `--iter` 変数化＋運用で回避）．この前提を
-  docstring に明記する．
-
-**(B) 集約・導出（純関数．単体テスト可能）**
-
-- 全ノードの `NodeStageTiming` を集約し，**デコードステップ（step≥1）** ごとに横断集計する（step0 は prefill/TTFT で桁が違うため分離）:
-  ```python
-  @dataclass
-  class StageTimingSummary:
-      n_ranks_reporting: int              # compute dt を報告できた非 rank0 rank 数
-      compute_sum_ms_by_step: dict[int, float]   # Σ_ranks compute（step 別）
-      send_sum_ms_by_step: dict[int, float]      # Σ_intermediate (sent_to_next − compute)（step 別）
-      # 代表値（デコードステップ中央値）
-      compute_sum_ms_median: float | None
-      send_sum_ms_median: float | None
-      prefill_recv_ms_by_rank: dict[int, float]  # step0 recv_hidden（rank 別．prefill 診断用）
-  ```
-  send は中間 rank の `sent_to_next_dt − compute_dt`（同 step）で近似する（`_t` 起点の差分＝送信区間）．最終 rank は send を
-  持たない（token_id を rank0 へ返すのみ）ため送信総和には含めない．
-- `build_record` 側で rank0 の `step_dt`（既存 `derived`/`parsed.step_dt`）と突き合わせ，**残差** を算出する:
-  `residual_ms_by_step[s] = step_dt[s]*1000 − compute_sum_ms_by_step[s] − send_sum_ms_by_step[s]`．
-  代表値として `timing_breakdown = {compute_sum_ms_median, send_sum_ms_median, residual_ms_median, rank0_step_dt_median_ms,
-  n_ranks_reporting}` を記録する（`compute+send+residual ≈ rank0_step_dt` が丸め誤差内で成立することを分析で検算できる）．
-
-**(C) 実機収集の拡張（`run_and_collect`．SSH を伴うため単体テスト対象外，Iter1〜3 と同じ扱い）**
-
-- `--stage-timing`（`action="store_true"`，既定 off）フラグを新設する．**off のとき現行挙動を完全に維持**（通常の `predict:demo`
-  相当 run を重くしない）．on のときのみ以下を追加実行する:
-  1. `hosts = read_hosts(config.hosts_file)` を取得（`hosts[i]`＝rank i）．rank0（`hosts[0]`＝master 自身）は既存 `collect_rank0_log`
-     が取得済みのためスキップし，**rank 1..len(hosts)-1** の worker から `ssh_via_master(config.ssh_user, config.master_addr,
-     hosts[i], f"docker logs --since {since} distributed-llm 2>&1", timeout=DOCKER_LOGS_SSH_TIMEOUT_SEC)` でログ取得する．
-  2. SSH は `concurrent.futures.ThreadPoolExecutor`（最大同時数は定数 `_STAGE_TIMING_MAX_WORKERS = 8` 程度）で並列化する
-     （50 ノード逐次×数秒は遅いため）．**個々のノードの SSH 失敗は握りつぶさず** `parse_warnings` に
-     `f"failed to fetch rank {i} docker logs: {stderr}"` を積み，成功ノードのみで集約を続行する（一部欠損を許容）．
-  3. 集約結果を `stage_timing`（rank 別の per-step 内訳．JSON 量が過大なら rank 別に compute の中央値＋step0 recv のみへ間引く．
-     初版は raw dict を保持し，肥大化が問題なら間引く方針を docstring に記す）と `timing_breakdown`（§2-B の代表値）として record へ追加する．
-- **スキーマ変更**: 新規フィールド `stage_timing`／`timing_breakdown` を追加し，`--stage-timing` off の run では両者を `null` とする
-  （既存 Iter1〜3 の v1 レコードと後方互換）．`SCHEMA_VERSION` を **2** へ上げ，v2＝段別時間フィールドを含み得ることを示す
-  （`build_record` の docstring も更新する）．
-
-**(D) `mise.toml` の `--iter` 変数化（backlog B6 の解消．非破壊）**
-
-- `mise.toml:123` を `--iter Iter1` 固定から env 上書き可能へ変更する（既定は Iter1 のまま＝後方互換）:
-  `run = 'uv run python tools/collect_results.py --iter "${ITER:-Iter1}" --prompt "${PROMPT:-Hello!}"'`．
-  B0 の測定 run は `ITER=Iter4 mise run predict:demo` あるいは
-  `uv run python tools/collect_results.py --iter Iter4 --stage-timing --prompt "Hello!"` を正式手順とする（フェーズ4 の実験計画で採用）．
-  これで複数 run が `Iter1.jsonl` に混在する実害（B6）を絶つ．**公開タスクの semantics 変更**にあたるため実装フェーズは既定値維持
-  （非破壊）を厳守すること．
-
-#### 3. 成功条件（measurable）
-
-本イテレーションのフェーズ2・3（実装・単体テスト）の完了条件は決定的で，以下を全て満たすこと:
-
-1. **単体テスト（新規，最低 6 件）が green，既存 38 件が回帰なし**（合計 44 件以上 passed，failed/error 0）:
-   - TS1: `_COMPUTE_DT_RE` が `Rank 7: step 3 compute dt=0.123s hidden_mean=...` から `(rank=7, step=3, dt=0.123)` を取り出す．
-   - TS2: `_RECV_HIDDEN_DT_RE` が `Rank 7: recv_hidden dt=1.234s` を取り出し，step>0 行（recv_hidden 無し）では None．
-   - TS3: `_SENT_TO_NEXT_DT_RE` が `Rank 7: step 3 sent to next dt=0.456s` を取り出す（`compute dt` 行と誤マッチしない）．
-   - TS4: `parse_node_stage_timing` が `[R7 INFO] ...` を含む 1 ノードログ全体から rank=7・compute_dt_ms_by_step・
-     recv_hidden_dt_ms_step0・sent_to_next_dt_ms_by_step を正しく構築し，単位が ms（秒×1000）で入る．
-   - TS5: 集約 `StageTimingSummary` が複数ノードから `compute_sum_ms_by_step`／`send_sum_ms_by_step` を step 別に加算し，
-     `send = sent_to_next − compute` の差分が負にならない健全ケースで正の値を返す（最終 rank が send 総和に含まれない）．
-   - TS6: 残差計算が `residual = rank0_step_dt_ms − compute_sum_ms − send_sum_ms` を返し，
-     `compute_sum + send_sum + residual == rank0_step_dt_ms`（丸め許容）を満たす．
-   - （任意）TS7: `--stage-timing` off 相当で `stage_timing`／`timing_breakdown` が `null`，かつ既存レコード形と後方互換．
-2. `uv run python -m py_compile tools/collect_results.py tests/test_collect_results.py` がエラー無し．
-3. コード変更が `tools/collect_results.py`／`tests/test_collect_results.py`／`mise.toml` の **3 ファイルのみ**
-   （`pipeline_inference.py`／`tools/predict.py`／`tools/common.py` 非改変，`git status` に新規 `.log` フィクスチャ混入なし）．
-
-フェーズ4（実機測定．B1 の人間確認後）での成功条件（本計画が指定，判定は analyst）:
-
-4. `ITER=Iter4 ... --stage-timing` の測定 run 後，`results/Iter4.jsonl` の当該レコードに `stage_timing`／`timing_breakdown` が
-   非 null で入り，**`timing_breakdown.n_ranks_reporting ≥ 45`**（50 worker 中，SSH/欠損の許容幅 5）で
-   compute_dt が集まっていること．
-5. `timing_breakdown` から **「ITL≈7s/token のうち計算（Σcompute）が X%・送信（Σsend）が Y%・残差（recv 待ち＋ACK＋
-   オーバーヘッド）が Z%」を数値で言明でき**，`X+Y+Z=100%`（丸め誤差内，`compute_sum+send_sum+residual ≈ rank0_step_dt` が
-   成立）していること．これにより「7s/token は計算律速か通信律速か」が判定可能になる＝B0 の目的達成．
-6. 測定は稼働中クラスタに対し `--stage-timing` run を **n≥3 回**（再デプロイなし＝冷開始交絡なし）実施し，代表値は中央値を採る
-   （run 間ばらつきの把握）．step0（prefill/TTFT）は `prefill_recv_ms_by_rank` で別枠診断する．
-
-#### 4. 実装フェーズ（rc-implementer）への申し送り
-
-- **対象ファイルと設定キー**:
-  - `tools/collect_results.py`: (A) 正規表現 `_COMPUTE_DT_RE`/`_RECV_HIDDEN_DT_RE`/`_SENT_TO_NEXT_DT_RE`・`NodeStageTiming`・
-    `parse_node_stage_timing`，(B) `StageTimingSummary`・集約/残差の純関数，(C) `run_and_collect` に `--stage-timing` 分岐と
-    ThreadPoolExecutor 並列 SSH（定数 `_STAGE_TIMING_MAX_WORKERS`・`_SEC_TO_MS`），`build_record` へ `stage_timing`/
-    `timing_breakdown` フィールド追加，`SCHEMA_VERSION=2`，`main()` に `--stage-timing` 引数追加．
-  - `tests/test_collect_results.py`: TS1〜TS6（＋任意 TS7）．物理ログは `[R{N} INFO] ...` プレフィックス付きインライン文字列で与え，
-    **新規 `.log` フィクスチャは作らない**（Iter2 の `*.log` gitignore トラップ回避）．
-  - `mise.toml`: `[tasks."predict:demo"]` の `run` を `--iter "${ITER:-Iter1}"`（＋任意で `--prompt "${PROMPT:-Hello!}"`）へ変数化
-    （既定値維持＝非破壊）．
-- **注意点**:
-  - `pipeline_inference.py` は**触らない**（ログは既存・稼働中イメージに含まれる＝再デプロイ不要）．これにより B0 はホットパス
-    非改変で，フェーズ4 は再デプロイなしの `--stage-timing` run のみで足りる（冷開始 348s を回避）．
-  - `send = sent_to_next_dt − compute_dt` の差分が負になる（ログ欠損・step 対応ずれ）ケースは 0 クランプせず warning を積み，
-    当該 step を集約から除外する（黙って歪めない）．
-  - worker ログにブロック開始マーカーが無いため `--since {run_start}` で run を限定する前提を守る（複数 run 混在は `--iter`
-    変数化＋単発運用で回避）．
-  - **フェーズ4（実機 `--stage-timing` 測定 run）は B1 の合意通り着手前に Slack で人間確認が必須**（再デプロイは不要だが 51 ノードへ
-    SSH で `docker logs` を並列取得するため，B1 のスコープに含める）．フェーズ2・3（実装・単体テスト）はローカルのみで進行可能．
-
----
-
-### 調査 (Iter4)
-
-**担当**: 調査フェーズ subagent（2026-07-18）．ユーザー指示⑤（先行研究調査に基づく推論パイプライン高速化）に向け，
-(A) `pipeline_inference.py` を実際に読んで現行の通信方式・バッチング方式・レイヤー分割方式を確認し，
-(B) tavily で分散パイプライン並列推論の高速化手法を文献調査した．実機クラスタへの接続・deploy/推論実行は一切していない
-（コード読み取りと Web 調査のみ）．次フェーズ（計画）が単一レバーとして選べる改善候補を末尾に整理した．
-
-**問い**
-1. 「ITL≈7s/token」の主要因は何か（通信オーバーヘッド／CPU 計算／同期待機／アイドル）．コードから一次推定する．
-2. 分散パイプライン並列推論の高速化手法（バブル削減・通信オーバーラップ・KV 最適化・量子化・continuous batching・
-   speculative decoding 等）の候補を洗い出し，本リポジトリ構成への適用難易度を評価する．
-3. 次フェーズ（計画）が単一レバーとして選べる具体候補（概要・期待効果・実装規模・リスク）を用意する．
-
-**A. 現行アーキテクチャの実測確認（コード出典＝リポジトリ内 ファイル:行）**
-
-- **これは GPU クラスタではなく CPU クラスタである（分析の前提を規定する最重要点）**．`COMPUTE_DTYPE = torch.float32`
-  （`pipeline_inference.py:38`）で，コメント（`:36-37`）に「Intel i5-8350U は AVX-512 BF16 非対応のため bfloat16 は
-  内部で float32 変換されオーバーヘッド．float32 直用で BLAS（OpenBLAS/MKL）を活かす」と明記．重みロードも `map_location="cpu"`
-  （`:770`），スレッドは `torch.set_num_threads(os.cpu_count())`（`:404`．i5-8350U は 4 コア／cpuset 0-3，`:401-402`）．
-  → **各ノードは 4 コアの弱い CPU**．GPU 前提の高速化手法（NCCL・TensorRT-LLM・PagedAttention の GPU 実装等）は
-  そのままは効かない．
-- **モデルは Gemma-4-31B-it（`config.json`）: `num_hidden_layers=60`，`hidden_size=5376`，heads=32/kv=16**．これを
-  **WORLD_SIZE=51 ノード**に分割する（`get_assigned_layers`，`:345-350`．60 層 ÷ 51 ノード ≒ 大半のノードが 1 層，
-  9 ノードが 2 層）．
-- **通信バックエンドは Gloo（TCP，物理 NIC 固定）**．`dist.init_process_group(backend="gloo", ...)`（`:547-548`），
-  物理 NIC 固定は `:408,424-434`．GPU/NCCL は不使用．
-- **デコードは「1 トークンずつ・単一マイクロバッチ・51 段を厳密逐次通過」**．生成本体 `_relay_request`（`:1275-1740`）は，
-  rank0 が 1 トークン分の embed（step0 は prompt 全体，`batch_size=1`／`seq_len=1`）を rank1 に `dist.send`（`:1466-1468`），
-  中間 rank が `recv → 自分の層を計算 → 次 rank へ send`（`:1655-1714`），最終 rank が `final_norm+lm_head → argmax →
-  token_id を rank0 へ send`（`:1600-1621`）．**`NUM_MICRO_BATCHES` を使うマイクロバッチ機構（`process_microbatch`
-  `:964-1000`／`_pipeline_loop` `:1109-1147`）はこの自己回帰デコード経路では使われていない**（別経路・実質ウォームアップ相当）．
-  つまり `NUM_MICRO_BATCHES` レバーは現状の 1 リクエスト生成レイテンシには効かない可能性が高い．
-- **通信は同期ブロッキング（`dist.send`/`dist.recv`）**．step>0 のみ seq_len スカラと hidden を `irecv` 2 本で受ける（`:1577-1580`,
-  `:1681-1684`）が，これは 2 値の受信並列化にとどまり，段間（stage i と i+1）の計算オーバーラップではない．
-- **段間同期は send/recv に加えて TCP の ACK チェーン**（`_RELAY_ACK_PORT`，永続接続 `:1344-1425`）と，リクエスト毎の
-  `dist.barrier()`（`:1298-1307`）がある．barrier はリクエスト毎 1 回で許容範囲だが，**ACK はステップ毎に段間で往復**する
-  （`:1478-1486`, `:1628-1642`, `:1716-1728`）．
-- **ホットループ内で毎ステップ・毎 rank に診断ログが多数**（テンソル全体の `.mean()/.std()/.min()/.max()` や `torch.topk` を
-  毎回計算）．最終 rank は `:1598,1605,1609,1616-1617,1619`，中間 rank は `:1704`．これらは `.item()`／全要素リダクションを
-  ホットパスで強制発火させる．
-- **通信ペイロードは小さい**: hidden は (1,1,5376) float32 = 5376×4 ≒ **21 KB/ホップ**（step0 の prefill のみ seq_len≒prompt 長で
-  数百 KB）．50 ホップでも総転送量は小さく，**生帯域は律速ではない**．効くのは「50 回の逐次ホップ × 1 ホップあたりの固定
-  レイテンシ（send/recv + ACK 往復 + Gloo/Python オーバーヘッド）＋各段の CPU 計算」の累積である．
-
-**A の一次推定（ITL≈7s/token の主要因）**
-
-- **根本原因は「単一リクエストのパイプライン並列は本質的にレイテンシを下げない」構造**にある．seq_len=1・単一マイクロバッチの
-  自己回帰デコードでは，段 i+1 は段 i の出力を待つ厳密依存のため，**任意時刻に 51 段のうち 1 段しか稼働しない**（利用率
-  ≒1/51≒2%）．7s/token を 51 段で割ると **1 段あたり≒140ms**．内訳は「1〜2 層の CPU 計算（float32・4 コア）＋ 21KB の
-  send/recv ＋ ACK 往復 ＋ 毎ステップ診断ログのリダクション」．**通信の生帯域ではなく，ホップ数（=段数）× 1 ホップ固定
-  レイテンシと，各段の逐次 CPU 計算の和**が支配的と一次推定する．
-- **確度の注意**: コード読みだけの推定である．コードは各 rank で `compute dt`（`:1598,1704`）と `recv_hidden dt`（`:1573,1677`）を
-  既にログ出力しているが，**現状 `results/Iter{n}.jsonl` は step_dt 集計しか保存しておらず，計算 vs 通信の内訳は未記録**．
-  内訳の確定にはこの per-stage ログを 1 度パースする（計画候補 B0 参照）．
-
-**B. 文献調査（Web 出典付き）**
-
-- **この構成特有の問題は文献で定式化済み**．FlowSpec（Sang et al., arXiv:2507.02620, 2025,
-  https://arxiv.org/html/2507.02620v1 ）は「エッジの分散パイプライン推論は**リクエストが疎（sparse）だとパイプライン利用率が
-  低くレイテンシ低減の恩恵が消える**」と本リポジトリと同じ根本問題を指摘し，pipeline-parallel な**木構造 speculative decoding**で
-  対処．実機で **1.36×–1.77× の速度向上**を報告（コード公開 https://github.com/Leosang-lx/FlowSpec ）．
-- **PipeDec / SpecPipe**（Chen et al., arXiv:2504.04104, 2025, https://arxiv.org/html/2504.04104v2 ）は「単一タスクのパイプライン
-  推論レイテンシを下げるため**パイプライン全体を使って後続の複数トークンをデコード**する」= 51 段を 1 往復するたびに複数
-  トークンを検証する方向で，本構成の token-by-token レイテンシに直接効く系譜．
-- **Prima.cpp**（Li et al., arXiv:2504.08791, 2025, https://arxiv.org/html/2504.08791v2 ）は**低リソース・ヘテロなホームクラスタ**
-  （まさに CPU 主体）で 30–70B を動かす研究で，「Wi-Fi 等の**高レイテンシ網では P2P 通信が少ない PP がむしろ適する**」とし，
-  層割当・メモリ配置の最適化を扱う．本リポジトリと最も環境が近い．
-- **Zero Bubble Pipeline Parallelism**（Qi et al., ICLR 2024, arXiv:2401.10241, https://github.com/sail-sg/zero-bubble-pipeline-parallelism ）
-  はバブル削減の代表だが**学習（forward/backward スケジューリング）主眼**で，単一リクエスト推論デコードには直接は効かない
-  （バブル削減はマイクロバッチ／複数リクエストが同時に流れて初めて効く）．
-- **OSS の同種プロジェクト**: llama.cpp RPC モード・exo・Petals・distributed-llama（https://github.com/b4rtaz/distributed-llama ）が
-  ホームクラスタ分散推論の実装例．コミュニティ知見（https://localaimaster.com/blog/distributed-inference-local-ai ,
-  r/LocalLLaMA）は「ボトルネックは多くの場合ネットワーク」「CPU-only は動くが遅い」とし，PP は低帯域向き，TP は高帯域向きと整理．
-- **CPU 量子化の効き方（本ハードで重要）**: INT8 の x86 高速化は主に **VNNI / DL Boost（第 2 世代 Xeon Scalable 以降）**に依存
-  （Intel, https://community.intel.com/t5/Blogs/... ; PyTorch x86 INT8, https://pytorch.org/blog/int8-quantization ）．**i5-8350U
-  (Kaby Lake R, 2017) は VNNI も AVX-512 も非搭載**のため，INT8 演算そのものの高速化は期待薄．一方 llama.cpp/llamafile の
-  手書き量子化カーネル（justine.lol/matmul, https://justine.lol/matmul ）は CPU で q8_0/q4 に対し実速度向上を出しており，
-  **CPU での量子化の主効果は「演算の INT8 化」より「重みのメモリ帯域削減」**である点に注意（ただし本リポは PyTorch float32
-  BLAS 経路で llama.cpp カーネルは未使用）．
-- **continuous batching / PagedAttention（vLLM, Sarathi-Serve 等）**: スループット・尾レイテンシ改善が主目的で，**単一リクエストの
-  ITL は下げない**（USENIX OSDI'24 Sarathi-Serve, https://www.usenix.org/system/files/osdi24-agrawal.pdf ）．現行ベンチが
-  1 プロンプト単発である限り本命ではない（目的がスループットに移れば有効）．
-
-**次フェーズ（計画）への示唆＝単一レバー候補（概要／期待効果／実装規模／リスク）**
-
-- **B0（計測・最小・最推奨の第一手）: per-stage の `compute dt` と `recv_hidden dt` を results に集約し，7s の計算 vs 通信内訳を確定**．
-  概要: rank ログに既に出ている段別時間（`:1573,1598,1677,1704`）を `collect_results.py` でパースし JSONL に追記（②の感度分析の
-  土台にもなる）．期待効果: レイテンシは下げないが「どのレバーを振るべきか」を確定させる．実装規模: 小（収集ツールに閉じ・実機
-  非接触寄り，Iter1〜3 と同性質）．リスク: 低．**根本原因が通信律速か計算律速か未確定な現状，最初にこれを潰すのが単一レバー
-  原則にも合致**．
-- **B1（既存レバー・診断価値大）: WORLD_SIZE を絞る（51→例 21/11）**．概要: 60 層を少数ノードに厚く割当（11 ノードなら≒5.5 層/
-  ノード）．期待効果: **逐次ホップ数が 50→10 に激減**し，1 ホップ固定レイテンシ×ホップ数の累積が減る（通信/ホップ律速なら大，
-  計算律速なら小＝B0 と合わせて根本原因を弁別できる）．実装規模: 小（config `levers` に既存，コード変更なし）．リスク: 各ノードの
-  層数増→メモリ/計算増（60 層が収まる下限は `:316-323` で制約），再デプロイ要・実機 run 要（B1/フェーズ4 で人間確認）．
-- **B2（安価なコード改善）: デコードホットループの毎ステップ診断ログ（全要素リダクション・topk）を削減／デバッグフラグ化**．
-  概要: `:1598,1605,1609,1616-1617,1704` 等の毎ステップ統計計算を抑制．期待効果: 各段の CPU オーバーヘッド×50 段×ステップを削減
-  （小〜中，計算律速なら効く）．実装規模: 小（`pipeline_inference.py` 内）．リスク: ホットパス改変＝再デプロイ・人間確認要（B1）．
-  ログを消すと分析材料が減るためフラグ化が無難．
-- **B3（本命＝文献の主流だが大規模）: speculative decoding（rank0 に小さな draft モデル，51 段 1 往復で K トークン検証）**．
-  概要: FlowSpec/PipeDec の方式．token-by-token の 51 段逐次通過を「K トークンまとめて検証」に置換しレイテンシを分割償却．
-  期待効果: 文献ベースで 1.36–1.77×（FlowSpec）〜それ以上．実装規模: **大**（draft モデル追加・relay プロトコルの大改修・検証木・
-  再デプロイ）．リスク: 高（単一レバーとしては過大．north star として位置づけ，まず B0/B1 で根本原因を確定してから段階的に）．
-- **不採用寄り**: continuous batching / PagedAttention（単発 ITL には効かない・スループット向き），純粋な INT8 量子化（本 CPU は
-  VNNI 非搭載で演算高速化は期待薄），学習向けの 1F1B/Zero-Bubble（単一リクエスト推論には非該当），段間計算オーバーラップ
-  （単一トークン・単一マイクロバッチでは重ねる相手がなく非該当）．
-
-**②（マイクロバッチ感度分析）との統合メモ**: 現行コードでは `NUM_MICRO_BATCHES` が自己回帰デコード経路で未使用のため，②を
-そのまま回しても ITL は動かない公算が大きい（上記 A）．したがって計画は，②を「B0 で内訳を確定 → B1（WORLD_SIZE）で
-ホップ数律速か計算律速かを弁別」という形に吸収するのが合理的．人間判断が要る論点（実機 deploy を伴う B1/B2 の掃引着手）は
-既に backlog B1/B6 で「フェーズ4 直前に Slack 確認必須」と登録済みで，本調査で新たな人間判断事項は増えていない．
 
 ---
 

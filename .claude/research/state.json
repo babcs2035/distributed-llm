@@ -1,12 +1,12 @@
 {
   "repo": "distributed-llm",
-  "iteration": "Iter7",
+  "iteration": "Iter8",
   "phase": "investigate",
   "status": "running",
   "current_lever": null,
   "experiment_dir": null,
   "experiment_deadline": null,
-  "updated_at": "2026-07-19T16:46:00+09:00",
-  "last_slack_ts": "1784446566.042059",
+  "updated_at": "2026-07-20T02:05:00+09:00",
+  "last_slack_ts": "1784459790.021299",
   "last_commit": "5e03fae"
 }

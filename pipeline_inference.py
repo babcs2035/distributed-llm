@@ -65,6 +65,14 @@ DEFAULT_STAGGER_INTERVAL = 3.0
 DEFAULT_INIT_TIMEOUT_MINUTES = 25
 DEFAULT_GLOO_TIMEOUT_MS = 3600000  # 60 min: exceeds 100 tokens x 7s = 700s, default 600s is insufficient
 
+# MICROBATCH_BENCH の既定値 (research-cycle Iter7: NUM_MICRO_BATCHES のスループット感度分析用).
+# `MICROBATCH_BENCH_STEPS` env が 0 (既定) のときはこれらを一切参照せず，現行 serving 挙動を変えない.
+DEFAULT_MICROBATCH_BENCH_WARMUP = 20   # 各 repeat 冒頭で捨てるステップ数 (プロセスグループ再初期化直後の冷開始を除外)
+# `MICROBATCH_BENCH_STEPS` env が measure_steps をそのまま兼ねる (env サーフェスを増やさないため).
+# この定数は operator 向けの推奨既定値のドキュメントとして残す (例: `MICROBATCH_BENCH_STEPS=100`).
+DEFAULT_MICROBATCH_BENCH_MEASURE = 100  # 各 repeat で wall-clock を計測する推奨ステップ数
+DEFAULT_MICROBATCH_BENCH_REPEATS = 3    # 計測窓を繰り返す回数 (ノイズ幅 2σ を見積もるための反復数)
+
 # Mock inference constants (mock layer increment value, input initialization stddev)
 MOCK_INCREMENT = 0.01
 INPUT_STDDEV = 0.02
@@ -960,10 +968,47 @@ class FullyOptimizedPipelineNode:
         return forward
 
  
+    def _reset_kv_cache_for_bench(self) -> None:
+        """bench 専用: KV キャッシュ本体と write_pos を毎ステップ冒頭でゼロリセットする.
+
+        `_broadcast_prompt_and_wait`（実リクエスト開始時のリセット，:1514-1522 付近）と同じ
+        「kv_cache 本体と `_kv_cache_write_pos_ref` を揃えてゼロクリアする」イディオムを bench 経路
+        （`_run_microbatch_bench`）にも適用する (research-cycle Iter7 実装フェーズ差し戻し・バグ B 対応).
+
+        理由: `_process_microbatch` が呼ぶ layer.forward 内 (:882 付近) は write_pos を
+        mb 呼び出しごとに無条件加算するため, リセットしないと bench の repeat/step を跨いで
+        write_pos が単調増加し, `max_gen_tokens`（2048, `_init_kv_cache` 参照）を超えて
+        `key_cache[:, :, write_pos:write_pos+_sl, :] = k` の代入が範囲外スライスでクラッシュする.
+        毎ステップ冒頭でリセットすることで, 1 ステップ内で write_pos が到達しうる最大値は
+        `num_micro_batches * seq_len` に構造的に収まり, ステップ・repeat 数に依らず max_gen_tokens を
+        跨がないことが保証される（副次効果として, 各ステップの attention コストのプロファイルが
+        ステップを跨いで再現される定常パターンになり, 「定常状態のスループット計測」という bench の
+        前提とも整合する．詳細は journal.md Iteration 7 `### 実装 (Iter7) バグ修正` 参照）．
+        """
+
+        if self.kv_cache:
+            for key_cache, value_cache in self.kv_cache.values():
+                key_cache.zero_()
+                value_cache.zero_()
+        if hasattr(self, "_kv_cache_write_pos_ref"):
+            for layer_idx in self._kv_cache_write_pos_ref:
+                self._kv_cache_write_pos_ref[layer_idx] = 0
+
     def _process_microbatch(self, mb: int, step_count: int, step_start_time: float, pbar: tqdm | None) -> None:
         """Process one microbatch per step (standard pipeline)
 
         Skip communication during relay mode execution to prevent buffer contention.
+
+        research-cycle Iter7 バグ修正: 呼び出し先 layer.forward の実シグネチャ
+        `forward(hidden_state, position_ids, is_first=True)` は `position_ids` に既定値が無く,
+        位置引数なしで呼ぶと `TypeError` で fatal crash する（バグ A）．bench はトークン生成では
+        なく乱数を流すだけの合成負荷のため position_ids の値自体に意味はないが, shape は
+        `_apply_rope`/sliding-window マスク（layer.forward 内）と整合させる必要がある．
+        `_run_microbatch_bench` が各ステップ冒頭で KV キャッシュと write_pos をゼロリセットする
+        （`_reset_kv_cache_for_bench`）前提のもと, mb 番目の呼び出しはそのステップ内で write_pos が
+        `mb * seq_len` から書き込みを開始する（forward 内で write_pos 加算が mb 呼び出し順に累積する
+        ため）ので, position_ids はそれに対応する `[mb*seq_len, (mb+1)*seq_len)` を渡し, 実際の
+        cache 書き込み位置と RoPE/マスクの位置表現を一致させる．
         """
 
         # Skip communication during relay execution (recv_buffers/send_buffers are exclusive)
@@ -983,8 +1028,11 @@ class FullyOptimizedPipelineNode:
 
         # [B] Compute
         hidden_state = self.recv_buffers[mb]
+        _seq_len = hidden_state.shape[1]
+        position_ids = torch.arange(mb * _seq_len, (mb + 1) * _seq_len, dtype=torch.long).unsqueeze(0)
+        is_first = (mb == 0)
         for layer in self.my_layers:
-            hidden_state = layer(hidden_state)
+            hidden_state = layer(hidden_state, position_ids=position_ids, is_first=is_first)
         self.send_buffers[mb].copy_(hidden_state)
 
         # [C] Send (with timeout)
@@ -1106,15 +1154,32 @@ class FullyOptimizedPipelineNode:
                 prompt = None
             time.sleep(0.05)
 
-    def _pipeline_loop(self) -> None:
+    def _pipeline_loop(
+        self,
+        warmup_steps: int | None = None,
+        measure_steps: int | None = None,
+        repeats: int | None = None,
+    ) -> None:
         """Pipeline inference loop running in a background thread.
 
         Rank 0 (prev_rank=None) generates input data and sends to Rank 1.
+
+        Args:
+            warmup_steps: bench モード時のみ有効 (`MICROBATCH_BENCH_STEPS` env ゲート経由).
+                各 repeat 冒頭で捨てるステップ数. `None`（既定）の場合は従来どおり
+                `_shutdown_requested`/`_pipeline_stopped` まで回り続ける無限ループを保つ
+                (research-cycle Iter7: 既定挙動を変えないことが可逆性の担保).
+            measure_steps: bench モード時のみ有効. 各 repeat で wall-clock を計測するステップ数.
+            repeats: bench モード時のみ有効. 計測窓を繰り返す回数.
         """
 
         is_last_node = (self.config.next_rank is None)
+        bench_mode = (
+            warmup_steps is not None and measure_steps is not None and repeats is not None
+        )
+
         pbar: tqdm | None = None
-        if is_last_node:
+        if is_last_node and not bench_mode:
             pbar = tqdm(
                 desc=f"R{self.config.rank}",
                 initial=0,
@@ -1124,11 +1189,19 @@ class FullyOptimizedPipelineNode:
             )
 
         step_count = 0
-        while not _shutdown_requested and not _pipeline_stopped:
-            step_start_time = time.monotonic()
-            for mb in range(self.config.num_micro_batches):
-                self._process_microbatch(mb, step_count, step_start_time, pbar)
-            step_count += 1
+        if bench_mode:
+            step_count = self._run_microbatch_bench(
+                is_last_node=is_last_node,
+                warmup_steps=warmup_steps,
+                measure_steps=measure_steps,
+                repeats=repeats,
+            )
+        else:
+            while not _shutdown_requested and not _pipeline_stopped:
+                step_start_time = time.monotonic()
+                for mb in range(self.config.num_micro_batches):
+                    self._process_microbatch(mb, step_count, step_start_time, pbar)
+                step_count += 1
 
         if pbar is not None:
             pbar.set_description(f"R{self.config.rank} (stopped)")
@@ -1144,6 +1217,62 @@ class FullyOptimizedPipelineNode:
                 "INFO",
                 f"Inference loop paused: {step_count} steps executed. Relay mode active.",
             )
+
+    def _run_microbatch_bench(
+        self, *, is_last_node: bool, warmup_steps: int, measure_steps: int, repeats: int,
+    ) -> int:
+        """`_pipeline_loop` の bench 分岐本体 (乱数パイプラインの集約マイクロバッチ・スループット計測).
+
+        各 repeat で warmup_steps 分のステップを捨ててから measure_steps 分の wall-clock を計測する.
+        最終 rank (`is_last_node`) でのみ，計測窓ごとに `[R{rank} RESULT] MICROBATCH_BENCH ...` 行を
+        出力する (`tools/collect_results.py` がこの行をパースして `results/Iter{n}.jsonl` へ追記する.
+        journal.md Iteration 7 参照). 全 rank が同一 env から同一 warmup/measure/repeats を読むため,
+        blocking send/recv (`_process_microbatch`) がステップをロックステップに保つ.
+
+        Returns:
+            実行した総ステップ数 (warmup + measure の合計. `_shutdown_requested` で早期終了した場合も含む).
+        """
+
+        step_count = 0
+        for _ in range(repeats):
+            if _shutdown_requested or _pipeline_stopped:
+                break
+
+            for _ in range(warmup_steps):
+                if _shutdown_requested or _pipeline_stopped:
+                    break
+                # バグ B 対応: 毎ステップ冒頭で KV キャッシュ・write_pos をリセットし，
+                # write_pos が repeat/step を跨いで max_gen_tokens を超えないようにする．
+                self._reset_kv_cache_for_bench()
+                step_start_time = time.monotonic()
+                for mb in range(self.config.num_micro_batches):
+                    self._process_microbatch(mb, step_count, step_start_time, None)
+                step_count += 1
+
+            measure_start = time.monotonic()
+            measured = 0
+            for _ in range(measure_steps):
+                if _shutdown_requested or _pipeline_stopped:
+                    break
+                self._reset_kv_cache_for_bench()
+                step_start_time = time.monotonic()
+                for mb in range(self.config.num_micro_batches):
+                    self._process_microbatch(mb, step_count, step_start_time, None)
+                step_count += 1
+                measured += 1
+            elapsed = time.monotonic() - measure_start
+
+            if is_last_node and measured > 0 and elapsed > 0:
+                steps_per_s = measured / elapsed
+                microbatch_per_s = self.config.num_micro_batches * measured / elapsed
+                _log(
+                    "RESULT",
+                    f"MICROBATCH_BENCH m={self.config.num_micro_batches} p={self.config.world_size} "
+                    f"warmup={warmup_steps} measure={measured} elapsed_s={elapsed:.4f} "
+                    f"steps_per_s={steps_per_s:.4f} microbatch_per_s={microbatch_per_s:.4f}",
+                )
+
+        return step_count
 
     def _cleanup(self) -> None:
         """Destroy the Gloo backend distributed process group and release resources."""
@@ -2028,6 +2157,34 @@ def main() -> None:
         # Start HTTP server only on Rank 0 (accept requests from management node)
         if config.rank == 0:
             _start_http_server(config, node)
+
+        # research-cycle Iter7: NUM_MICRO_BATCHES のスループット感度分析用 bench ゲート.
+        # `_pipeline_loop`/`_process_microbatch` は serving 経路 (process_pipeline_inference) から
+        # 呼ばれないデッドコードのため (journal.md Iteration 7 調査 C-1), 明示的に起動する分岐を追加する.
+        # 既定 (`MICROBATCH_BENCH_STEPS=0`) では以下の if は実行されず，現行 serving 挙動を一切変えない.
+        microbatch_bench_steps = int(os.environ.get("MICROBATCH_BENCH_STEPS", "0"))
+        if microbatch_bench_steps > 0:
+            bench_warmup_steps = int(
+                os.environ.get(
+                    "MICROBATCH_BENCH_WARMUP_STEPS", str(DEFAULT_MICROBATCH_BENCH_WARMUP)
+                )
+            )
+            bench_repeats = int(
+                os.environ.get("MICROBATCH_BENCH_REPEATS", str(DEFAULT_MICROBATCH_BENCH_REPEATS))
+            )
+            _log(
+                "INFO",
+                f"MICROBATCH_BENCH_STEPS={microbatch_bench_steps} > 0: running bounded "
+                f"_pipeline_loop bench (warmup={bench_warmup_steps}, "
+                f"measure={microbatch_bench_steps}, repeats={bench_repeats}) before falling "
+                "through to serving.",
+            )
+            node._pipeline_loop(
+                warmup_steps=bench_warmup_steps,
+                measure_steps=microbatch_bench_steps,
+                repeats=bench_repeats,
+            )
+            _log("INFO", "Microbatch bench finished. Falling through to serving (idle relay).")
 
         node.process_pipeline_inference()
     except Exception:

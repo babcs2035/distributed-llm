@@ -7,12 +7,17 @@
 `results/Iter{n}.jsonl` へ 1 実行 = 1 レコードで追記する．`--stage-timing` 指定時は rank1 以降の
 worker ノードの `docker logs` も並列 SSH 取得し，段別 compute/send 時間の内訳（`stage_timing`/
 `timing_breakdown`，schema_version=2）を追加で記録する（journal.md Iteration 4 参照）．
+`--microbatch-bench` 指定時はプロンプト送信を行わず，最終 rank（`world_size - 1`）の `docker logs`
+から `[R{rank} RESULT] MICROBATCH_BENCH ...` 行（`pipeline_inference.py` の env ゲート付き bench
+モードが出力．journal.md Iteration 7 参照）を全件パースし，`record_type="microbatch_bench"` の
+レコードとして 1 行 = 1 計測窓（repeat）で追記する．
 `pipeline_inference.py`（ホットパス）と `tools/predict.py` は非改変（import して再利用するのみ）．
 
 Usage:
   uv run python tools/collect_results.py --iter Iter1 --prompt "Hello!"
   uv run python tools/collect_results.py --iter Iter1 --prompt "Hello!" --http
   uv run python tools/collect_results.py --iter Iter4 --prompt "Hello!" --stage-timing
+  uv run python tools/collect_results.py --iter Iter7 --microbatch-bench
 """
 
 from __future__ import annotations
@@ -81,6 +86,14 @@ _RESULT_RE = re.compile(r"^Request response: '(.*)$", re.DOTALL)
 _COMPUTE_DT_RE = re.compile(r"^Rank (\d+): step (\d+) compute dt=([\d.]+)s")
 _RECV_HIDDEN_DT_RE = re.compile(r"^Rank (\d+): recv_hidden dt=([\d.]+)s$")
 _SENT_TO_NEXT_DT_RE = re.compile(r"^Rank (\d+): step (\d+) sent to next dt=([\d.]+)s$")
+
+# `MICROBATCH_BENCH` RESULT 行（journal.md Iteration 7．`pipeline_inference.py::_run_microbatch_bench`
+# が最終 rank（`next_rank is None`）でのみ計測窓ごとに出力する）．行はそれ自体が単発の物理行のため，
+# `_extract_rank0_messages` のような継続行連結は不要（`_LOG_LINE_RE` で行頭のみ照合すれば十分）．
+_MICROBATCH_BENCH_RE = re.compile(
+    r"^MICROBATCH_BENCH m=(\d+) p=(\d+) warmup=(\d+) measure=(\d+) elapsed_s=([\d.]+) "
+    r"steps_per_s=([\d.]+) microbatch_per_s=([\d.]+)$"
+)
 
 
 def _extract_rank0_messages(log_text: str) -> list[str]:
@@ -331,6 +344,58 @@ def parse_node_stage_timing(log_text: str) -> NodeStageTiming:
         recv_hidden_dt_ms_step0=recv_hidden_dt_ms_step0,
         sent_to_next_dt_ms_by_step=sent_to_next_dt_ms_by_step,
     )
+
+
+# ====================================================================
+# MICROBATCH_BENCH パース（`--microbatch-bench` 用．journal.md Iteration 7）
+# ====================================================================
+
+
+@dataclass
+class MicrobatchBenchRecord:
+    """1 回の計測窓（repeat）分の `MICROBATCH_BENCH` RESULT 行から抽出した集約スループット計測結果．"""
+
+    rank: int
+    num_micro_batches: int
+    world_size: int
+    warmup_steps: int
+    measure_steps: int
+    elapsed_s: float
+    steps_per_s: float
+    microbatch_per_s: float
+
+
+def parse_microbatch_bench_log(log_text: str) -> list[MicrobatchBenchRecord]:
+    """docker logs 生テキストから `[R{rank} RESULT] MICROBATCH_BENCH ...` 行を全件抽出する（純関数）．
+
+    最終 rank（`next_rank is None`）のみがこの行を出力する
+    （`pipeline_inference.py::_run_microbatch_bench`）ため，rank でのフィルタは不要．
+    `repeats` 回分の計測窓が同一ログに複数行並ぶ想定で，出現順にすべて返す
+    （1 行 = 1 計測窓 = `results/Iter{n}.jsonl` の 1 レコードに対応させる）．
+    """
+
+    records: list[MicrobatchBenchRecord] = []
+    for raw_line in log_text.splitlines():
+        clean_line = _ANSI_RE.sub("", raw_line)
+        line_match = _LOG_LINE_RE.match(clean_line)
+        if not line_match:
+            continue
+        bench_match = _MICROBATCH_BENCH_RE.match(line_match.group(3))
+        if not bench_match:
+            continue
+        records.append(
+            MicrobatchBenchRecord(
+                rank=int(line_match.group(1)),
+                num_micro_batches=int(bench_match.group(1)),
+                world_size=int(bench_match.group(2)),
+                warmup_steps=int(bench_match.group(3)),
+                measure_steps=int(bench_match.group(4)),
+                elapsed_s=float(bench_match.group(5)),
+                steps_per_s=float(bench_match.group(6)),
+                microbatch_per_s=float(bench_match.group(7)),
+            )
+        )
+    return records
 
 
 @dataclass
@@ -702,6 +767,38 @@ def build_record(
     }
 
 
+def build_microbatch_bench_record(
+    *,
+    iter_name: str,
+    run_id: str,
+    run_start: datetime,
+    bench: MicrobatchBenchRecord,
+) -> dict[str, object]:
+    """journal.md Iteration 7 の `MICROBATCH_BENCH` 計測窓 1 件を JSONL レコードとして組み立てる．
+
+    通常の serving レコード（`build_record`）とスキーマが異なる（`prompt`/`result_text` 等を持たない）
+    ため，`record_type="microbatch_bench"` で区別できるようにする．必須フィールドは
+    `num_micro_batches, world_size, warmup_steps, measure_steps, elapsed_s, steps_per_s,
+    microbatch_per_s, rank`（journal.md Iteration 7「計画」§2 で指定済み）．
+    """
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": "microbatch_bench",
+        "iter": iter_name,
+        "run_id": run_id,
+        "timestamp": run_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "rank": bench.rank,
+        "num_micro_batches": bench.num_micro_batches,
+        "world_size": bench.world_size,
+        "warmup_steps": bench.warmup_steps,
+        "measure_steps": bench.measure_steps,
+        "elapsed_s": bench.elapsed_s,
+        "steps_per_s": bench.steps_per_s,
+        "microbatch_per_s": bench.microbatch_per_s,
+    }
+
+
 def append_jsonl(path: Path, record: dict[str, object]) -> None:
     """レコードを JSONL ファイルへ 1 行追記する（親ディレクトリが無ければ作成，末尾改行付き）．"""
 
@@ -819,6 +916,73 @@ def run_and_collect(
     )
 
 
+def collect_last_rank_log(
+    config: ClusterConfig, since: datetime | None = None,
+) -> tuple[int, str, list[str]]:
+    """最終 rank（`world_size - 1`）の `docker logs` を取得する．
+
+    `MICROBATCH_BENCH` RESULT 行は最終 rank（`next_rank is None`）でしか出力されない
+    （`pipeline_inference.py::_run_microbatch_bench`）ため，rank0 ではなくこちらを対象にする．
+    bench は HTTP リクエストと無関係にコンテナ起動時に自動実行され，serving レコードのような
+    自然な `run_start` を持たないため，`since` は呼び出し側が明示的に絞り込みたい場合のみ渡す
+    （省略時はコンテナの全ログを取得する．同一デプロイに対して複数回 collect すると
+    `MICROBATCH_BENCH` 行が重複記録され得る点に注意．journal.md Iteration 7 参照）．
+
+    Returns:
+        (last_rank, log_text, warnings): SSH 失敗時は `log_text=""` と失敗内容を含む warnings を返す．
+    """
+
+    hosts = read_hosts(config.hosts_file)
+    last_rank = int(config.world_size) - 1
+    if not (0 <= last_rank < len(hosts)):
+        return last_rank, "", [
+            f"last rank {last_rank} is out of range for hosts.txt ({len(hosts)} hosts)"
+        ]
+
+    since_opt = f"--since {since.strftime('%Y-%m-%dT%H:%M:%SZ')} " if since is not None else ""
+    result = ssh_via_master(
+        config.ssh_user, config.master_addr, hosts[last_rank],
+        f"docker logs {since_opt}distributed-llm 2>&1",
+        timeout=DOCKER_LOGS_SSH_TIMEOUT_SEC,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        return last_rank, "", [f"failed to fetch rank {last_rank} docker logs via ssh: {stderr}"]
+    return last_rank, result.stdout, []
+
+
+def run_microbatch_bench_collect(
+    config: ClusterConfig, iter_name: str, since: datetime | None = None,
+) -> tuple[list[dict[str, object]], list[str]]:
+    """最終 rank の docker logs から `MICROBATCH_BENCH` 行を取得し，1 計測窓 = 1 レコードで組み立てる．
+
+    プロンプト送信は行わない（bench は乱数入力の `_pipeline_loop` を測るためのモードであり，
+    実プロンプト serving（`run_and_collect`）とは独立している．journal.md Iteration 7 参照）．
+    """
+
+    run_start = datetime.now(timezone.utc)
+    last_rank, log_text, warnings = collect_last_rank_log(config, since=since)
+    if not log_text:
+        return [], warnings
+
+    bench_records = parse_microbatch_bench_log(log_text)
+    if not bench_records:
+        warnings.append(
+            f"no MICROBATCH_BENCH RESULT lines found in rank {last_rank} docker logs "
+            "(MICROBATCH_BENCH_STEPS may be 0, or bench has not run yet)"
+        )
+
+    records: list[dict[str, object]] = []
+    for bench in bench_records:
+        run_id = make_run_id(iter_name, run_start)
+        records.append(
+            build_microbatch_bench_record(
+                iter_name=iter_name, run_id=run_id, run_start=run_start, bench=bench,
+            )
+        )
+    return records, warnings
+
+
 def main() -> None:
     """CLI エントリポイント．プロンプト送信 → rank0 ログ収集 → `results/Iter{n}.jsonl` への追記を行う．"""
 
@@ -838,9 +1002,38 @@ def main() -> None:
     parser.add_argument("--stage-timing", action="store_true",
                         help="Also fetch rank1+ worker docker logs (parallel SSH) and record "
                              "per-stage compute/send timing breakdown (default: off)")
+    parser.add_argument("--microbatch-bench", action="store_true",
+                        help="Skip prompt sending; instead fetch the last rank's docker logs, "
+                             "parse MICROBATCH_BENCH RESULT lines (pipeline_inference.py's "
+                             "MICROBATCH_BENCH_STEPS bench mode), and append one record per "
+                             "measurement window to results/{iter}.jsonl (default: off)")
+    parser.add_argument("--since",
+                        help="ISO8601 UTC timestamp (e.g. 2026-07-19T12:00:00Z) to narrow "
+                             "'docker logs --since' when using --microbatch-bench (default: "
+                             "fetch the full container log; repeated collection without --since "
+                             "may duplicate MICROBATCH_BENCH records from earlier deploys)")
     args = parser.parse_args()
 
     config = ClusterConfig.load(args.config)
+
+    if args.microbatch_bench:
+        since = (
+            datetime.strptime(args.since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if args.since else None
+        )
+        records, warnings = run_microbatch_bench_collect(config, args.iter, since=since)
+
+        results_path = Path(args.results_dir) / f"{args.iter}.jsonl"
+        for record in records:
+            append_jsonl(results_path, record)
+
+        print(
+            f"[INFO] appended {len(records)} MICROBATCH_BENCH record(s) to {results_path}",
+            file=sys.stderr,
+        )
+        for warning in warnings:
+            print(f"[WARN] {warning}", file=sys.stderr)
+        return
 
     prompt = get_prompt(args.prompt)
     if not prompt:
