@@ -4,35 +4,46 @@
 1 回のプロンプト送信を `tools/predict.py` の送信ロジック（`send_prompt_ssh` / `send_prompt_http`）に
 そのまま再利用し，送信後に wafl-ctrl1（rank0）コンテナの `docker logs` を取得して
 ステップ時間・TTFT・ITL・tokens/sec・prompt/output tokens・埋め込み統計を抽出，
-`results/Iter{n}.jsonl` へ 1 実行 = 1 レコードで追記する．`pipeline_inference.py`（ホットパス）と
-`tools/predict.py` は非改変（import して再利用するのみ）．
+`results/Iter{n}.jsonl` へ 1 実行 = 1 レコードで追記する．`--stage-timing` 指定時は rank1 以降の
+worker ノードの `docker logs` も並列 SSH 取得し，段別 compute/send 時間の内訳（`stage_timing`/
+`timing_breakdown`，schema_version=2）を追加で記録する（journal.md Iteration 4 参照）．
+`pipeline_inference.py`（ホットパス）と `tools/predict.py` は非改変（import して再利用するのみ）．
 
 Usage:
   uv run python tools/collect_results.py --iter Iter1 --prompt "Hello!"
   uv run python tools/collect_results.py --iter Iter1 --prompt "Hello!" --http
+  uv run python tools/collect_results.py --iter Iter4 --prompt "Hello!" --stage-timing
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
 import re
 import sys
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from common import ClusterConfig, ssh_via_master
+from common import ClusterConfig, read_hosts, ssh_via_master
 from predict import get_prompt, send_prompt_http, send_prompt_ssh
 
 # rank0 の docker logs を取得する際の SSH タイムアウト（秒）．
 DOCKER_LOGS_SSH_TIMEOUT_SEC = 30
 
-# JSONL スキーマのバージョン（journal.md Iteration 1 の確定版に対応）．
-SCHEMA_VERSION = 1
+# `--stage-timing` 指定時，worker（rank1 以降）の docker logs を並列 SSH 取得する際の最大同時数．
+_STAGE_TIMING_MAX_WORKERS = 8
+
+# 秒 → ミリ秒変換係数（per-stage 時間はミリ秒で記録するため使用．マジックナンバー回避）．
+_SEC_TO_MS = 1000.0
+
+# JSONL スキーマのバージョン（journal.md Iteration 4 で stage_timing/timing_breakdown を追加し 2 へ更新．
+# Iteration 1〜3 の v1 レコードは stage_timing/timing_breakdown を持たない＝後方互換）．
+SCHEMA_VERSION = 2
 
 _EMPTY_EMBED_STATS: dict[str, float | None] = {
     "mean": None, "std": None, "min": None, "max": None,
@@ -63,6 +74,13 @@ _DECODED_RE = re.compile(r"^Rank 0: decoded in ([\d.]+)s:")
 # `_extract_rank0_messages` で継続行を `\n` 連結済みの 1 論理メッセージを渡す前提で，
 # re.DOTALL により `.` を改行にもマッチさせ，全文を group(1) で捕捉する．
 _RESULT_RE = re.compile(r"^Request response: '(.*)$", re.DOTALL)
+
+# per-stage 時間ログ（非 rank0 全ノード．journal.md Iteration 4「計画」§0 参照）．
+# `compute dt`/`sent to next dt` は行末に `hidden_mean=...` 等が続くため prefix マッチにし，
+# `recv_hidden dt` は他の行と衝突しない単独行のため `$` 終端で厳密一致させる．
+_COMPUTE_DT_RE = re.compile(r"^Rank (\d+): step (\d+) compute dt=([\d.]+)s")
+_RECV_HIDDEN_DT_RE = re.compile(r"^Rank (\d+): recv_hidden dt=([\d.]+)s$")
+_SENT_TO_NEXT_DT_RE = re.compile(r"^Rank (\d+): step (\d+) sent to next dt=([\d.]+)s$")
 
 
 def _extract_rank0_messages(log_text: str) -> list[str]:
@@ -249,6 +267,72 @@ def _extract_decode_time(block: list[str]) -> float | None:
     return None
 
 
+# ====================================================================
+# per-stage 時間パース（`--stage-timing` 用．非 rank0 全ノードのログが対象）
+# ====================================================================
+
+
+@dataclass
+class NodeStageTiming:
+    """1 ノード（= 1 rank）分の docker logs から抽出した per-stage 時間．
+
+    worker ノードはブロック開始マーカー（`Rank 0: prompt=`）を持たないため，`run_and_collect`
+    が `--since {run_start}` で当該 run の時間窓に限定して取得したログ全体をそのまま渡す前提で
+    構築する（journal.md Iteration 4「計画」§2-A 参照．複数 run 混在は `--iter` 変数化＋単発運用で回避）．
+    """
+
+    rank: int | None                              # 本文 "Rank {N}:" から検出（ノード = 1 rank）
+    compute_dt_ms_by_step: dict[int, float]       # step -> compute dt（ms）
+    recv_hidden_dt_ms_step0: float | None         # step0（prefill 受信）の recv_hidden dt（ms）．無ければ None
+    sent_to_next_dt_ms_by_step: dict[int, float]  # 中間 rank のみ（最終 rank は空のまま）
+
+
+def parse_node_stage_timing(log_text: str) -> NodeStageTiming:
+    """1 ノード分の docker logs テキストから per-stage 時間（`NodeStageTiming`）を構築する（純関数）．
+
+    `_LOG_LINE_RE`（`[R{rank} LEVEL] ...`）に一致する行は本文部分のみを対象に照合し，一致しない行
+    （プレフィックス無しの継続行等）はそのまま本文として照合する．対象の 3 種の物理ログ行はいずれも
+    単発行（RESULT のような複数行本文を持たない）ため，`_extract_rank0_messages` のような継続行連結は
+    不要である．
+    """
+
+    rank: int | None = None
+    compute_dt_ms_by_step: dict[int, float] = {}
+    recv_hidden_dt_ms_step0: float | None = None
+    sent_to_next_dt_ms_by_step: dict[int, float] = {}
+
+    for raw_line in log_text.splitlines():
+        clean_line = _ANSI_RE.sub("", raw_line)
+        line_match = _LOG_LINE_RE.match(clean_line)
+        body = line_match.group(3) if line_match else clean_line
+
+        compute_match = _COMPUTE_DT_RE.match(body)
+        if compute_match:
+            rank = rank if rank is not None else int(compute_match.group(1))
+            step = int(compute_match.group(2))
+            compute_dt_ms_by_step[step] = round(float(compute_match.group(3)) * _SEC_TO_MS, 3)
+            continue
+
+        recv_match = _RECV_HIDDEN_DT_RE.match(body)
+        if recv_match:
+            rank = rank if rank is not None else int(recv_match.group(1))
+            recv_hidden_dt_ms_step0 = round(float(recv_match.group(2)) * _SEC_TO_MS, 3)
+            continue
+
+        sent_match = _SENT_TO_NEXT_DT_RE.match(body)
+        if sent_match:
+            rank = rank if rank is not None else int(sent_match.group(1))
+            step = int(sent_match.group(2))
+            sent_to_next_dt_ms_by_step[step] = round(float(sent_match.group(3)) * _SEC_TO_MS, 3)
+
+    return NodeStageTiming(
+        rank=rank,
+        compute_dt_ms_by_step=compute_dt_ms_by_step,
+        recv_hidden_dt_ms_step0=recv_hidden_dt_ms_step0,
+        sent_to_next_dt_ms_by_step=sent_to_next_dt_ms_by_step,
+    )
+
+
 @dataclass
 class ParsedLog:
     """rank0 の docker logs 1 ブロック分から抽出した生指標．"""
@@ -407,6 +491,116 @@ def compute_derived_metrics(
     )
 
 
+@dataclass
+class StageTimingSummary:
+    """非 rank0 全ノードの `NodeStageTiming` を横断集計した結果（デコードステップ = step≥1 が対象）．"""
+
+    n_ranks_reporting: int                      # compute dt を報告できた非 rank0 rank 数
+    compute_sum_ms_by_step: dict[int, float]    # Σ_ranks compute（step 別）
+    send_sum_ms_by_step: dict[int, float]       # Σ_intermediate (sent_to_next − compute)（step 別）
+    compute_sum_ms_median: float | None         # デコードステップ（step≥1）中央値
+    send_sum_ms_median: float | None            # 同上
+    prefill_recv_ms_by_rank: dict[int, float]   # step0 recv_hidden（rank 別．prefill 診断用）
+
+
+# デコードステップと prefill（step0）を分ける境界（step0 は桁が違うため代表値から除外する）．
+_FIRST_DECODE_STEP = 1
+
+
+def aggregate_stage_timing(
+    nodes: list[NodeStageTiming],
+) -> tuple[StageTimingSummary, list[str]]:
+    """複数ノードの `NodeStageTiming` を集約し，step 別 compute/send 総和と中央値代表値を算出する．
+
+    send は中間 rank の `sent_to_next_dt − compute_dt`（同一 step）で近似する．最終 rank は
+    `sent_to_next` を持たないため自動的に送信総和から除外される．差分が負になる場合
+    （ログ欠損・step 対応ずれ）は 0 クランプせず warning を積んでその (rank, step) を送信集計から
+    除外する（黙って歪めない．journal.md Iteration 4「計画」§2-B 参照）．
+    """
+
+    warnings: list[str] = []
+    compute_sum_ms_by_step: dict[int, float] = {}
+    send_sum_ms_by_step: dict[int, float] = {}
+    prefill_recv_ms_by_rank: dict[int, float] = {}
+    n_ranks_reporting = 0
+
+    for node in nodes:
+        if node.compute_dt_ms_by_step:
+            n_ranks_reporting += 1
+
+        for step, compute_ms in node.compute_dt_ms_by_step.items():
+            compute_sum_ms_by_step[step] = compute_sum_ms_by_step.get(step, 0.0) + compute_ms
+
+        for step, sent_ms in node.sent_to_next_dt_ms_by_step.items():
+            compute_ms = node.compute_dt_ms_by_step.get(step)
+            if compute_ms is None:
+                warnings.append(
+                    f"rank {node.rank}: sent_to_next dt at step {step} has no matching "
+                    "compute dt; excluded from send aggregation"
+                )
+                continue
+            send_ms = sent_ms - compute_ms
+            if send_ms < 0:
+                warnings.append(
+                    f"rank {node.rank}: negative send dt ({send_ms:.3f}ms) at step {step} "
+                    "(sent_to_next < compute); excluded from send aggregation"
+                )
+                continue
+            send_sum_ms_by_step[step] = send_sum_ms_by_step.get(step, 0.0) + send_ms
+
+        if node.recv_hidden_dt_ms_step0 is not None and node.rank is not None:
+            prefill_recv_ms_by_rank[node.rank] = node.recv_hidden_dt_ms_step0
+
+    decode_compute_values = [
+        v for step, v in compute_sum_ms_by_step.items() if step >= _FIRST_DECODE_STEP
+    ]
+    decode_send_values = [
+        v for step, v in send_sum_ms_by_step.items() if step >= _FIRST_DECODE_STEP
+    ]
+
+    summary = StageTimingSummary(
+        n_ranks_reporting=n_ranks_reporting,
+        compute_sum_ms_by_step=compute_sum_ms_by_step,
+        send_sum_ms_by_step=send_sum_ms_by_step,
+        compute_sum_ms_median=_percentile(decode_compute_values, 50.0) if decode_compute_values else None,
+        send_sum_ms_median=_percentile(decode_send_values, 50.0) if decode_send_values else None,
+        prefill_recv_ms_by_rank=prefill_recv_ms_by_rank,
+    )
+    return summary, warnings
+
+
+def build_timing_breakdown(
+    step_dt: list[float], summary: StageTimingSummary,
+) -> dict[str, float | int | None]:
+    """rank0 の `step_dt`（デコードステップ = step≥1）と `StageTimingSummary` から残差内訳を算出する．
+
+    `residual_ms_median = rank0_step_dt_median_ms − compute_sum_ms_median − send_sum_ms_median`
+    （recv 待ち＋ACK 往復＋Gloo/Python オーバーヘッド＋rank0/最終 rank の周辺処理に相当．
+    journal.md Iteration 4「計画」§2-B 参照）．compute/send いずれかの中央値が `None`（報告ノード無し
+    等）の場合，残差は算出不能として `None` にする（捏造しない）．
+    """
+
+    decode_step_dt_s = step_dt[_FIRST_DECODE_STEP:]
+    rank0_step_dt_median_ms = (
+        _percentile(decode_step_dt_s, 50.0) * _SEC_TO_MS if decode_step_dt_s else None
+    )
+
+    compute_ms = summary.compute_sum_ms_median
+    send_ms = summary.send_sum_ms_median
+    if rank0_step_dt_median_ms is not None and compute_ms is not None and send_ms is not None:
+        residual_ms_median: float | None = rank0_step_dt_median_ms - compute_ms - send_ms
+    else:
+        residual_ms_median = None
+
+    return {
+        "compute_sum_ms_median": compute_ms,
+        "send_sum_ms_median": send_ms,
+        "residual_ms_median": residual_ms_median,
+        "rank0_step_dt_median_ms": rank0_step_dt_median_ms,
+        "n_ranks_reporting": summary.n_ranks_reporting,
+    }
+
+
 # ====================================================================
 # レコード組み立て・永続化
 # ====================================================================
@@ -472,8 +666,15 @@ def build_record(
     result_text: str,
     e2e_latency_s: float,
     levers: dict[str, int | float | None],
+    stage_timing: dict[str, object] | None = None,
+    timing_breakdown: dict[str, float | int | None] | None = None,
 ) -> dict[str, object]:
-    """journal.md Iteration 1 で確定した JSONL スキーマ（schema_version=1）に沿って 1 レコードを組み立てる．"""
+    """journal.md Iteration 1〜4 で確定した JSONL スキーマ（schema_version=2）に沿って 1 レコードを組み立てる．
+
+    `stage_timing`/`timing_breakdown` は `--stage-timing` 指定時のみ非 null（`StageTimingSummary`/
+    `build_timing_breakdown` の結果）．未指定（既定・schema v1 相当の挙動）では両方 `null` とし，
+    Iteration 1〜3 の v1 レコードと後方互換を保つ．
+    """
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -494,6 +695,8 @@ def build_record(
         "result_text": result_text,
         "embed_stats": parsed.embed_stats,
         "levers": levers,
+        "stage_timing": stage_timing,
+        "timing_breakdown": timing_breakdown,
         "parse_ok": parsed.parse_ok,
         "parse_warnings": parsed.parse_warnings,
     }
@@ -533,8 +736,52 @@ def collect_rank0_log(config: ClusterConfig, run_start: datetime) -> tuple[str, 
     return result.stdout, []
 
 
-def run_and_collect(config: ClusterConfig, prompt: str, iter_name: str, use_http: bool) -> dict[str, object]:
-    """プロンプト送信からログ取得・パース・レコード組み立てまでを一括で実行する．"""
+def collect_worker_stage_timing_logs(
+    config: ClusterConfig, run_start: datetime,
+) -> tuple[list[str], list[str]]:
+    """`--stage-timing` 指定時，rank1 以降の worker から `docker logs --since {run_start}` を並列取得する．
+
+    rank0（= master 自身）は `collect_rank0_log` で別途取得済みのためここでは対象外とする
+    （`read_hosts` は `hosts[i]` = rank i の順で IP を返す．journal.md Iteration 4「計画」§0 参照）．
+    個々のノードの SSH 失敗は握りつぶさず warnings へ積み，成功ノードのログのみ返す（一部欠損許容）．
+    """
+
+    since_str = run_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    hosts = read_hosts(config.hosts_file)
+    worker_ranks = list(range(1, len(hosts)))
+
+    def _fetch_one(rank: int) -> tuple[int, str, str | None]:
+        result = ssh_via_master(
+            config.ssh_user, config.master_addr, hosts[rank],
+            f"docker logs --since {since_str} distributed-llm 2>&1",
+            timeout=DOCKER_LOGS_SSH_TIMEOUT_SEC,
+        )
+        if result.returncode != 0:
+            return rank, "", (result.stderr or "").strip()
+        return rank, result.stdout, None
+
+    log_texts: list[str] = []
+    warnings: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_STAGE_TIMING_MAX_WORKERS) as executor:
+        for rank, log_text, error in executor.map(_fetch_one, worker_ranks):
+            if error is not None:
+                warnings.append(f"failed to fetch rank {rank} docker logs: {error}")
+                continue
+            log_texts.append(log_text)
+
+    return log_texts, warnings
+
+
+def run_and_collect(
+    config: ClusterConfig, prompt: str, iter_name: str, use_http: bool,
+    stage_timing: bool = False,
+) -> dict[str, object]:
+    """プロンプト送信からログ取得・パース・レコード組み立てまでを一括で実行する．
+
+    `stage_timing=True` の場合のみ，rank1 以降の worker ログを追加取得して per-stage 内訳
+    （`stage_timing`/`timing_breakdown`）を算出する．既定（`False`）では現行挙動を完全に維持する
+    （既存の `predict:demo` 相当 run を重くしない．journal.md Iteration 4「計画」§2-C 参照）．
+    """
 
     run_start = datetime.now(timezone.utc)
     run_id = make_run_id(iter_name, run_start)
@@ -554,10 +801,21 @@ def run_and_collect(config: ClusterConfig, prompt: str, iter_name: str, use_http
     derived = compute_derived_metrics(parsed.step_dt, parsed.output_tokens_from_log)
     levers = build_levers(config, parsed.levers_from_log)
 
+    stage_timing_dict: dict[str, object] | None = None
+    timing_breakdown: dict[str, float | int | None] | None = None
+    if stage_timing:
+        worker_logs, worker_warnings = collect_worker_stage_timing_logs(config, run_start)
+        node_timings = [parse_node_stage_timing(log_text) for log_text in worker_logs]
+        summary, aggregate_warnings = aggregate_stage_timing(node_timings)
+        parsed.parse_warnings = parsed.parse_warnings + worker_warnings + aggregate_warnings
+        stage_timing_dict = asdict(summary)
+        timing_breakdown = build_timing_breakdown(parsed.step_dt, summary)
+
     return build_record(
         iter_name=iter_name, run_id=run_id, run_start=run_start, prompt=prompt,
         parsed=parsed, derived=derived, result_text=result_text,
         e2e_latency_s=e2e_latency_s, levers=levers,
+        stage_timing=stage_timing_dict, timing_breakdown=timing_breakdown,
     )
 
 
@@ -577,6 +835,9 @@ def main() -> None:
                         help="Iteration name used for run_id / results/{iter}.jsonl (default: Iter1)")
     parser.add_argument("--results-dir", default="results",
                         help="Directory to write results/{iter}.jsonl into (default: results)")
+    parser.add_argument("--stage-timing", action="store_true",
+                        help="Also fetch rank1+ worker docker logs (parallel SSH) and record "
+                             "per-stage compute/send timing breakdown (default: off)")
     args = parser.parse_args()
 
     config = ClusterConfig.load(args.config)
@@ -587,7 +848,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"[INFO] Sending to {config.master_addr}:8082 (iter={args.iter})...", file=sys.stderr)
-    record = run_and_collect(config, prompt, args.iter, args.http)
+    record = run_and_collect(config, prompt, args.iter, args.http, stage_timing=args.stage_timing)
 
     results_path = Path(args.results_dir) / f"{args.iter}.jsonl"
     append_jsonl(results_path, record)

@@ -13,19 +13,27 @@ from types import SimpleNamespace
 import pytest
 
 from collect_results import (
+    _COMPUTE_DT_RE,
+    _RECV_HIDDEN_DT_RE,
+    _SENT_TO_NEXT_DT_RE,
     _extract_levers,
     _extract_rank0_messages,
     _extract_result_text,
     _percentile,
     _select_relevant_block,
+    aggregate_stage_timing,
     build_levers,
     build_record,
+    build_timing_breakdown,
     append_jsonl,
     compute_derived_metrics,
     make_run_id,
+    parse_node_stage_timing,
     parse_rank0_log,
     DerivedMetrics,
+    NodeStageTiming,
     ParsedLog,
+    StageTimingSummary,
 )
 
 _FIXTURE_PATH = Path(__file__).parent / "fixtures" / "rank0_sample.log"
@@ -614,10 +622,15 @@ def test_build_record_contains_all_schema_keys_and_is_json_serializable() -> Non
         "schema_version", "iter", "run_id", "timestamp", "prompt", "prompt_tokens",
         "output_tokens", "step_dt", "ttft_s", "generation_time_s", "tokens_per_sec",
         "itl_p50_s", "itl_p95_s", "decode_time_s", "e2e_latency_s", "result_text",
-        "embed_stats", "levers", "parse_ok", "parse_warnings",
+        "embed_stats", "levers", "stage_timing", "timing_breakdown", "parse_ok",
+        "parse_warnings",
     }
     assert set(record.keys()) == expected_keys
     assert record["timestamp"] == "2026-07-18T08:15:00Z"
+    # `--stage-timing` 未指定（既定）では stage_timing/timing_breakdown は null（Iteration 1〜3 の
+    # v1 レコードとの後方互換．journal.md Iteration 4「計画」§2-C 参照）．
+    assert record["stage_timing"] is None
+    assert record["timing_breakdown"] is None
 
     round_tripped = json.loads(json.dumps(record, ensure_ascii=False))
     assert round_tripped == record
@@ -649,3 +662,141 @@ def test_append_jsonl_appends_without_overwriting_existing_records(tmp_path: Pat
     assert len(lines) == 2
     assert json.loads(lines[0])["run_id"] == "run-1"
     assert json.loads(lines[1])["run_id"] == "run-2"
+
+
+# ====================================================================
+# per-stage 時間内訳（Iteration 4: TS1〜TS6）
+# `--stage-timing` で非 rank0 全ノードから収集する compute/recv/send dt のパース・集約・残差計算．
+# ====================================================================
+
+
+def test_compute_dt_regex_extracts_rank_step_and_seconds() -> None:
+    """TS1: `_COMPUTE_DT_RE` が行末に hidden_mean=... が続く行から (rank, step, dt) を取り出す．"""
+
+    match = _COMPUTE_DT_RE.match("Rank 7: step 3 compute dt=0.123s hidden_mean=0.01 hidden_std=0.02")
+
+    assert match is not None
+    assert match.group(1) == "7"
+    assert match.group(2) == "3"
+    assert match.group(3) == "0.123"
+
+
+def test_recv_hidden_dt_regex_matches_only_dedicated_line() -> None:
+    """TS2: `_RECV_HIDDEN_DT_RE` は step0 の recv_hidden 行にのみ一致し，compute dt 行には一致しない．"""
+
+    recv_match = _RECV_HIDDEN_DT_RE.match("Rank 7: recv_hidden dt=1.234s")
+    assert recv_match is not None
+    assert recv_match.group(1) == "7"
+    assert recv_match.group(2) == "1.234"
+
+    # step>0 の行（recv_hidden 行を持たない compute dt 行）ではマッチしない．
+    assert _RECV_HIDDEN_DT_RE.match("Rank 7: step 3 compute dt=0.123s hidden_mean=0.01") is None
+
+
+def test_sent_to_next_dt_regex_does_not_collide_with_compute_dt_line() -> None:
+    """TS3: `_SENT_TO_NEXT_DT_RE` が sent to next 行を取り出し，compute dt 行とは誤マッチしない．"""
+
+    sent_match = _SENT_TO_NEXT_DT_RE.match("Rank 7: step 3 sent to next dt=0.456s")
+    assert sent_match is not None
+    assert sent_match.group(1) == "7"
+    assert sent_match.group(2) == "3"
+    assert sent_match.group(3) == "0.456"
+
+    assert _SENT_TO_NEXT_DT_RE.match(
+        "Rank 7: step 3 compute dt=0.123s hidden_mean=0.01 hidden_std=0.02"
+    ) is None
+
+
+def test_parse_node_stage_timing_builds_timing_in_milliseconds_from_physical_log() -> None:
+    """TS4: `[R7 INFO]` 形式の 1 ノードログ全体から NodeStageTiming を構築し，単位が ms（秒×1000）になる．"""
+
+    log_text = (
+        "[R7 INFO] Rank 7: recv_hidden dt=1.234s\n"
+        "[R7 INFO] Rank 7: step 0 compute dt=0.100s hidden_mean=0.01 hidden_std=0.02\n"
+        "[R7 INFO] Rank 7: step 0 sent to next dt=0.150s\n"
+        "[R7 INFO] Rank 7: step 1 compute dt=0.110s hidden_mean=0.01 hidden_std=0.02\n"
+        "[R7 INFO] Rank 7: step 1 sent to next dt=0.160s\n"
+    )
+
+    timing = parse_node_stage_timing(log_text)
+
+    assert timing.rank == 7
+    assert timing.compute_dt_ms_by_step == {0: pytest.approx(100.0), 1: pytest.approx(110.0)}
+    assert timing.recv_hidden_dt_ms_step0 == pytest.approx(1234.0)
+    assert timing.sent_to_next_dt_ms_by_step == {0: pytest.approx(150.0), 1: pytest.approx(160.0)}
+
+
+def test_aggregate_stage_timing_sums_by_step_and_excludes_final_rank_from_send() -> None:
+    """TS5: 複数ノードの集約で compute_sum_ms_by_step/send_sum_ms_by_step が step 別に加算され，
+    sent_to_next を持たない最終 rank は送信総和に含まれない．
+    """
+
+    intermediate_rank_1 = NodeStageTiming(
+        rank=1,
+        compute_dt_ms_by_step={1: 100.0, 2: 110.0},
+        recv_hidden_dt_ms_step0=None,
+        sent_to_next_dt_ms_by_step={1: 150.0, 2: 160.0},  # send = 50.0, 50.0
+    )
+    intermediate_rank_2 = NodeStageTiming(
+        rank=2,
+        compute_dt_ms_by_step={1: 80.0, 2: 90.0},
+        recv_hidden_dt_ms_step0=None,
+        sent_to_next_dt_ms_by_step={1: 120.0, 2: 130.0},  # send = 40.0, 40.0
+    )
+    final_rank = NodeStageTiming(
+        rank=3,
+        compute_dt_ms_by_step={1: 60.0, 2: 70.0},
+        recv_hidden_dt_ms_step0=None,
+        sent_to_next_dt_ms_by_step={},  # 最終 rank は send を持たない
+    )
+
+    summary, warnings = aggregate_stage_timing([intermediate_rank_1, intermediate_rank_2, final_rank])
+
+    assert warnings == []
+    assert summary.n_ranks_reporting == 3
+    assert summary.compute_sum_ms_by_step == {1: pytest.approx(240.0), 2: pytest.approx(270.0)}
+    assert summary.send_sum_ms_by_step == {1: pytest.approx(90.0), 2: pytest.approx(90.0)}
+
+
+def test_aggregate_stage_timing_excludes_negative_send_delta_with_warning() -> None:
+    """TS5 補足: sent_to_next − compute が負になるケースは 0 クランプせず除外し，warning を積む．"""
+
+    corrupted_rank = NodeStageTiming(
+        rank=9,
+        compute_dt_ms_by_step={1: 200.0},
+        recv_hidden_dt_ms_step0=None,
+        sent_to_next_dt_ms_by_step={1: 150.0},  # sent(150) < compute(200) => 負の差分
+    )
+
+    summary, warnings = aggregate_stage_timing([corrupted_rank])
+
+    assert summary.send_sum_ms_by_step == {}
+    assert any("negative send dt" in w for w in warnings)
+
+
+def test_build_timing_breakdown_residual_reconciles_with_rank0_step_dt() -> None:
+    """TS6: compute_sum + send_sum + residual が rank0_step_dt_median_ms と一致する（丸め許容）．"""
+
+    summary = StageTimingSummary(
+        n_ranks_reporting=2,
+        compute_sum_ms_by_step={1: 6000.0, 2: 6100.0, 3: 5900.0},
+        send_sum_ms_by_step={1: 500.0, 2: 480.0, 3: 520.0},
+        compute_sum_ms_median=6000.0,
+        send_sum_ms_median=500.0,
+        prefill_recv_ms_by_rank={},
+    )
+    # step_dt[0] は prefill（step0），step_dt[1:] がデコードステップ．中央値は 7.0s。
+    step_dt = [80.0, 6.9, 7.0, 7.1]
+
+    breakdown = build_timing_breakdown(step_dt, summary)
+
+    assert breakdown["compute_sum_ms_median"] == pytest.approx(6000.0)
+    assert breakdown["send_sum_ms_median"] == pytest.approx(500.0)
+    assert breakdown["rank0_step_dt_median_ms"] == pytest.approx(7000.0)
+    assert breakdown["residual_ms_median"] == pytest.approx(500.0)
+    assert breakdown["n_ranks_reporting"] == 2
+
+    reconciled = (
+        breakdown["compute_sum_ms_median"] + breakdown["send_sum_ms_median"] + breakdown["residual_ms_median"]
+    )
+    assert reconciled == pytest.approx(breakdown["rank0_step_dt_median_ms"])

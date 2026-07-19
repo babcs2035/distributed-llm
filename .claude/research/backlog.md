@@ -6,6 +6,62 @@
 
 ---
 
+## B9 [needs-human 2026-07-19] B3 本体（speculative decoding の relay プロトコル改修＝SL3）着手の go/no-go
+- **状況**: Iteration 4（B0）で「ITL≈7s/token は計算律速（compute 92%・send 0.3%・residual 7.6%）」が確定．支配項
+  （92% の compute＝1 トークンずつ 50 段を逐次通過する CPU 計算）を攻められるのは B3（speculative decoding）のみで，
+  B1（WORLD_SIZE 絞り込み，Σcompute 不変）・B2（診断ログ削減，compute dt 非含）はいずれも残差止まりと確定した．
+- **論点**: B3 本体の実レイテンシ低減には，**どの draft 戦略でも relay プロトコルの改修（K トークン運搬＋検証を 1 往復で
+  行う）＝SL3 が避けられない**．これは `pipeline_inference.py` ホットパスの改変・検証木の実装・51 ノードへの再デプロイを
+  伴う**大規模かつ不可逆側**の変更であり，research-cycle の自律判断ポリシー（不可逆/大規模は人間判断）に該当する．
+- **方針**: Iteration 5 では B3 本体に直行せず，最小サブレバー **SL1（compute 側上限の local マイクロベンチ，B8）**で
+  「B3 の compute 側利得がこの CPU（i5-8350U・4 コア・float32）で実在するか」を先に測る．**SL1 の結果（GEMM(K) の
+  1 トークンあたりコストが GEMV に対しどれだけ縮むか）を添えて，B3 本体（SL3）着手の go/no-go を人間に諮る**．
+  SL1 で compute 側利得が実在しないと判明すれば，B3 の天井は残差償却（≈1.08 倍）に縮み，大投資は見送る判断もあり得る．
+- **現在の扱い**: Iteration 5 は path (a)（十分小さい SL1 を自動選定）で `status="running"` 進行．B3 本体は本 B9 として
+  温存し，SL1 完了後の考察・次計画フェーズで Slack（`<@U08GLKY1QCW>`）へ go/no-go を諮る．今回の Iteration 4 完了
+  サマリー Slack でも，B3 本体は SL1 の結果を見て別途諮る旨を予告済み．
+
+---
+
+## B8 [auto-decided 2026-07-19] Iteration 5 の単一レバー選定（B3 を最小サブレバーへ分解した SL1: compute 側上限の local マイクロベンチ）
+- **状況**: Iteration 4（B0: per-stage 内訳診断）を「採用」で確定・収束．「7s/token は計算律速（compute≈92%）」が確定し，
+  「計算 vs 通信の弁別」という診断課題は完了した．次は支配項（92% の compute）そのものを攻める段だが，それに効く唯一の
+  候補 B3（speculative decoding）本体は実装規模が大きく（draft モデル・relay プロトコル改修・検証木・再デプロイ），
+  単一レバー原則に対して過大で不可逆側でもある．
+- **自動選択**: Iteration 5 の単一レバーを **SL1（compute 側上限の local マイクロベンチ）**とする．本モデルの実次元
+  （`hidden_size=5376`，ノードあたり 1〜2 層相当の GEMM 形状）で `torch.set_num_threads(4)`・float32 のもと，
+  seq_len=1（GEMV）と seq_len=K（K=2,4,8 の GEMM）の **1 トークンあたり実行時間**を比較し，「K 位置まとめた GEMM が
+  この CPU で演算強度/キャッシュ効率を上げるか（＝B3 の compute 側効き源 (ii) が実在するか）」を測る．重み不要の
+  ランダムテンソルで足り，`pipeline_inference.py` 非改変・再デプロイ不要・クラスタ本体非接触・完全に可逆．
+- **根拠**: (1) B3 の最大の不確実性（compute 側利得の実在有無）を near-zero コストで潰せ，大規模な relay 改修（SL3, B9）の
+  go/no-go の決定的入力になる．(2) B0 と同じ「作る前に測る」診断の系譜で，収束した診断レバー群の延長として単一レバー
+  原則に整合する．(3) 破壊的操作を含まず完全に可逆．
+- **可逆性**: 次に振るレバーの選定であり可逆．local マイクロベンチのみで破壊的操作なし（自動判断とした）．
+- **要レビュー / 要人間判断**: SL1 自体は自律実行可．ただし SL1 の先にある **B3 本体（SL3: relay プロトコル改修・再デプロイ）は
+  不可逆・大規模のため B9 として人間 go/no-go を要する**．SL1 を計測用スクリプトの独立イテレーションとして扱うのが
+  過剰と判断する場合（別案: B3 本体へ直行して人間確認）は，次回 continue 時に人間がこの B8 を差し替えること．
+
+---
+
+## B7 [resolved 2026-07-19] Iter4 フェーズ4（実験，B0の51ノード実機`--stage-timing`測定run）開始可否の確認依頼（B1の実行）
+- **解決**: ユーザーが承認．「ノード・デバイスへの ssh 接続を伴うデプロイなどは全て許可する」との明示的な指示を受け，
+  フェーズ4（実験）へ進行する．
+- **状況**: Iteration 4（B0: per-stage compute/recv dt の内訳記録）のフェーズ1〜3（調査・計画・実装）が完了．
+  `tools/collect_results.py` に `--stage-timing` オプションを追加し，rank1以降のworkerへ並列SSHで`docker logs`を
+  取得・パースして`stage_timing`/`timing_breakdown`をJSONLへ記録できるようにした．単体テスト45件green（既存38件＋
+  新規7件，回帰無し）．`pipeline_inference.py`は非改変・**再デプロイ不要**（既存稼働イメージのログのみを利用）．
+- **論点**: フェーズ4は`pipeline_inference.py`の改変を伴わないが，**51ノード全てへSSHで`docker logs`を並列取得する**
+  実機接続を伴う．B1の合意（実機への deploy/推論実行を伴う実験の前に必ずSlack確認）の対象に含めるべきと判断し，
+  着手前に一度停止してSlackで`<@U08GLKY1QCW>`へ確認を依頼した（2026-07-19投稿）．
+- **今後の運用への影響（重要）**: ユーザーの「ssh 接続を伴うデプロイなどは全て許可する」という指示は，本イテレーション限りの
+  承認ではなく，このリポジトリの research-cycle 運用における**SSH接続・deploy・推論実行に対する事前確認要件（B1由来）への
+  包括的な事前承認**と解釈する．したがって以降のイテレーションで `mise run deploy`／`mise run predict:demo`／
+  `--stage-timing` 等の**SSH接続を伴う非破壊的な実機操作**は，都度Slack確認を挟まずオーケストレータの自律判断で進めてよい．
+  ただし **`mise clean --full`（イメージ/コンテナ削除）・`git push --force`等の破壊的操作は本承認の対象外**であり，
+  引き続き人間確認が必須．詳細はメモリ `feedback_research_cycle_ssh_deploy_authorized` を参照．
+
+---
+
 ## B6 [auto-decided 2026-07-18] Iteration 4 の単一レバー選定（ユーザー指示⑤: 先行研究調査に基づく推論パイプライン高速化）
 - **状況**: Iteration 3（P1: levers 記録の堅牢化）を「採用」で確定・収束．②着手前に事前イテレーションで潰すべき
   基盤頑健化 (a)RESULT 複数行照合・(b)levers 記録堅牢化は Iter2・Iter3 で両方解消し，「基盤の信頼性」系レバーは

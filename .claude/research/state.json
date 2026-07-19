@@ -1,12 +1,12 @@
 {
   "repo": "distributed-llm",
-  "iteration": "Iter4",
-  "phase": "investigate",
+  "iteration": "Iter5",
+  "phase": "plan",
   "status": "running",
-  "current_lever": "ユーザー指示⑤: 先行研究調査に基づく推論パイプライン高速化（調査→計画で単一レバーへ絞り込み，②感度分析を吸収）",
+  "current_lever": "SL1: compute 側上限の local マイクロベンチ（seq_len=1 GEMV vs seq_len=K GEMM を hidden=5376・4スレッド float32 で比較し，B3 の compute 側効き源が実在するか診断）",
   "experiment_dir": "results",
   "experiment_deadline": null,
-  "updated_at": "2026-07-18T22:40:00+09:00",
-  "last_slack_ts": null,
-  "last_commit": "8616c27"
+  "updated_at": "2026-07-19T10:24:00+09:00",
+  "last_slack_ts": "1784423981.675999",
+  "last_commit": "d9fe4b8"
 }
