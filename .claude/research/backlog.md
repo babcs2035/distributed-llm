@@ -6,6 +6,50 @@
 
 ---
 
+## B12 [auto-decided 2026-07-19] Iteration 7 の単一レバー選定（NUM_MICRO_BATCHES: research_frontier② のスループット感度）
+- **状況**: Iteration 6（SL2: draft 採択率のオフライン見積もり）を「採用」で確定・収束．overall α=0.5856（≳0.5）・
+  a_2=1.8562（≳1.5）で計画の go 条件を両方充足し，SL1×SL2 合成の実効 compute 利得は最良 K=4 で ≈1.43 倍と数値化した．
+  これで SL1（compute 天井）×SL2（採択率）が出揃い，B9（B3 本体＝relay プロトコル改修＝SL3 の go/no-go）の判断材料は
+  揃ったが，B9 は**不可逆・大規模のため `[needs-human]` のまま維持**（reflector では自動判定しない．別途 Slack で mention
+  済み，人間回答待ち）．次イテレーションは B9 の人間回答を待たずに自律実行できる軽量な項目を選ぶ段である．
+- **自動選択**: Iteration 7 の単一レバーを **`NUM_MICRO_BATCHES`（config `levers` 最優先候補，research_frontier② の
+  「マイクロバッチ数・stagger interval のスループット感度分析」の枠組みで振る）**とする．検証対象は「マイクロバッチ数を
+  増やしパイプラインバブル（段間の遊び）を埋めるとスループットが上がるか」で，実機 deploy/predict で ITL/TTFT を測る．
+  具体的なワークロード設計（複数リクエスト同時投入等）は次の rc-planner が決める．
+- **根拠**: (1) B9 が人間判断待ちの間，reflector が自律的に選べる項目は config `research_frontier` ②③④ または `levers`
+  の 4 候補（NUM_MICRO_BATCHES/STAGGER_INTERVAL/SEQ_LEN/WORLD_SIZE）に限られ，不可逆な SL3/B9 へは踏み込まない．その中で
+  `NUM_MICRO_BATCHES` は `levers` の最優先（順序＝優先度）で，B6 が ②/⑤ の実験前提条件（`--iter Iter{n}` 変数化・冷開始
+  交絡除去・各水準 n≥3〜5 反復・主指標 ITL/TTFT）を申し送り済みで planner が即着手できる．(2) B3 の compute 律速（B9）
+  とは直交する軸で，人間回答を待つ間に研究を停滞させない．(3) 破壊的操作を含まず可逆．
+- **可逆性**: 次に振るレバーの選定であり可逆．実機 deploy/predict を伴うが B7 の包括承認（非破壊 SSH/deploy）の範囲内で
+  破壊的操作なし（自動判断とした）．
+- **要レビュー / 要人間判断**: **重要な留保**——Iter4 で「`NUM_MICRO_BATCHES` は単一リクエストの ITL では Σcompute 不変・
+  残差止まり」と確定済みのため，単発デモ（`"Hello!"` 1 件）を回すだけではスループット差は出ない．②の感度を意味あるものに
+  するには planner が**複数リクエスト同時投入／連続バッチのワークロードを設計**する必要がある．この設計が過大
+  （`pipeline_inference.py` ホットパス改変を要する等）と判明した場合は，SEQ_LEN（④）や STAGGER_INTERVAL へ振り替えるか
+  backlog へ `[needs-human]` 登録して諮ること．また B9（SL3 go/no-go）は温存済みで，人間回答が得られ次第そちらを優先して
+  よい（本 B12 は待ち時間を無駄にしないための直交レバーであり，B9 回答が来れば人間がこの B12 を差し替え可）．
+
+---
+
+## B11 [auto-decided 2026-07-19] Iteration 6 実験フェーズ失敗への対処（HF キャッシュ revision 固定）
+- **状況**: `scripts/estimate_draft_acceptance.py` の初回実行が `AutoTokenizer.from_pretrained` 段階で即時失敗した．
+  当初の懸念（`Gemma4ForConditionalGeneration` を `AutoModelForCausalLM` が非対応）ではなく，ローカル HF キャッシュ
+  `~/.cache/huggingface/hub/models--google--gemma-4-31B-it/refs/main`（2026-07-19T10:41 更新）が config.json のみの
+  不完全スナップショット（`b9ea41a2...`）を指しており，59GB weights・tokenizer.json を含む完全なスナップショット
+  （`fb9ae262...`）が別途存在するのに参照されていなかったことが原因．診断（revision 明示指定での読み込み）では
+  `AutoConfig`/`AutoTokenizer` とも成功し，architectures 非対応の懸念は解消済み．
+- **自動選択**: 対処案 (A)（スクリプト内の `from_pretrained` 呼び出しに `revision="fb9ae262347c3945692f09a612f8bb189def854f"`
+  を明示指定）を選ぶ．対処案 (B)（ローカル HF キャッシュの `refs/main` を書き換えて修復）は不採用．
+- **根拠**: (A) はリポジトリ内のコード変更のみで完結し，git 管理下・完全に可逆．(B) は共有 HF キャッシュ（他プロセスが
+  参照している可能性あり）への書き込みを伴い，本スクリプト以外への影響範囲が不明なため，可逆性が (A) より劣る．
+  同一レバー（SL2）内の実装バグ修正であり，単一レバー原則には抵触しない（新たなレバー変更ではない）．
+- **要レビュー**: revision ハッシュをコードにハードコードする方式は，HF キャッシュが将来更新された場合に追随できない
+  暫定対応である．恒久対応（例: 最新の完全スナップショットを動的に解決する）は本イテレーションのスコープ外とし，
+  必要なら次イテレーション以降の backlog へ改めて起票する．
+
+---
+
 ## B10 [auto-decided 2026-07-19] Iteration 6 の単一レバー選定（SL2: draft 採択率のオフライン見積もり）
 - **状況**: Iteration 5（SL1: compute 側上限の local マイクロベンチ）を「採用」で確定・収束．実機（i5-8350U，`wafl100`＝rank1，
   cpuset 0-3）で ratio_2=0.753／ratio_4=0.378／ratio_8=0.213，判定「利得あり」＝B3 の compute 側効き源が実在することを確認し，

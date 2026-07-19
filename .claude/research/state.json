@@ -1,12 +1,12 @@
 {
   "repo": "distributed-llm",
-  "iteration": "Iter6",
+  "iteration": "Iter7",
   "phase": "investigate",
   "status": "running",
-  "current_lever": "SL2: draft 採択率のオフライン見積もり（K トークン提案のうち検証で受理される割合を，relay 改修せず prompt-lookup／n-gram draft または小 draft モデルで既存ログ／参照出力に対して見積もる）。Iteration 5（SL1: compute 側上限の local マイクロベンチ）は採用で確定・収束：実機 i5-8350U（wafl100＝rank1，cpuset 0-3）で ratio_2=0.753/ratio_4=0.378/ratio_8=0.213，判定「利得あり」＝B3 の compute 側利得の実在を確認しダウンサイドリスクを棄却。残る不確実性は採択率（期待値側）に集約され，SL1×SL2 で B3 実効利得の期待値レンジを固めてから B9（B3 本体 go/no-go）を人間に諮る方針。具体的な SL2 実装方針は次の rc-planner が決定。",
-  "experiment_dir": "results",
+  "current_lever": null,
+  "experiment_dir": null,
   "experiment_deadline": null,
-  "updated_at": "2026-07-19T11:07:30+09:00",
-  "last_slack_ts": "1784426776.134309",
-  "last_commit": "c5f39a9"
+  "updated_at": "2026-07-19T16:40:00+09:00",
+  "last_slack_ts": "1784442899.430479",
+  "last_commit": "3de7d05"
 }
