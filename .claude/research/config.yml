@@ -20,6 +20,10 @@ experiment:
   timeout_min: 30                           # predict:demo 単発は数分〜十数分程度の見込み（要実測）
   poll_interval_sec: 60
 
+# journal.md に残す直近イテレーション数．超過分は自動で journal_archive.md へ移す
+# （reflector が rotate_journal.sh を呼ぶ）．journal.md の肥大化・毎フェーズの Read コストを抑えるため．
+journal_retention: 3
+
 # 単一レバー原則で振る候補（順序＝優先度）．pipeline_inference.py の環境変数で制御．
 levers:
   - {name: NUM_MICRO_BATCHES, values: [2, 4, 8], note: "既定4．パイプラインバブル低減とのトレードオフ"}
