@@ -1,0 +1,7 @@
+[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=51 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51
+[R0 [0;32mRESULT[0m] MICROBATCH_BENCH_TIMING m=51 p=51 rank=0 repeat=0 n_samples=5100 recv_wait_mean_s=0.000012 recv_wait_min_s=0.000005 recv_wait_max_s=0.000050 compute_mean_s=0.003210 compute_min_s=0.003000 compute_max_s=0.003500 send_wait_mean_s=0.000200 send_wait_min_s=0.000100 send_wait_max_s=0.000400
+[R0 RESULT] MICROBATCH_BENCH_TIMING m=51 p=51 rank=0 repeat=1 n_samples=5100 recv_wait_mean_s=0.000013 recv_wait_min_s=0.000006 recv_wait_max_s=0.000051 compute_mean_s=0.003211 compute_min_s=0.003001 compute_max_s=0.003501 send_wait_mean_s=0.000201 send_wait_min_s=0.000101 send_wait_max_s=0.000401
+[R49 INFO] Rank 49: received forward chunk
+[R50 RESULT] MICROBATCH_BENCH_TIMING m=51 p=51 rank=50 repeat=0 n_samples=5100 recv_wait_mean_s=0.012000 recv_wait_min_s=0.008000 recv_wait_max_s=0.020000 compute_mean_s=0.003300 compute_min_s=0.003100 compute_max_s=0.003600 send_wait_mean_s=0.000000 send_wait_min_s=0.000000 send_wait_max_s=0.000000
+[R50 RESULT] MICROBATCH_BENCH m=51 p=51 warmup=20 measure=100 elapsed_s=12.2000 steps_per_s=8.1967 microbatch_per_s=418.0328
+[R50 INFO] Inference loop paused: 360 steps executed. Relay mode active.

@@ -395,6 +395,13 @@ class FullyOptimizedPipelineNode:
         _RANK = config.rank
         self.config = config
 
+        # research-cycle Iter9: bench 経路限定の per-microbatch 3 区間計時
+        # (recv_wait_s/compute_s/send_wait_s) の蓄積先．既定 None (serving/非 bench 経路) では
+        # `_process_microbatch` が一切打刻しないため挙動は完全に不変 (journal.md Iteration 9 参照)．
+        # `_run_microbatch_bench` の measure ループ直前にのみ {"recv": [], "compute": [], "send": []}
+        # をセットし，warmup 中および計測窓外では None に戻す．
+        self._bench_timing: dict[str, list[float]] | None = None
+
         # B1: Load and cache HuggingFace config once in the instance.
         # Eliminates duplicate AutoConfig loads in _init_kv_cache and _build_transformer_layer.
         from transformers import AutoConfig as _AutoConfig
@@ -1009,12 +1016,23 @@ class FullyOptimizedPipelineNode:
         `mb * seq_len` から書き込みを開始する（forward 内で write_pos 加算が mb 呼び出し順に累積する
         ため）ので, position_ids はそれに対応する `[mb*seq_len, (mb+1)*seq_len)` を渡し, 実際の
         cache 書き込み位置と RoPE/マスクの位置表現を一致させる．
+
+        research-cycle Iter9: `self._bench_timing` が非 `None`（bench 計測窓中のみ）のときに限り,
+        [A]受信/[B]計算/[C]送信 の 3 区間を `time.monotonic()` で加算的に計測し
+        `self._bench_timing["recv"/"compute"/"send"]` へ append する．既定 `None`（serving/非 bench
+        経路）では打刻を一切行わず挙動不変（journal.md Iteration 9 参照）．
         """
 
         # Skip communication during relay execution (recv_buffers/send_buffers are exclusive)
         global _relay_active
         if _relay_active:
             return
+
+        # research-cycle Iter9: bench 計測窓 (`self._bench_timing is not None`) のときだけ
+        # 3 区間の境界を打刻する．serving/非 bench 経路 (既定 None) では `time.monotonic()` を
+        # 一切呼ばず，挙動・オーバーヘッドともに完全に不変 (journal.md Iteration 9 参照)．
+        timing = self._bench_timing
+        t0 = time.monotonic() if timing is not None else 0.0
 
         # [A] Receive data (with timeout)
         if self.config.prev_rank is None:
@@ -1026,6 +1044,8 @@ class FullyOptimizedPipelineNode:
                 # Do nothing on timeout or error
                 return
 
+        t1 = time.monotonic() if timing is not None else 0.0
+
         # [B] Compute
         hidden_state = self.recv_buffers[mb]
         _seq_len = hidden_state.shape[1]
@@ -1034,6 +1054,8 @@ class FullyOptimizedPipelineNode:
         for layer in self.my_layers:
             hidden_state = layer(hidden_state, position_ids=position_ids, is_first=is_first)
         self.send_buffers[mb].copy_(hidden_state)
+
+        t2 = time.monotonic() if timing is not None else 0.0
 
         # [C] Send (with timeout)
         if self.config.next_rank is None:
@@ -1048,6 +1070,12 @@ class FullyOptimizedPipelineNode:
                 dist.send(tensor=self.send_buffers[mb], dst=self.config.next_rank)
             except Exception:
                 pass
+
+        if timing is not None:
+            t3 = time.monotonic()
+            timing["recv"].append(t1 - t0)
+            timing["compute"].append(t2 - t1)
+            timing["send"].append(t3 - t2)
 
     def process_pipeline_inference(self) -> None:
         """
@@ -1229,15 +1257,24 @@ class FullyOptimizedPipelineNode:
         journal.md Iteration 7 参照). 全 rank が同一 env から同一 warmup/measure/repeats を読むため,
         blocking send/recv (`_process_microbatch`) がステップをロックステップに保つ.
 
+        research-cycle Iter9: 上記に加え，**全 rank**（`is_last_node` ゲート無し）が計測窓ごとに
+        `[R{rank} RESULT] MICROBATCH_BENCH_TIMING ...` 行を出力する．`self._bench_timing` は
+        warmup 中は `None`（計測窓外は打刻しない），measure ループ直前に空リスト辞書をセットして
+        `_process_microbatch` に 3 区間 (recv_wait_s/compute_s/send_wait_s) を累積させ，
+        measure ループ直後に mean/min/max を集約する（journal.md Iteration 9 参照）．計測擾乱回避のため
+        per-mb ループ内に `dist.barrier()` は追加しない．
+
         Returns:
             実行した総ステップ数 (warmup + measure の合計. `_shutdown_requested` で早期終了した場合も含む).
         """
 
         step_count = 0
-        for _ in range(repeats):
+        for repeat_idx in range(repeats):
             if _shutdown_requested or _pipeline_stopped:
                 break
 
+            # research-cycle Iter9: warmup 中は計測窓外のため打刻しない（None ガード）．
+            self._bench_timing = None
             for _ in range(warmup_steps):
                 if _shutdown_requested or _pipeline_stopped:
                     break
@@ -1249,6 +1286,8 @@ class FullyOptimizedPipelineNode:
                     self._process_microbatch(mb, step_count, step_start_time, None)
                 step_count += 1
 
+            # research-cycle Iter9: measure ループ直前に計測窓を開始する．
+            self._bench_timing = {"recv": [], "compute": [], "send": []}
             measure_start = time.monotonic()
             measured = 0
             for _ in range(measure_steps):
@@ -1271,6 +1310,34 @@ class FullyOptimizedPipelineNode:
                     f"warmup={warmup_steps} measure={measured} elapsed_s={elapsed:.4f} "
                     f"steps_per_s={steps_per_s:.4f} microbatch_per_s={microbatch_per_s:.4f}",
                 )
+
+            # research-cycle Iter9: 全 rank が計測窓ごとに 3 区間の mean/min/max を出力する
+            # (`is_last_node` ゲート無し．journal.md Iteration 9 参照).
+            recv_samples = self._bench_timing["recv"]
+            compute_samples = self._bench_timing["compute"]
+            send_samples = self._bench_timing["send"]
+            n_samples = len(recv_samples)
+            if n_samples > 0:
+                _log(
+                    "RESULT",
+                    f"MICROBATCH_BENCH_TIMING m={self.config.num_micro_batches} "
+                    f"p={self.config.world_size} rank={self.config.rank} repeat={repeat_idx} "
+                    f"n_samples={n_samples} "
+                    f"recv_wait_mean_s={sum(recv_samples) / n_samples:.6f} "
+                    f"recv_wait_min_s={min(recv_samples):.6f} "
+                    f"recv_wait_max_s={max(recv_samples):.6f} "
+                    f"compute_mean_s={sum(compute_samples) / n_samples:.6f} "
+                    f"compute_min_s={min(compute_samples):.6f} "
+                    f"compute_max_s={max(compute_samples):.6f} "
+                    f"send_wait_mean_s={sum(send_samples) / n_samples:.6f} "
+                    f"send_wait_min_s={min(send_samples):.6f} "
+                    f"send_wait_max_s={max(send_samples):.6f}",
+                )
+
+        # research-cycle Iter9: bench 終了後は既定の None に戻し，以降の serving 経路が
+        # 誤って打刻対象にならないようにする（`_process_microbatch` は serving からは呼ばれない
+        # デッドコードだが，状態を明示的に既定へ戻すことで意図を保つ）．
+        self._bench_timing = None
 
         return step_count
 

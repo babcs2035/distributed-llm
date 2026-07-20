@@ -54,6 +54,10 @@ def _build_single_node(
         ),
     }
     node._kv_cache_write_pos_ref = {0: 0}
+    # research-cycle Iter9: `__init__` が設定する bench 計測フラグ（既定 None）．
+    # `object.__new__` は `__init__` を経由しないため，`_process_microbatch` が参照する前に
+    # ここで明示的に既定値へ揃える（journal.md Iteration 9 参照）．
+    node._bench_timing = None
 
     def fake_layer(hidden_state: torch.Tensor, position_ids: torch.Tensor, is_first: bool = True) -> torch.Tensor:
         recorded_calls.append(

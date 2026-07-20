@@ -33,5 +33,8 @@ models/
 
 # Logs
 *.log
+# ただしテスト用の固定フィクスチャログは追跡する（tests/test_microbatch_bench.py 等が
+# 参照する docker logs のサンプル．research-cycle backlog B16 参照）
+!tests/fixtures/*.log
 
 config.json

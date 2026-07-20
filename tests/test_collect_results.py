@@ -23,20 +23,26 @@ from collect_results import (
     _select_relevant_block,
     aggregate_stage_timing,
     build_levers,
+    build_microbatch_bench_timing_record,
     build_record,
     build_timing_breakdown,
     append_jsonl,
     compute_derived_metrics,
     make_run_id,
+    parse_microbatch_bench_timing_log,
     parse_node_stage_timing,
     parse_rank0_log,
     DerivedMetrics,
+    MicrobatchBenchTimingRecord,
     NodeStageTiming,
     ParsedLog,
     StageTimingSummary,
 )
 
 _FIXTURE_PATH = Path(__file__).parent / "fixtures" / "rank0_sample.log"
+_MICROBATCH_BENCH_TIMING_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "microbatch_bench_timing_sample.log"
+)
 
 
 def _load_fixture_text() -> str:
@@ -800,3 +806,139 @@ def test_build_timing_breakdown_residual_reconciles_with_rank0_step_dt() -> None
         breakdown["compute_sum_ms_median"] + breakdown["send_sum_ms_median"] + breakdown["residual_ms_median"]
     )
     assert reconciled == pytest.approx(breakdown["rank0_step_dt_median_ms"])
+
+
+# ====================================================================
+# parse_microbatch_bench_timing_log / build_microbatch_bench_timing_record
+# (research-cycle Iter9: per-microbatch recv_wait_s/compute_s/send_wait_s 内訳．journal.md Iteration 9 参照)
+# ====================================================================
+
+
+def _load_microbatch_bench_timing_fixture_text() -> str:
+    """rank0（ANSI 混入 1 件・非混入 1 件，repeat=0,1）と rank50（repeat=0）の
+    `MICROBATCH_BENCH_TIMING` RESULT 行が混在するログフィクスチャを読み込む．同ログには
+    無視すべき `MICROBATCH_BENCH`（スループットのみ）行と他 rank の INFO 行も含む．
+    """
+
+    return _MICROBATCH_BENCH_TIMING_FIXTURE_PATH.read_text(encoding="utf-8")
+
+
+def test_parse_microbatch_bench_timing_log_extracts_all_rank_and_repeat_combinations_in_order() -> None:
+    """全 rank・全 repeat の `MICROBATCH_BENCH_TIMING` 行を出現順にすべて抽出し，
+    `MICROBATCH_BENCH`（スループットのみ）行や他 rank の INFO 行は無視する．
+    """
+
+    records = parse_microbatch_bench_timing_log(_load_microbatch_bench_timing_fixture_text())
+
+    assert len(records) == 3
+    assert all(isinstance(record, MicrobatchBenchTimingRecord) for record in records)
+    assert [(record.rank, record.repeat) for record in records] == [(0, 0), (0, 1), (50, 0)]
+
+
+def test_parse_microbatch_bench_timing_log_extracts_correct_fields_for_ansi_colored_line() -> None:
+    """1 件目（rank=0, repeat=0, ANSI カラーコード混入）の全フィールドが正しく数値化される．"""
+
+    records = parse_microbatch_bench_timing_log(_load_microbatch_bench_timing_fixture_text())
+    first = records[0]
+
+    assert first.rank == 0
+    assert first.num_micro_batches == 51
+    assert first.world_size == 51
+    assert first.repeat == 0
+    assert first.n_samples == 5100
+    assert first.recv_wait_mean_s == 0.000012
+    assert first.recv_wait_min_s == 0.000005
+    assert first.recv_wait_max_s == 0.000050
+    assert first.compute_mean_s == 0.003210
+    assert first.compute_min_s == 0.003000
+    assert first.compute_max_s == 0.003500
+    assert first.send_wait_mean_s == 0.000200
+    assert first.send_wait_min_s == 0.000100
+    assert first.send_wait_max_s == 0.000400
+
+
+def test_parse_microbatch_bench_timing_log_handles_ansi_free_result_line_for_second_repeat() -> None:
+    """2 件目（rank=0, repeat=1, ANSI 無し）が repeat 単位で別レコードとして区別される．"""
+
+    records = parse_microbatch_bench_timing_log(_load_microbatch_bench_timing_fixture_text())
+    second = records[1]
+
+    assert second.rank == 0
+    assert second.repeat == 1
+    assert second.recv_wait_mean_s == 0.000013
+    assert second.compute_mean_s == 0.003211
+    assert second.send_wait_mean_s == 0.000201
+
+
+def test_parse_microbatch_bench_timing_log_distinguishes_last_rank_with_zero_send_wait() -> None:
+    """3 件目（rank=50，最終 rank）は send_wait が 0（次段が無いため）で他 rank と区別される．"""
+
+    records = parse_microbatch_bench_timing_log(_load_microbatch_bench_timing_fixture_text())
+    last_rank = records[2]
+
+    assert last_rank.rank == 50
+    assert last_rank.repeat == 0
+    assert last_rank.recv_wait_mean_s == 0.012000
+    assert last_rank.compute_mean_s == 0.003300
+    assert last_rank.send_wait_mean_s == 0.000000
+    assert last_rank.send_wait_max_s == 0.000000
+
+
+def test_parse_microbatch_bench_timing_log_returns_empty_list_when_no_result_lines() -> None:
+    """`MICROBATCH_BENCH_TIMING` RESULT 行が無いログ（bench 無効時の通常ログ）では空リストを返す．"""
+
+    log_text = "[R0 INFO] Rank 0: prompt='Hi'\n[R0 RESULT] Request response: 'Hello'\n"
+
+    assert parse_microbatch_bench_timing_log(log_text) == []
+
+
+def test_parse_microbatch_bench_timing_log_ignores_throughput_only_result_line() -> None:
+    """既存 `MICROBATCH_BENCH`（スループットのみ）行は別の正規表現で照合されるため抽出されない
+    （フィクスチャ内の rank50 の `MICROBATCH_BENCH m=... elapsed_s=...` 行を含む）．"""
+
+    log_text = (
+        "[R50 RESULT] MICROBATCH_BENCH m=51 p=51 warmup=20 measure=100 "
+        "elapsed_s=12.2000 steps_per_s=8.1967 microbatch_per_s=418.0328\n"
+    )
+
+    assert parse_microbatch_bench_timing_log(log_text) == []
+
+
+def test_build_microbatch_bench_timing_record_includes_all_required_fields() -> None:
+    """journal.md Iteration 9「計画」§4 が指定した必須フィールド（rank/repeat/3 区間の mean/min/max）を
+    過不足なく含む．"""
+
+    from datetime import datetime, timezone
+
+    timing = MicrobatchBenchTimingRecord(
+        rank=50, num_micro_batches=51, world_size=51, repeat=0, n_samples=5100,
+        recv_wait_mean_s=0.012000, recv_wait_min_s=0.008000, recv_wait_max_s=0.020000,
+        compute_mean_s=0.003300, compute_min_s=0.003100, compute_max_s=0.003600,
+        send_wait_mean_s=0.000000, send_wait_min_s=0.000000, send_wait_max_s=0.000000,
+    )
+    run_start = datetime(2026, 7, 20, 3, 0, 0, tzinfo=timezone.utc)
+    run_id = make_run_id("Iter9", run_start)
+
+    record = build_microbatch_bench_timing_record(
+        iter_name="Iter9", run_id=run_id, run_start=run_start, timing=timing,
+    )
+
+    assert record["record_type"] == "microbatch_bench_timing"
+    assert record["iter"] == "Iter9"
+    assert record["run_id"] == run_id
+    assert record["timestamp"] == "2026-07-20T03:00:00Z"
+    assert record["rank"] == 50
+    assert record["num_micro_batches"] == 51
+    assert record["world_size"] == 51
+    assert record["repeat"] == 0
+    assert record["n_samples"] == 5100
+    assert record["recv_wait_mean_s"] == 0.012000
+    assert record["recv_wait_min_s"] == 0.008000
+    assert record["recv_wait_max_s"] == 0.020000
+    assert record["compute_mean_s"] == 0.003300
+    assert record["compute_min_s"] == 0.003100
+    assert record["compute_max_s"] == 0.003600
+    assert record["send_wait_mean_s"] == 0.000000
+    assert record["send_wait_min_s"] == 0.000000
+    assert record["send_wait_max_s"] == 0.000000
+    assert json.dumps(record) is not None

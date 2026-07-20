@@ -1,3 +1,558 @@
+## Iteration 6
+
+### 考察・次計画 (Iter6)
+
+**担当**: 考察・次計画 subagent（2026-07-19）．`### 分析(解釈) (Iter6)` の結論（go 方向を強める）を受け，単一レバー
+**SL2（draft 採択率のオフライン見積もり）**の採否を確定し，次イテレーション（Iteration 7）の方向を決めた．実機への新規
+接続・実行はしていない（記録の読み取り・`results/draft_acceptance.jsonl` の読み取り・commit 操作のみ）．
+
+**1. 採否判定: 採用で確定・収束（adopt & converged）**
+
+- **判定根拠**: SL2 は診断（計測）レバーであり，判定対象は「B3（speculative decoding）の**期待値側の因子＝draft 採択率**が，
+  SL1 で確定した compute 天井を実効利得として現実化させる下限条件を満たすか（向き）」．analyst 判定どおり実測は
+  **overall α=0.5856（≳0.5）・a_2=1.8562（≳1.5）**で計画 §4 の go 条件を**両方充足**し，no-go 域（a_K≈1・α≲0.1）からは
+  大きく離れる．ノイズは greedy ゆえ決定的量で，全体 α は 555 位置・全 4 カテゴリが位置数 ≥50 を満たし（doc_qa は 52 で
+  境界だが全体値優先），ラベルが反転する余地は無い．実装は新規 2 ファイル（`scripts/estimate_draft_acceptance.py`／
+  `tests/test_estimate_draft_acceptance.py`）＋ HF キャッシュ revision 固定のみで `pipeline_inference.py` 非改変，
+  `pytest` 83 passed（回帰なし）．計画 §4 の完了条件（α・カテゴリ別 α・経験 a_K・α→a_K 写像併記・prompt-lookup 層別・
+  SL1×SL2 合成の素数値・純関数テスト green）を全て満たした．**採用で確定**．
+- **追加反復の要否**: 不要．α・a_K は greedy で決定的（run 間分散ゼロ）ゆえ，同一プロンプト集合での反復では新情報は
+  得られない（推定誤差は位置数のみに支配され，555 位置で十分）．
+- **このレバーの収束状況**: SL2 は「採択率が SL1 の compute 天井を実効利得へ現実化する下限条件を満たすか」という単一の
+  問いに，決定的な答え（満たす＝下限クリア．ただし満額は取れず実効 compute 利得は最良 K=4 で ≈1.43 倍）を出したため
+  **このサブレバーは収束**．同じ問いへ SL2 を再び振っても新情報は得られない．次は B3 go/no-go（B9，人間判断待ち）へ
+  論点が移るが，それ自体はこの reflector では決めない（§3）．
+
+**2. 非自明な学び（次の自分向け）**
+
+- **(i) SL1 の 4.7 倍 compute 天井の大半は採択率が食い潰す**: SL1 単独では ratio_8=0.213＝per-token compute を最大
+  1/0.213≈4.7 倍にできる余地があった（Iter5 の学び）が，現実の採択率（α=0.586・a_K が K に届かない）を織り込むと
+  **SL1×SL2 合成の実効 compute 利得は最良でも ≈1.43 倍（K=4）**に縮む（K=2:1.23／K=4:1.43／K=8:1.35）．B3 の compute 側
+  期待値は「no-go にするほど低くはない（下限クリア）が，天井を満額は取れない」水準．Iter5 §2(iii)「残る不確実性は
+  期待値側（採択率）に集約」への定量的回答である．
+- **(ii) K=4 が最良点で，draft 長を伸ばすほど得ではない**: a_K は K とともに単調増加（1.86→2.16→2.29）するが増分は
+  逓減し，一方で検証コスト K·ratio_K は K=8 で増える（1.506→1.512→1.704）ため，実効利得は K=4 で最大・K=8 で目減り
+  （1.43→1.35）する．**B3 を進める場合の draft 長の第一候補は K=4**．K=8 への延伸は a_K の飽和で割に合わない．
+- **(iii) prompt-lookup（n-gram）は E2B 主軸の妥当性を補強しただけ**: prompt-lookup は open_chat（α=0.013）・code
+  （α=0.057）で無力で，入力接地が n-gram 重複として現れる要約・抽出的 QA（α=0.36／0.52）でのみ効く．同じ code で E2B は
+  α=0.516 と機能しており，**汎用 draft には n-gram 単独では不適，go/no-go は E2B に依存させた計画判断は正しかった**．
+  補助指標は主指標を動かさずに枠組みの妥当性検証に徹する使い方が有効，という運用面の学びでもある．
+- **(iv) B9 を諮る前に残る未測 3 因子（analyst 申し送り）**: (a) **relay 1 往復化のプロトコルオーバーヘッド**（＝SL3/B9
+  本体そのもので，1.43 倍の compute 利得を通信コストがどれだけ食うかが B3 の実 end-to-end 速度を左右する最大の未測因子），
+  (b) **プロンプト分布の代表性**（本測定は 4 カテゴリ均等 16 件のトイ集合．open_chat 比率が高い運用では全体 α は下振れ），
+  (c) **長文生成での α 安定性**（本測定は `N_MAX_NEW_TOKENS=48` の短い生成長）．(a) は B9 本体，(b)(c) はオフラインで
+  安価に潰せる余地があるが，本 reflector では次レバーを config 既定候補から選ぶ制約に従い自律選定の対象外とした（§4）．
+
+**3. B9（B3 本体＝relay プロトコル改修＝SL3 の go/no-go）の扱い: needs-human のまま維持（今回 reflector では自動判定しない）**
+
+- **判断**: SL1（compute 天井）×SL2（採択率）が出揃い，B9 の判断材料（実効 compute 利得 ≈1.4 倍・K=4 最良）は揃った．
+  ただし B9 は「不可逆・大規模な relay プロトコル改修（`pipeline_inference.py` ホットパス改変・検証木・51 ノード再デプロイ）」の
+  go/no-go であり，research-cycle の自律判断ポリシー（不可逆/大規模は人間判断）に該当する**不可逆判断**である．したがって
+  この reflector フェーズでは go/no-go を自動選択せず，B9 は `[needs-human]` のまま**維持（差し替えない）**．
+- **状況**: B9 の論点は「この ≈1.4 倍の compute 利得を relay プロトコル改修コスト（未測）が上回るか」へ移行しており，
+  既に別途 Slack（`<@U08GLKY1QCW>` mention 付き）で報告済み．今回の通常サマリー投稿では重複 mention を避ける．人間の
+  回答を待って continue 時に，回答内容に応じて SL3 着手（go）か別レバー継続（no-go/保留）を決める．
+
+**4. 次に振るレバーの決定（Iteration 7）: NUM_MICRO_BATCHES（research_frontier② のスループット感度）を自動選定**
+
+- **決定（自律判断・可逆）**: Iteration 7 の単一レバーを **`NUM_MICRO_BATCHES`（config `levers` 最優先候補，
+  research_frontier② の「マイクロバッチ数・stagger interval のスループット感度分析」の枠組みで振る）**とする．B9 の人間
+  回答を待たずに自律実行できる軽量な項目で，B3 の compute 律速（B9，人間判断待ち）とは**直交する軸**であり，人間回答を
+  待つ間に研究を停滞させないための選定である．
+- **選定理由**: (1) B9 が人間判断待ちの間，reflector が自律的に選べる項目は config `research_frontier` ②③④ または `levers`
+  の 4 候補に限られる（不可逆な SL3/B9 へは踏み込まない）．その中で `NUM_MICRO_BATCHES` は `levers` 一覧の**最優先**
+  （順序＝優先度）で，B6 が ②/⑤ 着手時の実験前提条件（`--iter Iter{n}` 変数化・冷開始交絡除去・各水準 n≥3〜5 反復・
+  主指標 ITL/TTFT）を既に申し送り済みで planner が即着手できる．(2) 実機 deploy/predict を伴うが B7 の包括承認（非破壊
+  SSH/deploy）の範囲内で自律実行可．(3) 破壊的操作を含まず可逆．
+- **重要な留保（planner への申し送り）**: Iter4 で「`NUM_MICRO_BATCHES` は**単一リクエストの ITL では Σcompute 不変・
+  残差止まり**（支配項 compute に効かない）」と確定済みである．したがって単発デモ（`"Hello!"` 1 件）を回すだけでは
+  スループット差は出ない．②の感度を意味あるものにするには，**planner が複数リクエスト同時投入／連続バッチのワークロード
+  を設計し，パイプラインバブル低減が効く条件（micro-batch 数を増やすと段間の遊びが埋まる状況）を作る**必要がある．
+  この設計が過大（`pipeline_inference.py` ホットパス改変を要する等）と判明した場合は，SEQ_LEN（④）や STAGGER_INTERVAL
+  へ振り替えるか，backlog へ `[needs-human]` 登録して諮ること．
+- **見送り（非選定）の理由**: SL3／B3 本体は §3 のとおり B9（人間判断待ち・不可逆）．STAGGER_INTERVAL は起動時
+  thundering herd 回避が主目的で単発 ITL への寄与が小さく，SEQ_LEN（④）・WORLD_SIZE（③）は品質/メモリ・層割当粒度の
+  トレードオフで今回の「軽量に振れる待ち時間の使い道」としては `NUM_MICRO_BATCHES`（最優先レバー）に劣後する．
+  backlog に `## B12 [auto-decided 2026-07-19]` として本決定を記録した．
+
+**次イテレーションへの結論**: Iteration 6（SL2: draft 採択率のオフライン見積もり）を**採用で確定・収束**（overall α=0.5856・
+a_2=1.8562 で go 条件を両方充足＝SL1 の compute 天井を実効利得へ現実化する下限条件をクリア．SL1×SL2 合成の実効 compute
+利得は最良 K=4 で ≈1.43 倍）．B3 本体（SL3）go/no-go の B9 は判断材料が揃ったが不可逆判断のため `[needs-human]` のまま
+維持し，人間の回答を待つ．Iteration 7 は `NUM_MICRO_BATCHES`（research_frontier② のスループット感度）を自動選定して開始
+する（B9 回答を待つ間，直交軸で研究を進める）．
+
+### 実験（再実行・成功） (Iter6)
+
+**担当**: 実験フェーズ subagent（2026-07-19T15:35〜16:15 JST）．`### 実装（HF キャッシュ revision 修正）(Iter6)` の
+対処後，`unset VIRTUAL_ENV && uv run python scripts/estimate_draft_acceptance.py` を再実行（既に起動済みだったプロセス
+PID 1097153/1097157 を監視するのみで，新規プロセスは起動していない）．実機クラスタへの接続・deploy・SSH・HF キャッシュ
+の書き換えは行っていない．
+
+- **結果: 正常完了**．所要時間 約 39 分（開始 15:35 → `results/draft_acceptance.jsonl` 書き込み完了 16:15:17）．
+  `run.log` にエラー・例外なし（`torch_dtype` deprecated 警告のみ）．デッドライン 17:35 に対し余裕あり．
+- **出力先**: `results/draft_acceptance.jsonl` 1 行目に 1 レコード追記（新規ファイル，既存 `Iter1/3/4.jsonl` や
+  `bench_compute_ceiling.jsonl` は無変更）．
+
+#### 主要数値（解釈・良否判定は analyst フェーズへ）
+
+- `overall_alpha_e2b = 0.5856`（E2B draft の全体採択率）．カテゴリ別: `open_chat=0.5000`／`summarization=0.7197`／
+  `doc_qa=0.6923`／`code=0.5156`．
+- prompt-lookup（n-gram, 補助・A-2 検証用）カテゴリ別 α: `open_chat=0.0130`／`summarization=0.3567`／
+  `doc_qa=0.5192`／`code=0.0573`（入力接地型で高く開放チャットでほぼゼロ，計画で想定した傾向と一致）．
+- 経験 `a_K`（K別平均採択長，E2B）: `K=2: 1.8562`／`K=4: 2.1595`／`K=8: 2.2934`．α からの予測値
+  （`K=2: 1.9285`／`K=4: 2.2469`／`K=8: 2.3935`）と近似し，大きな乖離なし．
+- **SL1×SL2 合成**（`a_K × ratio_K` と `gain_over_baseline`，SL1 の実測 `ratio_K={2:0.753,4:0.378,8:0.213}` と合成）:
+  `K=2: product=1.3977, gain=1.2325`／`K=4: product=0.8163, gain=1.4283`／`K=8: product=0.4885, gain=1.3459`．
+- プロンプト数 16（4 カテゴリ×4 件），`n_max_new_tokens=48`．per-prompt 内訳は `results/draft_acceptance.jsonl`
+  の `per_prompt` フィールドに全件保存済み．
+
+### 分析(解釈) (Iter6)
+
+**担当**: 分析(解釈) subagent（2026-07-19）．`### 実験（再実行・成功） (Iter6)` の実測値と `results/draft_acceptance.jsonl`
+の `per_prompt` 全 16 件を Read し，`### 検討・計画 (Iter6)` §4 の成功条件・判定の解釈指針（位置数 ≥50 のみ有意な層別値／
+a_2≳1.5・α≳0.5 で go 方向／a_K≈1・α≲0.1 で no-go 方向／中間は SL1 ratio_K との積で期待値レンジ）に照らして解釈した．
+実機への接続・実行・`results/draft_acceptance.jsonl` への書き込みはしていない（読み取りのみ）．α は greedy で決定的
+（run 間分散ゼロ）ゆえ，ノイズ評価は位置数（＝参照トークン数）で行い，過去反復の標準偏差ではなく決定的量の位置数依存性で判定した．
+
+**前提（判定の枠組み）**: SL2 の判定対象は「B3（speculative decoding）の**期待値側の因子＝draft 採択率**が，draft の per-token
+compute 削減（SL1 で確定した compute 天井）を実効利得として現実化させる下限条件を満たすか」であり，B3 本体の実レイテンシ低減量
+そのものではない．判定は E2B draft の全体 α・a_K を主根拠とし，prompt-lookup は A-2 検証（E2B を主軸に据える妥当性の裏付け）
+の補助に留める（計画 §2 の一本化どおり，prompt-lookup で go/no-go を動かさない）．
+
+**1. ノイズ判定: 全 4 カテゴリが位置数 ≥50 を満たし，層別値は全て有意（ただし doc_qa は下限ぎりぎり）．全体 α は十分な母数**
+
+- `per_prompt` の `num_reference_tokens` をカテゴリ別に集計した位置数（＝α を測った照合位置数）: **open_chat=154／
+  summarization=157／doc_qa=52／code=192，全体=555**．計画 §4 の閾値「位置数 ≥50 のみ有意な層別値」を**全カテゴリが充足**する
+  ため，カテゴリ別 α は 4 種とも有意な層別値として扱える．ただし **doc_qa は 52 と閾値ぎりぎり**（計画 §3 が目標とした
+  ≈150 位置/カテゴリには届かない．doc_qa の参照出力が短い＝QA 回答が 18/10/15/9 トークンと簡潔なため）で，doc_qa の α=0.6923 は
+  有意だが層別推定としては相対的に薄い（解釈は全体値優先）．
+- **全体 α=0.5856 は 555 位置に基づく**（計画 §3 の全体 ≈600 位置想定にほぼ一致）．greedy ゆえ α は決定的量で run 分散はゼロ，
+  推定誤差は位置数のみに支配される．555 位置は「見かけの増減か有意か」を論じるまでもなく，**全体値を主たる判断根拠に据えられる
+  水準**である（計画の指針どおり，doc_qa の薄さを含む層別ノイズは全体値で吸収する）．
+- カテゴリ内ばらつき（per-prompt α の min/max）: open_chat 0.479–0.542／summarization 0.629–0.783／doc_qa 0.556–0.778／
+  code 0.417–0.625．各カテゴリ内で符号が割れる（一部が α≈0 に落ちる）ことはなく，**層別値の向きは安定**している．
+
+**2. 判定結果: go 方向を強める（下限条件クリア）．全体 a_2=1.86≳1.5 かつ α=0.586≳0.5 に明確に該当**
+
+- 計画 §4 の解釈ガイド「**E2B の全体 a_2≳1.5（α≳0.5）**なら SL1 の compute 天井が実効利得として現実化する下限条件クリア＝
+  B3 go 方向を強める」に対し，実測は **a_2=1.8562（≳1.5）・overall_α=0.5856（≳0.5）**で**両条件とも充足**．no-go 方向の
+  条件（a_K≈1・α≲0.1）からは大きく離れる（最小の a_2=1.86 でも 1 を大幅に超える）．したがって本 SL2 は **go 方向を強める**
+  領域に該当し，中間域（SL1 ratio_K との積で期待値レンジを提示して B9 で諮る）ではなく**下限条件を明確にクリアした**と判定する．
+- **α→a_K 写像の整合**: A-1 の式 `E=(1-α^(K+1))/(1-α)` による予測 a_K（K=2:1.9285／4:2.2469／8:2.3935）と経験 a_K
+  （1.8562／2.1595／2.2934）の乖離は各 K で 3.8%／3.9%／4.2% と小さく，**経験値が一貫して予測をわずかに下回る**．これは iid 幾何
+  近似に対し実系列が非 iid（序盤位置ほど採択されやすく，後半で不一致が出やすい）であることの符号として自然で，想定外の挙動
+  ではない．写像が数％以内で成立するため，α と a_K は相互変換可能な整合した量として扱える．
+- 想定外挙動（言語崩れ・発散・OOM 等）は無し．実験は 39 分で正常完了し，run.log にエラーなし（`torch_dtype` deprecated 警告のみ）．
+
+**3. prompt-lookup（A-2 検証）: 開放チャット≈0 は予想どおり．ただし code も低く，E2B を主軸に据える妥当性をむしろ補強**
+
+- prompt-lookup（n-gram）カテゴリ別 α: open_chat=0.0130／summarization=0.3567／doc_qa=0.5192／code=0.0573．**開放チャットで
+  ほぼゼロ（0.013）**は A-2 の予想「開放チャットでは入力↔出力の n-gram 重複が乏しく採択率≈0」と**一致**．summarization=0.357／
+  doc_qa=0.519 が高いのも「入力接地型で高い」予想と一致する．
+- **予想からの部分的ズレ（重要な補強材料）**: A-2 は code（コード編集）も入力接地型として高採択を予想したが，実測 code=0.0573 は
+  open_chat 並みに低い．本イテレーションの code タスク（docstring 追加・バグ修正・型ヒント付与・実装補完）は**出力が入力の
+  n-gram コピーではなく新規生成**のため，直近 n-gram の入力内マッチが効かなかったと解釈できる．一方で**同じ code で E2B は
+  α=0.5156 と機能している**．すなわち prompt-lookup は「入力接地の形が n-gram 重複として現れるタスク（要約・抽出的 QA）」に
+  限って効き，code のような生成的タスクでは開放チャット同様に崩れる．これは計画 §2 が E2B を主軸（開放チャットでも効く汎用性・
+  prompt-lookup の弱点 A-2 を持たない）に据えた判断を**むしろ補強する**（prompt-lookup 単独では code・open_chat の 2 カテゴリで
+  無力＝汎用 draft には不適，go/no-go は E2B に依存させて正解）．
+
+**4. B9（B3 本体＝relay プロトコル改修 go/no-go）への材料: compute 側の実効利得は 1.23〜1.43 倍（K=4 が最良）．上限側は埋まったが期待値側の一部と relay コストは未測**
+
+- **合成利得の意味**: `gain_over_baseline = a_K /(K·ratio_K)`（実測で K=2:1.2325／K=4:1.4283／K=8:1.3459．算出式を per_prompt から
+  逆算し確認済み）は，「1 検証ステップで draft の K 提案を 1 回の GEMM（K 位置）で検証し a_K トークンを確定する」ときの，通常の
+  逐次 GEMV（per-token compute=1）に対する **per-token compute の実効削減倍率**である．SL1（GEMM 効率＝ratio_K）と SL2（採択率＝a_K）
+  を掛け合わせた B3 の **compute 側実効利得の期待値**にあたる．
+- **数値の大小の意味づけ（B9 の核心）**: SL1 単独では ratio_8=0.213＝理論上 per-token compute を最大 1/0.213≈4.7 倍にできる余地が
+  あった（Iter5 の学び）．しかし採択が理想化されない現実（α=0.586，a_K が K に届かない）を織り込むと，**compute 側利得は最良でも
+  ≈1.43 倍（K=4）に縮む**．つまり **SL1 の 4.7 倍の compute 天井のうち，採択率が大半を食い潰し，残る実効 compute 利得は 1.4 倍
+  程度**というのが SL1×SL2 合成の結論である．これは Iter5 §2(iii)「残る不確実性は期待値側（採択率）に集約」への定量的回答で，
+  採択率は「B3 を no-go にするほど低くはない（下限クリア）が，compute 天井を実効利得として満額は取れない」水準だと分かった．
+- **K 依存性の解釈**: 利得は **K=4 で最大（1.43 倍）**．a_K は K とともに単調増加（1.86→2.16→2.29）するが増分は逓減し，一方
+  K·ratio_K（検証コスト）は K=8 で増える（1.506→1.512→1.704）ため，積の比は K=4 が最良点になる．**B3 を進める場合の draft 長は
+  K=4 が第一候補**．K=8 まで伸ばしても a_K の伸びが飽和し検証コスト増で利得はむしろ目減りする（1.43→1.35）．
+- **何が測れて何が未知か（B9 の残論点）**:
+  - 測れた: (i) draft 採択率 α と a_K（E2B・16 プロンプト・4 カテゴリ層別），(ii) SL1×SL2 合成の compute 側実効利得（1.23〜1.43 倍，
+    K=4 最良），(iii) 生成品質は greedy exact-match 採択の構成上ロスレス（speculative decoding のアルゴリズム的性質で品質劣化なし）．
+  - **未知（B9 で人間が織り込むべき）**: (a) **relay 1 往復化のプロトコルオーバーヘッド（SL3/B9 本体）**＝分散 51 ノードで draft 提案と
+    target 検証を 1 往復に畳む通信コストは本 SL2 に含まれない．この relay コストが 1.4 倍の compute 利得をどれだけ食うかが B3 の
+    実 end-to-end 速度を左右する最大の未測因子．(b) **プロンプト分布の代表性**: 実運用のタスク構成（開放チャット比率が高いか，
+    入力接地型が多いか）で全体 α は動く（本測定は 4 カテゴリ均等 16 件のトイ集合．open_chat が多い運用なら α は下振れ）．
+    (c) 本測定は N_MAX_NEW_TOKENS=48 の短い生成長での α．長文生成での α の安定性は未確認．
+
+**分析の結論**: SL2（E2B draft 採択率）は **go 方向を強める**（全体 a_2=1.86≳1.5・α=0.586≳0.5 で下限条件を明確にクリア，
+no-go 域からは遠い）．ノイズ判定は全 4 カテゴリが位置数 ≥50 を満たし層別値は有意（doc_qa は 52 で薄いため全体値を優先），
+全体 α=0.5856 は 555 位置に基づく決定的量で確信度は高い．prompt-lookup は open_chat・code で崩れ E2B 主軸の妥当性を補強．
+SL1×SL2 合成の compute 側実効利得は 1.23〜1.43 倍（**K=4 が最良**）で，SL1 の 4.7 倍 compute 天井の大半は採択率が食い潰すが
+B3 を棄却するほど低くはない．B3 go/no-go は「この 1.4 倍の compute 利得を relay プロトコル改修コスト（未測）が上回るか」に論点が
+移る．追加反復の要否: SL2 の judgment 自体は決定的量ゆえ**追加反復不要**．ただし B9 を諮る前に，relay オーバーヘッドの見積もり
+（別レバー）とプロンプト分布の代表性の確認が残課題として次の考察・次計画フェーズ（rc-reflector）へ申し送る．
+
+### 調査 (Iter6)
+
+**担当**: 調査フェーズ subagent（2026-07-19）．単一レバー **SL2（draft 採択率のオフライン見積もり）**の計画に必要な，
+(A) 採択率見積もり手法の先行研究，(B) 既存コード（`pipeline_inference.py` の生成・トークナイズ・サンプリング）と
+ローカル資産（モデル重み・トークナイザ）の制約，を調べた．実機クラスタへの接続・deploy・relay 改修は一切していない
+（コードと文献の読み取り，および `~/.cache/huggingface`・`models/splits` のメタデータ確認のみ）．
+
+#### 調査の問い
+
+1. speculative decoding の draft 採択率（acceptance rate）をオフラインで見積もる標準手法は何か（prompt-lookup/n-gram
+   と小 draft モデルの両系統）．測定指標はどう定義され，採択率から実効速度への写像はどう与えられるか．
+2. 本リポジトリのユースケース（Gemma-4-31B・分散パイプライン並列・CPU・greedy 生成）で，relay 改修・再デプロイなしに
+   「draft 生成 → 検証 → 採択率算出」を単一プロセスで完結できるか．既存コード・ローカル資産の制約は何か．
+
+#### A. 分かったこと（採択率見積もり手法・出典付き）
+
+- **A-1 採択率の指標定義（写像が計画の要）**: speculative decoding の実効利得は「1 検証ステップあたり確定するトークン数
+  （block efficiency / mean accepted length）」で決まる．greedy target 検証では **draft の第 i トークンは target の argmax と
+  一致したときのみ採択**（決定的な exact-match）で，最初の不一致で打ち切り＋target が 1 個の bonus トークンを出す．
+  Leviathan et al. 2023「Fast Inference from Transformers via Speculative Decoding」の期待トークン数は
+  **E[生成トークン/ステップ] = (1 − α^(γ+1)) / (1 − α)**（α＝1 トークンあたり採択確率，γ＝draft 長＝K）．
+  これが **SL2 で測る α を実効利得へ写像する式**であり，SL1 の per-token compute 比（ratio_K）と掛け合わせると B3 の
+  期待利得レンジが数値で括れる（出典: arxiv.org/abs/2211.17192，および vLLM の acceptance/mean-acceptance-length 定義
+  docs.vllm.ai の `vllm.v1.spec_decode.metrics`）．
+- **A-2 prompt-lookup（n-gram）draft の傾向と測定法**: draft モデルを使わず，直近生成 n-gram を **入力（プロンプト＋既生成）
+  内で文字列マッチ**し，一致継続列を candidate として提案する（apoorvumang/prompt-lookup-decoding，github.com）．著者の
+  実測条件は **max n-gram=3・continuation length=10・greedy**．**入力接地型タスク（要約・文書 QA・コード編集・多ターン
+  チャット）で入力↔出力の n-gram 重複が高いとき 2〜4 倍高速化，品質不変**．逆に**開放的な短文チャットでは重複が乏しく
+  採択率はほぼゼロに落ちる**（zenml.io，aphrodite/vLLM の ngram prompt-lookup 解説も同旨）．**含意（重要）**: 本リポジトリの
+  デモプロンプトは `"Hello!"`（出力 15 トークン `"Hello! How can I help you today?\nthought"`，`results/Iter4.jsonl`）で入力接地性が
+  無く，prompt-lookup をこの 1 プロンプトだけで測ると採択率≈0 という**過小評価**になる．prompt-lookup を公平に測るなら
+  要約・QA・コードなど入力接地型プロンプト集合が要る．
+- **A-3 小 draft モデルの採択率オフライン測定法**: 標準手順は「target の greedy 参照系列を確定 → 同一プレフィックスを
+  draft に食わせ K トークン提案 → target argmax と逐位置照合し，最初の不一致までの採択長を集計」．必要データは
+  (i) target と **同一トークナイザ／語彙**の小 draft モデル，(ii) 評価プロンプト集合，(iii) target の参照 argmax 系列．
+  採択率が低いと draft の予測精度不足で利得が出ない点が既知の弱点（Online Speculative Decoding, arxiv.org/abs/2310.07177）．
+- **A-4 本ユースケースに近い事例**: CPU・分散パイプライン・Gemma に完全一致する公開事例は見当たらなかった（Gemma-3 の
+  spec decoding は主に GPU ランタイム LM Studio/Ollama/TensorRT-LLM 文脈）．ただし **採択率の測定自体はランタイム非依存**で，
+  target と draft の logits/argmax があれば CPU 単機でも成立する（採択率はモデル対の性質で，実行ハードに依らない）．
+
+#### B. 既存コード・ローカル資産の制約（SL2 をローカル単一プロセスで完結できるか）
+
+- **B-1 生成規則（複製すべき target の判定則）**: 最終 rank は `hidden → final_norm → lm_head(F.linear) →
+  final_logit_softcapping=30 の tanh → argmax`（`pipeline_inference.py:1600-1618`）で **greedy・決定的**．softcapping は
+  単調変換で argmax を変えないが，参照再現では忠実に含めてよい．**greedy なので採択判定は exact-match で厳密**（サンプリング
+  時の確率的採択の近似は不要）＝オフライン測定が素直．
+- **B-2 トークナイズ**: `_tokenize()`（`:110-129`）が Gemma-4 chat template（`apply_chat_template` + `encode`,
+  `add_generation_prompt=True`）を適用．参照系列・draft の入出力は**この同じ経路でトークナイズすべき**（生テキスト直 encode は
+  IT モデルで挙動が変わる）．
+- **B-3 ローカル資産（オフライン化の決定的な後押し）**:
+  - target **`google/gemma-4-31B-it` のフル重みがローカルに二重に存在**: `~/.cache/huggingface/hub/models--google--gemma-4-31B-it`
+    （59GB・safetensors 5 本，tokenizer/config 含む）と `models/splits/`（60GB・`embed_tokens`＋`layer_0..59`＋`lm_head`）．
+    語彙は embed サイズ 2818572416B ÷ (5376 hidden × 2B bf16) ≈ **262144**．
+  - **小 draft 候補 `google/gemma-4-E2B` がローカルに存在**（`~/.cache/.../models--google--gemma-4-E2B`，9.6GB・
+    `model.safetensors`，tokenizer/config 揃い）．`model_type=gemma4`・**`vocab_size=262144`＝target と一致**（＝同一トークナイザ，
+    token ID 直接照合可），`num_hidden_layers=35`・`hidden_size=1536`・`num_kv_heads=1`（実効 ~2B 級）．**同一 Gemma-4 系
+    ＝語彙一致の小 draft が既に手元にある**のは A-3 の要件 (i) を満たす理想条件．
+  - 実行ホスト RAM: 125GB（available 89GB）．draft(E2B)＝軽量で確実に載る．target 31B は bf16 で 59GB＝**単機ロードも一応可能
+    （余裕は小）**．より安全には `models/splits` を layer 単位でストリーム（load→compute→free）して参照生成する手もあるが，
+    **手元 HF キャッシュに 31B フル重みがある以上，`transformers` で `AutoModelForCausalLM.from_pretrained(..., torch_dtype=bfloat16,
+    device_map="cpu", local_files_only=True)` を単機ロードして greedy 参照を出すのが最短**（クラスタ・relay・deploy 完全不要）．
+- **B-4 既存ログの限界**: `results/*.jsonl` は `result_text`（デコード済み文字列）は持つが **generated_ids（トークン列）を持たない**
+  し，プロンプトは `"Hello!"` 1 種のみ（`results/Iter4.jsonl`）．よって**既存ログだけでは採択率は測れず**，参照系列は
+  ローカルで新規生成する必要がある（B-3 によりこれはクラスタ非接触で可能）．
+- **B-5 relay 改修は不要**: SL2 は「採択率という**モデル対の統計量**」の推定であり，実運用の relay 1 往復化（SL3/B9）を一切
+  含まない．`pipeline_inference.py` ホットパスも 51 ノード再デプロイも不要で，B10 の申し送り「クラスタ本体への大改変が要れば
+  needs-human 登録」に**抵触しない**（ローカル単一プロセスで完結する見込み）．
+
+#### C. 次フェーズ（rc-planner）への具体的示唆
+
+- **測定指標の定義（planner が固定すべき）**: 主指標は **K∈{2,4,8} ごとの平均採択長 a_K＝1 検証ステップで確定するトークン数**
+  （＝1＋最初の不一致までの採択数）と，**1 トークンあたり採択率 α**．A-1 の式で a_K と α は相互変換でき，SL1 の ratio_K と
+  組めば実効利得 ≈ a_K × (per-cycle コスト)⁻¹ の期待値レンジが出る．SL1 の K 値（2/4/8）に採択率の K を揃えると接続が綺麗．
+- **候補 draft 戦略（2 系統，両方測るのが安価で情報量大）**:
+  - **(C-1) 小 draft モデル＝`gemma-4-E2B`**: 語彙一致・ローカル在・軽量で第一候補．target(31B)greedy 参照に対する
+    exact-match 採択長を測る．**開放チャットでも効く**汎用性が prompt-lookup より高い見込み．
+  - **(C-2) prompt-lookup（n-gram, max=3・cont=10）**: モデル追加ゼロ・実装数十行．ただし A-2 より**入力接地型プロンプトで
+    ないと採択率≈0**．`"Hello!"` 単独では過小評価になるため，公平比較には入力接地型プロンプトが必須．
+- **参照データの取り方**: (a) **プロンプト集合**を小規模（例: 開放チャット数件＋要約/QA/コード編集など入力接地型数件，計
+  10〜30 件）に定義し，(b) 各プロンプトで **target(gemma-4-31B-it) を単機 greedy 生成**（`_tokenize` と同じ chat template・
+  `final_logit_softcapping=30`・argmax を再現）して参照 argmax 系列を作る（クラスタ非接触）．(c) 同系列上で (C-1)(C-2) の
+  採択長を集計．prompt-lookup の弱さを可視化するため**タスク種別ごとに採択率を層別集計**すること．
+- **既存コードとの接続点**: トークナイズは `pipeline_inference.py:_tokenize()` を再利用（chat template 一致），採択判定則は
+  `:1600-1618` の greedy+softcapping+argmax を複製．実装は Iter5 の `scripts/bench_compute_ceiling.py` と同じ **`scripts/` 配下の
+  独立スクリプト＋純関数テスト**方針が踏襲可能（`pipeline_inference.py` 非改変）．結果は `results/*.jsonl` へ追記（SL1 と同形式）．
+- **想定コスト/リスク**: target 31B の CPU 単機 greedy 生成は低速（実機 i5 で ~7s/token，実行ホスト 64 コアなら数倍速いが
+  依然重い）．**参照生成の総トークン数を絞る**（プロンプト数×最大新規トークン数を小さく）ことで数十分〜数時間に収める設計を
+  planner が置くべき．採択率は決定的量（greedy）ゆえ n=1 でも安定だが，プロンプト多様性が結論を左右する（A-2 の教訓）．
+- **人間判断の要否**: 現時点では **needs-human 事項は発生していない**（SL2 はローカル完結・可逆）．ただし planner が
+  「31B 参照生成を実機クラスタ経由で取得する」設計を選ぶ場合は B7 包括承認内の非破壊 SSH で可（それでも破壊的操作なし）．
+  ローカル完結（B-3 の HF キャッシュ利用）が最短かつクラスタ無負荷で推奨．
+
+**出典**: Leviathan et al. 2023, arxiv.org/abs/2211.17192（採択率→期待トークン式）; apoorvumang/prompt-lookup-decoding,
+github.com（n-gram draft・入力接地型で 2〜4×・max n-gram=3/cont=10/greedy）; Online Speculative Decoding, arxiv.org/abs/2310.07177
+（低採択率が利得を削ぐ）; vLLM `vllm.v1.spec_decode.metrics`, docs.vllm.ai（acceptance rate / mean acceptance length 定義）;
+zenml.io・aphrodite prompt-lookup 解説（n-gram 適用範囲）; ローカル資産: `~/.cache/huggingface/hub/models--google--gemma-4-{31B-it,E2B}`,
+`models/splits/split_info.json`, `pipeline_inference.py:110-129,1600-1618`, `results/Iter4.jsonl`．
+
+### 検討・計画 (Iter6)
+
+**担当**: 計画フェーズ subagent（2026-07-19）．`### 調査 (Iter6)` の結論（A-1 写像式・A-2 prompt-lookup の適用域・A-3
+小 draft の測定法・B-1〜B-5 のローカル資産と非改変性）を受け，単一レバー **SL2（draft 採択率のオフライン見積もり）**を
+実装可能な粒度へ落とし込んだ．本フェーズは実機クラスタへの接続・deploy・推論を一切行わない（コード／config／HF キャッシュ
+メタデータの読み取りのみ）．**確認事実**: `google/gemma-4-31B-it`（target, vocab=262144, `final_logit_softcapping=30.0`）と
+`google/gemma-4-E2B`（draft, `model_type=gemma4`, text vocab=**262144 一致**, softcapping=30.0, 35 層, hidden=1536,
+単一 `model.safetensors` 9.6GB）が HF キャッシュにローカル在．**語彙・softcapping が完全一致**＝**token ID を直接 exact-match
+照合可**．softcapping は単調変換で greedy argmax を変えない（B-1）ため，参照 argmax はモデル logits の argmax で取得してよい．
+
+#### 1. 仮説
+
+B3（speculative decoding）の**期待値側の因子＝draft 採択率**を，relay 改修・再デプロイなしにオフライン単一プロセスで
+見積もれる．具体的には，target(31B) の greedy 参照系列に対し draft(E2B) が提案する K トークンの exact-match 採択長を測れば，
+**1 トークンあたり採択率 α** と **K∈{2,4,8} ごとの平均採択長 a_K** が確定する．α が十分高ければ（例 α≳0.5 で a_2≳1.5），
+SL1 の実機 ratio_K（0.753/0.378/0.213）と組んで B3 の実効利得レンジを数値で括れる（go 方向を強める）．逆に α≈0（a_K≈1）なら
+draft は無力で，SL1 の compute 天井があっても B3 の実効利得は崩れる（no-go 方向）．prompt-lookup（n-gram）は入力接地型
+タスクでのみ α>0，開放チャットでは α≈0 という A-2 の傾向が，タスク種別層別で再現するはずである．
+
+#### 2. 単一レバー・変更内容
+
+**単一レバー**: 「診断対象を，SL1 の compute マイクロベンチ（GEMV vs GEMM）から，**draft/target 対の採択率オフライン測定**へ移す」
+の 1 点．クラスタ・relay・`pipeline_inference.py` は一切変更しない（固定）．draft 戦略の位置づけは以下に一本化する（単一レバー原則）:
+
+- **主軸（go/no-go の決定的入力）＝小 draft モデル `gemma-4-E2B`**．理由: (i) 語彙・softcapping が target と一致し token ID 直接
+  照合可，(ii) 軽量・ローカル在で単一プロセス完結，(iii) 開放チャットでも効く汎用性（prompt-lookup の弱点 A-2 を持たない），
+  (iv) B3/SL3 が実運用で載せる draft の実体に最も近い．**SL2 完了判定と B3 期待値レンジの数値化は E2B の α・a_K で行う**．
+- **補助（安価な比較・A-2 の検証のみ）＝prompt-lookup（n-gram, max=3・cont=10）**．追加モデルゼロ・実装数十行．**主指標には
+  用いず**，タスク種別層別で「入力接地型では α>0／開放チャットでは α≈0」を可視化して E2B を主軸に据える妥当性を裏付けるだけの
+  位置づけとする（結論は E2B に依存させ，prompt-lookup の結果で go/no-go を動かさない）．
+
+**変更ファイル（新規のみ・クラスタ非接触，Iter5 の `scripts/` 独立スクリプト方針を踏襲）**:
+- 新規 `scripts/estimate_draft_acceptance.py`．責務: target(31B) の greedy 参照生成 → draft(E2B) 提案 → exact-match 採択判定 →
+  α・a_K 算出 → SL1 ratio_K との合成で B3 実効利得レンジを出力．
+- 新規 `tests/test_estimate_draft_acceptance.py`（純関数の単体テスト）．
+- （`pipeline_inference.py`・`tools/*.py` は非改変．結果は `results/draft_acceptance.jsonl` へ追記＝SL1 と同形式．）
+
+**スクリプト設計**:
+- **(a) プロンプト集合（層別）**: 4 カテゴリ × 4 件 = **計 16 プロンプト**をスクリプト内に定数定義する．カテゴリは
+  `open_chat`（開放チャット・入力非接地，既存デモ `"Hello!"` を含む）／`summarization`（短文書＋要約指示）／`doc_qa`（提示文脈への
+  QA）／`code`（短いコード補完・編集）．入力接地型 3 種を含めることで prompt-lookup を過小評価しない公平な設計にする（A-2）．
+- **(b) トークナイズ**: `pipeline_inference.py:_tokenize()`（:110-129, Gemma-4 chat template・`add_generation_prompt=True`）を
+  複製し，target・draft とも同一経路でトークナイズする（生 encode は IT モデルで挙動が変わるため不可，B-2）．
+- **(c) target 参照生成**: `AutoModelForCausalLM.from_pretrained("google/gemma-4-31B-it", torch_dtype=bfloat16,
+  device_map="cpu", local_files_only=True)` を単一プロセスにロードし，各プロンプトで **greedy に最大 `N_MAX_NEW_TOKENS` 個**
+  生成して参照 argmax token 列を得る（`torch.set_num_threads` は SL1 と同条件・EOS で打ち切り）．判定則は `:1600-1618` の
+  greedy を踏襲するが，softcapping は argmax 不変（B-1）のため **model logits の argmax を参照に採る**（softcap 適用は任意，
+  適用しても結果同一）．参照系列はカテゴリ別に `results/draft_acceptance.jsonl` へ保存し，再現・再解析可能にする．
+- **(d) draft 提案と採択判定（純関数化）**: 参照系列上を **検証ステップのブロック単位**で歩く．各ブロック開始プレフィックス
+  （chat template + 既確定 token）を draft(E2B) に食わせ **greedy に K トークン自己回帰提案**，参照 argmax と逐位置 exact-match
+  照合して**最初の不一致まで**を採択（最大 K）＋bonus 1 個で前進（accepted+1）．これを K∈{2,4,8} それぞれで実施し，
+  ブロック集計から **経験的 a_K（1 検証ステップで確定するトークン数）**を得る．
+- **(e) α と写像の相互検証**: K 非依存の**1 位置あたり採択率 α**（＝「真プレフィックス条件下で draft の greedy top-1 が target
+  argmax に一致する位置割合」）も別途集計する．A-1 の式 **E=(1-α^(K+1))/(1-α)** で α から予測した a_K と，(d) の経験 a_K を
+  併記し，iid 幾何近似の妥当性（実際は序盤位置ほど採択されやすく非 iid）を可視化する．
+- **(f) B3 実効利得レンジ（SL1×SL2 の合成・本イテレーションの成果物）**: 実機 SL1 の `ratio_K`（K=2/4/8=0.753/0.378/0.213）と
+  経験 a_K を組み，**1 検証サイクルで a_K トークンを K 位置 GEMM 1 回のコストで確定する**関係から，per-token compute の実効
+  利得レンジ（例 `a_K /(K·ratio_K)` 等の候補式）を数値出力する．**最終的な式選定と解釈は analyst に委ねる**が，スクリプトは
+  a_K・ratio_K・その積/比を素の数値として吐き，analyst が B9 go/no-go の材料にできる形にする．
+- **(g) prompt-lookup（補助）**: draft を使わず直近 n-gram（max=3）をプレフィックス内マッチ・continuation=10（K で切詰）で提案し，
+  同じ採択判定でカテゴリ別 α を出す．主指標に混ぜず，**A-2 検証用の層別テーブルとして併記**する．
+
+**定数化（マジックナンバー回避）**: `K_VALUES=(2,4,8)`（SL1 と一致）・`N_MAX_NEW_TOKENS=48`・`NUM_PROMPTS=16`（4 カテゴリ×4）・
+`NGRAM_MAX=3`・`NGRAM_CONT=10`・`TARGET_DTYPE=torch.bfloat16`・`DRAFT_DTYPE=torch.bfloat16`．
+
+#### 3. 実験規模（target 31B CPU 生成が律速．具体値）
+
+- **参照生成の総量上限**: 16 プロンプト × 最大 48 新規トークン = **target forward ≤ 768 ステップ**．SL1 実測（本 research-cycle
+  実行ホスト 64 コアで GEMV 1 層中央値 80.97ms）から 60 層＋lm_head で 1 トークン概ね数秒と見積もり，**総計 1〜2 時間程度**を想定
+  （EOS 早期打ち切りで実際は下振れ）．超過・OOM 時のフォールバック: (i) `N_MAX_NEW_TOKENS` を 48→32 に，(ii) 31B 単機ロードが
+  RAM 逼迫（bf16 59GB / available 89GB）で不安定なら `models/splits` の layer ストリーム（load→compute→free）に切替．いずれも
+  クラスタ非接触で可逆．
+- **draft(E2B) の生成コストは無視できる**（35 層・hidden 1536・9.6GB）．採択判定はブロック当たり最大 K 回の draft forward のみ．
+- **統計的安定性**: greedy ゆえ α・a_K は**決定的（run 間分散ゼロ）**．推定誤差は位置数に支配される．各カテゴリ 4 プロンプト×
+  最大 48 位置 ≈ **150 位置/カテゴリ**を確保し，カテゴリ別 α を安定推定する（全体 α は ≈600 位置）．
+
+#### 4. 成功条件（measurable．「SL2 が完了」と言える基準）
+
+実装・実行の完了条件（決定的）:
+1. `scripts/estimate_draft_acceptance.py` が単一プロセス（クラスタ・relay 非接触）で完走し，**E2B draft** について
+   (a) 全体 α，(b) カテゴリ別 α（`open_chat`/`summarization`/`doc_qa`/`code`），(c) K∈{2,4,8} ごとの**経験 a_K** を出力する．
+2. α→a_K の写像式 `E=(1-α^(K+1))/(1-α)` で予測した a_K と経験 a_K を**併記**し，乖離を数値で示す．
+3. prompt-lookup（補助）のカテゴリ別 α を併記し，**入力接地型>開放チャット**の傾向（A-2）を層別テーブルで可視化する
+   （傾向の向きが出れば可．prompt-lookup では go/no-go を判定しない）．
+4. **SL1×SL2 合成**: 実機 ratio_K（0.753/0.378/0.213）と経験 a_K を組んだ B3 実効利得レンジの素数値（a_K・ratio_K・積/比）を
+   出力する＝本イテレーションの成果物（analyst が B9 go/no-go の材料に使える形）．
+5. 純関数（exact-match 採択判定＝最初の不一致で打切り＋bonus，ブロック前進 accepted+1，α↔a_K 写像，n-gram lookup 提案）の
+   単体テストが **green（最低 4 件）**，`uv run python -m py_compile scripts/estimate_draft_acceptance.py
+   tests/test_estimate_draft_acceptance.py` がエラー無し．
+6. 変更は `scripts/estimate_draft_acceptance.py`／`tests/test_estimate_draft_acceptance.py` の**新規 2 ファイルのみ**
+   （`pipeline_inference.py` 他既存本体は非改変），結果は `results/draft_acceptance.jsonl` へ追記．
+
+判定の解釈指針（判定は analyst．ノイズは決定的量ゆえ位置数依存）:
+- α は greedy で決定的（run 分散ゼロ）．**カテゴリ別 α は位置数 ≥50 を満たすものだけを有意な層別値**として扱う．
+- 解釈ガイド（analyst 向け・拘束はしない）: **E2B の全体 a_2≳1.5（α≳0.5）**なら SL1 の compute 天井が実効利得として現実化する
+  下限条件クリア＝B3 go 方向を強める．**a_K≈1（α≲0.1）**なら draft 無力で B3 実効利得は崩れ no-go 方向．中間は SL1 ratio_K との
+  積で期待値レンジを提示し B9 で人間に諮る．
+
+#### 5. 実装フェーズ（rc-implementer）への申し送り
+
+- **対象ファイル・キー**: 新規 `scripts/estimate_draft_acceptance.py`（定数 `K_VALUES`／`N_MAX_NEW_TOKENS`／`NUM_PROMPTS`／
+  `NGRAM_MAX`／`NGRAM_CONT`／`TARGET_DTYPE`／`DRAFT_DTYPE`，純関数 `accepted_length()`（exact-match 打切り）／
+  `simulate_block_walk()`（ブロック前進で a_K 集計）／`alpha_to_expected_len()`（A-1 写像）／`ngram_lookup_propose()`，
+  参照生成 `generate_target_reference()`／draft 提案 `draft_propose()`），新規 `tests/test_estimate_draft_acceptance.py`．
+  トークナイズは `pipeline_inference.py:_tokenize()`（:110-129）を複製，判定則は `:1600-1618` の greedy を踏襲（softcap は
+  argmax 不変ゆえ任意）．実行は `unset VIRTUAL_ENV && uv run python scripts/estimate_draft_acceptance.py`（SL1 と同様の
+  `VIRTUAL_ENV` 汚染回避）．
+- **ローカル資産パス**: HF キャッシュに `google/gemma-4-31B-it`・`google/gemma-4-E2B` 在（`local_files_only=True` で単機ロード）．
+  E2B は `AutoModelForCausalLM`／`Gemma4ForConditionalGeneration` の text バックボーンとして読み込む（vocab 262144 一致）．
+- **やらないこと**: 実機 relay・deploy・`pipeline_inference.py` 改変・分散推論は本イテレーションでは一切行わない（**ローカル
+  単一プロセス完結・クラスタ本体への大改変を要さないため needs-human 事項なし**＝B10 の申し送りに非抵触）．B3 本体（SL3:
+  relay プロトコル改修）は B9 として温存し，本 SL2 の α・a_K・実効利得レンジを SL1 と合わせて別途人間に go/no-go を諮る．
+
+### 実装（HF キャッシュ revision 修正）(Iter6)
+
+**担当**: 実装フェーズ subagent（2026-07-19）．`### 実験 (Iter6)` が報告した `AutoTokenizer.from_pretrained` 失敗
+（HF キャッシュ `refs/main` の不完全スナップショット参照）の対処として，backlog B11 で自動選定された対処案 (A) を
+実施した．実機クラスタへの接続・deploy・SSH・HF キャッシュの書き換えは一切行っていない（`~/.cache/huggingface` は
+読み取り確認のみ）．
+
+- **裏取り**: `~/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/` を確認し，完全なスナップショット
+  （`config.json`・`tokenizer.json`・`model-0000{1,2}-of-00002.safetensors` を含む）が `fb9ae262347c3945692f09a612f8bb189def854f`
+  （および内容同一の `3548789868c5356dbf307c98e6f609007b82b3eb`）であることを確認した．journal 記載のハッシュと一致．
+  **draft(`google/gemma-4-E2B`) 側も同様の不整合を発見**: `refs/main` は `d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f` を
+  指すが，このハッシュに対応する snapshot ディレクトリ自体が存在しない（target よりさらに壊れた状態）．実在する
+  スナップショットは `19f17d3255f458aa49ebe8843d65ec7b7386db1f`（Jul 10）と `63db66a33dc06d58c02b1e887446e103c202602c`
+  （Jul 8）の 2 つで，両者は全ファイル（`config.json`/`tokenizer.json`/`model.safetensors`/`generation_config.json`/
+  `tokenizer_config.json`）の blob ハッシュが完全一致（内容同一の重複スナップショット）．より新しい
+  `19f17d3255f458aa49ebe8843d65ec7b7386db1f` を採用した．
+- **変更ファイル**: `scripts/estimate_draft_acceptance.py` のみ．
+  - 定数追加（`TARGET_MODEL_NAME`/`DRAFT_MODEL_NAME` 直後，:52-60）: `TARGET_MODEL_REVISION =
+    "fb9ae262347c3945692f09a612f8bb189def854f"`，`DRAFT_MODEL_REVISION = "19f17d3255f458aa49ebe8843d65ec7b7386db1f"`．
+    直前にコメントで固定理由（`refs/main` 不整合の暫定回避，キャッシュ自体は非改変）を明記．
+  - `main()` 内の 3 箇所の `from_pretrained` 呼び出し（旧 :542-549 相当）に `revision=TARGET_MODEL_REVISION` /
+    `revision=DRAFT_MODEL_REVISION` を追加（`AutoTokenizer.from_pretrained`／target `AutoModelForCausalLM.from_pretrained`／
+    draft `AutoModelForCausalLM.from_pretrained` の全て）．他のロジック・定数・プロンプト集合・純関数は無改変．
+- **検証**: `unset VIRTUAL_ENV && uv run python -m py_compile scripts/estimate_draft_acceptance.py
+  tests/test_estimate_draft_acceptance.py` → エラー無し．`uv run pytest tests/test_estimate_draft_acceptance.py -v`
+  → **30 passed**（回帰無し，モデルロードを伴わない純関数テストのみで revision 追加の影響を受けない範囲）．
+  `uv run pytest`（全体）→ **83 passed**．実際のモデルロード・生成の実行（revision 固定が実機で解決するかの確認）は
+  本フェーズでは行っていない（次の実験フェーズへ委譲）．
+- **申し送り**: `AutoModelForCausalLM.from_pretrained(...)` が `Gemma4ForConditionalGeneration` アーキテクチャを
+  直接ロードできるかは，実験フェーズの診断（`AutoConfig`/`AutoTokenizer` は revision 指定で成功済み）で有望だが
+  実際の重みロードは未確認．revision 修正後も同様のロード時エラーが出た場合は，前回申し送りどおり
+  `AutoModelForImageTextToText` 等への切替を検討すること．draft 側 revision の選定は「2 スナップショットが内容同一」
+  という確認に基づく（内容が違えば選定基準を人間に諮る必要があったが，今回は不要だった）．
+
+### 実験 (Iter6)
+
+**担当**: 実験フェーズ subagent（2026-07-19T15:26 JST）．`unset VIRTUAL_ENV && uv run python
+scripts/estimate_draft_acceptance.py` をバックグラウンド起動（nohup）．**結果: 失敗（tokenizer ロード段階，即時終了・
+数十分待たず数秒で `ValueError`）**．`results/draft_acceptance.jsonl` は未生成（既存 `results/*.jsonl` は無変更）．
+
+#### エラー内容
+
+`AutoTokenizer.from_pretrained(TARGET_MODEL_NAME, ...)` にて:
+
+```
+ValueError: Couldn't instantiate the backend tokenizer from one of:
+(1) a `tokenizers` library serialization file,
+(2) a slow tokenizer instance to convert or
+(3) an equivalent slow tokenizer class to instantiate and convert.
+You need to have sentencepiece or tiktoken installed to convert a slow tokenizer to a fast one.
+```
+
+#### 原因調査（実装フェーズが懸念していた `Gemma4ForConditionalGeneration` 非対応ではない）
+
+- `~/.cache/huggingface/hub/models--google--gemma-4-31B-it/refs/main` が指すスナップショット
+  `b9ea41a2887d8607f594846523f94c6cc75ac8a4`（更新日時 2026-07-19T10:41，本日の SL1/Iter4 系実行と時刻が近接）は
+  `config.json` **のみ**を含む不完全なスナップショットであり，`tokenizer.json`・weights を含まない．
+- 一方，同リポジトリ配下には完全なスナップショット（`3548789868c5356dbf307c98e6f609007b82b3eb` と
+  `fb9ae262347c3945692f09a612f8bb189def854f`）が存在し，`tokenizer.json`・`model-0000{1,2}-of-00002.safetensors`
+  （計 59GB）・`config.json`（`main` と同一内容）を保持している．`local_files_only=True` かつ revision 未指定のため
+  `AutoTokenizer`/`AutoModelForCausalLM` は `refs/main` の不完全なスナップショットを解決してしまい失敗した．
+- **診断（読み取りのみ・キャッシュ改変なし）**: 完全なスナップショット `fb9ae262...` を revision 指定で明示的に読み込むと，
+  `AutoConfig.from_pretrained(...)` は `architectures=['Gemma4ForConditionalGeneration']`／
+  `type(cfg) in MODEL_FOR_CAUSAL_LM_MAPPING == True`（transformers 5.9.0 で登録済み）となり，`AutoTokenizer` も
+  `GemmaTokenizer` として正常ロードできた．すなわち実装フェーズが未検証としていたリスク（`Gemma4ForConditionalGeneration`
+  を `AutoModelForCausalLM` が扱えるか）は，**この診断範囲では解消**（`refs/main` を経由しなければロード可能）．
+  ただし重み込みの実フォワードまでは実行していないため，モデル本体の完全な動作確認はまだ済んでいない．
+- `refs/main` の不整合発生原因は未特定（本日 10:41 前後に別プロセスが `local_files_only=False` でオンライン解決した際，
+  config.json のみ取得できて weights/tokenizer の再取得が走らなかった可能性がある，推測の域を出ない）．
+
+#### 実施した操作・変更していないもの
+
+- 診断のための `AutoConfig`/`AutoTokenizer.from_pretrained(..., revision="fb9ae262...")` 読み取りのみ実行．
+  `refs/main` ファイルは読み取り前後で内容不変（`b9ea41a2887d8607f594846523f94c6cc75ac8a4` のまま）を確認済み．
+- `scripts/estimate_draft_acceptance.py`・HF キャッシュとも一切変更していない（禁止事項の破壊的操作も未実施）．
+- `python -c "import sentencepiece"` / `import tiktoken"` は共に `ModuleNotFoundError`（`pyproject.toml` の
+  dependencies に含まれていない）．ただし `tokenizer.json`（fast tokenizer serialization）が完全スナップショットに
+  存在するため，正しい revision が解決されれば sentencepiece/tiktoken は不要（`GemmaTokenizer` は `tokenizers` backend
+  で動作，診断ログで確認済み）．
+
+#### 申し送り（analyst/planner 判断事項）
+
+- 対処案の候補（判断は analyst/planner に委ねる）:
+  (A) `scripts/estimate_draft_acceptance.py` の `AutoTokenizer`/`AutoModelForCausalLM.from_pretrained` 呼び出しに
+      `revision="fb9ae262347c3945692f09a612f8bb189def854f"`（または `3548789868c5356dbf307c98e6f609007b82b3eb`）を
+      明示指定する．
+  (B) ローカル HF キャッシュ側で `refs/main` を完全スナップショットのハッシュに修復する（キャッシュ操作，人間確認が
+      望ましい可能性あり）．
+- 環境未検証事項（次回実験時に確認要）: 上記いずれかの対処後，実際に target 31B の重みロード＋ greedy 生成が完走するか
+  （メモリ 125GB 中空き 87GB，bfloat16 で target 62GB 程度＋draft 19GB 程度と見積もられ理論上は収まる想定だが未実測）．
+
+---
+
+### 実装 (Iter6)
+
+**担当**: 実装フェーズ subagent（2026-07-19）．`### 検討・計画 (Iter6)` §2〜§5 の設計どおり，新規 2 ファイルのみを追加した
+（`pipeline_inference.py` を含む既存ファイルは一切改変していない）．実機クラスタへの接続・deploy・SSH は行っていない．
+モデルの実ロード・実推論（target 31B・draft E2B）はこのフェーズでは実行していない（次の実験フェーズへ委譲）．
+
+#### 変更ファイル
+
+- 新規 `scripts/estimate_draft_acceptance.py`（624 行）: 計画 (a)〜(g) を実装．
+  - 定数: `K_VALUES=(2,4,8)`／`N_MAX_NEW_TOKENS=48`／`NUM_PROMPTS=16`／`NGRAM_MAX=3`／`NGRAM_CONT=10`／
+    `TARGET_DTYPE=DRAFT_DTYPE=torch.bfloat16`／`NUM_THREADS=4`／`NUM_INTEROP_THREADS=1`（SL1 と同条件，計画 (c)）／
+    `SL1_RATIO_BY_K={2:0.753,4:0.378,8:0.213}`（Iteration 5 実測値）．
+  - `build_prompt_set()`: 4 カテゴリ（`open_chat`/`summarization`/`doc_qa`/`code`）×4 件＝16 プロンプト．`open_chat` に
+    既存デモの `"Hello!"` を含む．`summarization`/`doc_qa`/`code` は入力接地型（prompt-lookup を過小評価しない設計，A-2）．
+  - `tokenize_prompt()`: `pipeline_inference.py:_tokenize()`（:110-129）を複製（chat template + `add_generation_prompt=True`）．
+  - `generate_target_reference()` / `draft_teacher_forced_predictions()`: モデル呼び出しを伴う関数として分離（単体テスト対象外）．
+    **設計判断（計画からの効率化）**: draft の block 提案は，計画で想定された「各ブロックで K トークンずつ自己回帰生成」の
+    代わりに，**参照系列全体に対する draft の 1 回の teacher-forced forward**から全位置の greedy top-1 予測を事前計算し，
+    `make_block_propose_fn()` で `simulate_block_walk()` の `propose_fn` に変換する方式にした．根拠:
+    一致が続く区間では「draft の自己回帰提案」と「真の参照プレフィックスを条件とした teacher-forced 予測」は同一コンテキスト
+    から計算されるため常に一致し，判定に使うのは最初の不一致位置までなので，不一致後の自己回帰予測との差は判定へ影響しない
+    （`draft_teacher_forced_predictions()` の docstring に理由を明記）．これにより 1 プロンプトあたり draft forward が
+    K×プロンプト数回ではなく 1 回で済み，実験フェーズの実行時間を大幅に削減できる見込み．計画の意図（exact-match 採択判定・
+    K∈{2,4,8}集計・α算出）は変えていない．
+  - 純関数（単体テスト対象）: `accepted_length()`（exact-match 打切り＋bonus+1）／`simulate_block_walk()`（ブロック前進で
+    a_K 集計，終端クリップ処理を追加）／`alpha_to_expected_len()`（A-1 写像，α=1.0 の特異点を極限値 K+1 で処理）／
+    `compute_alpha()`（teacher-forced 一致率）／`ngram_lookup_propose()`（prompt-lookup, 直近一致優先）／
+    `compute_ngram_alpha()`／`aggregate_alpha_by_category()`（位置数重み付き）／`compute_effective_gain_candidates()`
+    （SL1×SL2 合成，`product_a_k_ratio_k`・`gain_over_baseline` を算出）．
+  - `main()`: target/draft モデルをロードし，全プロンプトを処理して `results/draft_acceptance.jsonl` へ 1 レコード追記．
+- 新規 `tests/test_estimate_draft_acceptance.py`（30 件）: `accepted_length`（全一致／即不一致／部分一致／K=1相当／
+  提案空）5 件，`simulate_block_walk`（常時一致／常時不一致／終端クリップ／K≤0拒否）4 件，`alpha_to_expected_len`
+  （具体値検証／α=0／α=1極限／範囲外拒否／K≤0拒否）5 件，`compute_alpha` 3 件，`ngram_lookup_propose`（直近一致／
+  不一致／continuation打切り）3 件，`compute_ngram_alpha`（入力接地型で正／開放チャットでゼロ）2 件，
+  `aggregate_alpha_by_category` 2 件，`compute_effective_gain_candidates` 2 件，`build_prompt_set` 2 件，
+  `BlockWalkResult` frozen 検証 1 件．計画の最低 4 件要件を超える網羅度で実装した．
+
+#### 検証結果
+
+- `unset VIRTUAL_ENV && uv run python -m py_compile scripts/estimate_draft_acceptance.py
+  tests/test_estimate_draft_acceptance.py` → エラー無し．
+- `unset VIRTUAL_ENV && uv run pytest tests/test_estimate_draft_acceptance.py -v` → **30 passed**（モデルロードなしの
+  純粋関数テストのみ．target/draft の実ロード・実推論は含まない）．
+- `unset VIRTUAL_ENV && uv run pytest`（既存スイート全体）→ **83 passed**（Iter5 時点の 53 passed + 新規 30 件，回帰無し）．
+
+#### 計画との差異・申し送り
+
+- **計画からの唯一の設計逸脱**: draft 提案を「ブロックごとの自己回帰生成」から「1 回の teacher-forced forward」に効率化
+  （上記「設計判断」参照）．exact-match 判定・K∈{2,4,8}集計という計画の意図・出力形式は変えていない．次の実験フェーズで
+  実行した際，何らかの理由でこの前提（一致区間での自己回帰予測とteacher-forced予測の同値性）が成立しないと判明した場合は
+  （通常は成立するはずだが），`draft_propose()` 相当の素朴な自己回帰実装への切り替えを検討すること．
+- **`AutoModelForCausalLM.from_pretrained` の適用可否は未検証**: 両モデルの `config.json` の `architectures` は
+  `Gemma4ForConditionalGeneration`（マルチモーダルラッパークラス）であり，`AutoModelForCausalLM` が this checkpoint を
+  直接ロードできるかは実機で未確認．計画 §5 の指示どおり `AutoModelForCausalLM.from_pretrained(...)` を実装したが，
+  実験フェーズで `ValueError` 等が出た場合は `AutoModelForImageTextToText` または `Gemma4ForConditionalGeneration` への
+  切り替えを検討すること（本実装フェーズではモデル実ロードを行っていないため未検証，計画・制約どおり）．
+- 実験を開始してよい状態: **可**（新規ファイル 2 点のみ，構文健全性・純関数テスト・既存スイート回帰確認済み．
+  `pipeline_inference.py` 他既存ファイルは非改変）．
+
+---
+
 ## Iteration 5
 
 ### 考察・次計画 (Iter5)

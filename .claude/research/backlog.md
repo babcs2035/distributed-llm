@@ -6,6 +6,64 @@
 
 ---
 
+## B17 [auto-decided 2026-07-20] Iteration 10 の単一レバー選定（全 51 ノードで単層 local マイクロベンチを回し straggler ノードを特定）
+- **状況**: Iteration 9（bench 経路への 3 区間 per-microbatch 計時ログ追加）を **採用（診断として成功）・収束**で確定した．
+  全 51 rank×3 区間の分解で，直列化点＝律速ボトルネック段を **rank14（物理ノード wafl113，層 23，1 層割当）に一意特定**
+  （基準 (i)：compute/per-step=0.758 ≥ 0.60 が閾値で成立，3 repeat CV<0.1%，約 55σ の外れ値）．2 番手 straggler は
+  rank37（wafl136，層 46，2.30 倍）．Iter7 の見かけの完全直列は「通信構造でも全層 compute でもなく，単段 straggler による
+  負荷不均衡が主因」と切り分けた．**残る未確定点は「rank14/wafl113（rank37/wafl136）が遅い理由がノード起因（straggler）か
+  層 23/46 の構造的な重さか」の二択**（層→rank 割当が固定のため交絡）で，analyst は追加反復 1 回で決着可能と示唆した．
+- **自動選択**: Iteration 10 の単一レバーを **「全 51 ノードで単層 local マイクロベンチ（SL1 型・通信なし）を回し，各物理
+  ノードの単層 compute 時間を直接ランキングして wafl113/wafl136 が突出するか確認する」**（analyst 示唆 (a)）とする．
+  全ノードで**同一の単層ワークロード（層を固定）**を走らせるため，差が出ればノード起因と直接帰属でき，wafl113/wafl136 が
+  突出しなければ層起因（層 23/46 が重い）と切り分けられる＝二択を一度で決着させる．具体的なベンチ設計（測定層の選定・
+  ウォームアップ・反復数・全ノード並列 SSH の収集経路）は次の rc-planner が決める．state は `phase="investigate"`・
+  `current_lever=null` で開始．**iteration_name**: 「全 51 ノードの単層 local マイクロベンチによる straggler ノード特定
+  （ノード起因 vs 層起因の切り分け）」．
+- **根拠**: (1) 未確定点が「ノード起因か層起因か」の二択に集約されており，(a) はそれを一度で決着でき最も情報利得が高い．
+  (2) 通信を伴わない SL1 型 local マイクロベンチ（Iter5/B8 の系譜）で完全に可逆・低リスク．対立案 (b)（層→rank 割当の
+  シャッフルで遅さがノード/層どちらに追従するか見る）は deploy 側の割当変更を伴い実装規模がやや大きく，同じ問いに (a) より
+  重いため見送る．(3) 過去の一貫方針（B8「大改修の前に near-zero コストの local マイクロベンチで先に測る」，Iter8「棄却の
+  前に一次証拠を取る」）と整合し，可逆・低リスクで情報利得の高い方を優先する．
+- **可逆性**: 次に振るレバーの選定であり可逆．local 単層マイクロベンチで serving/relay ロジックも層割当も変更せず，コード
+  変更は計測スクリプト追加のみ．51 ノードへの実行は SSH を伴うが非破壊（B7 の包括承認範囲内で破壊的操作なし＝自動判断とした）．
+- **要レビュー / 要人間判断**: (a) 本軸は local 単層計測で relay プロトコル（B9/SL3）には一切触れず軸が直交・実装衝突なし．
+  **B9 は今回も温存（`[needs-human]` 維持，reflector では自動判定しない）**．(b) フォールバック: (a) の実装が予想外に過大と
+  判明した場合は (b)（層割当シャッフル）へ振り替える．config `levers`（`STAGGER_INTERVAL`/`SEQ_LEN`/`WORLD_SIZE`）は下位
+  フォールバックとして温存（B14(a)）．(c) 処方箋への含意——(a) で straggler 起因と確定すれば負荷分散（遅ノードへ層を減らす／
+  WORLD_SIZE 調整）へ，層起因と確定すれば当該層の compute 最適化（量子化・attention 実装）へ向かうが，いずれも (a) の結果を
+  見てから改めて単一レバーを立てる．async ホットパス大改修（B14(b)）は不可逆・大規模のため妥当と判明するまで着手せず，その
+  時点で `[needs-human]` 登録＋Slack 確認．(d) 任意の将来課題（診断品質の向上，本軸の必須ではない）: Iter9 の整合チェック
+  77% の残差 23% は measure ループの per-step 定数オーバーヘッドの計測被覆漏れで，measure ループ全体を t_step で挟む 4 点目の
+  計時を足せば残差を per-step overhead 区間として明示回収できる（診断結論には影響しないため優先度は低い）．
+
+---
+
+## B16 [auto-decided 2026-07-20] `.gitignore` 例外追加によるテストフィクスチャの追跡漏れ修正（Iter7 由来の既存欠陥）
+- **状況**: Iteration 9 の実装フェーズで `tests/fixtures/microbatch_bench_timing_sample.log` を新規追加したところ，
+  `.gitignore:35` の `*.log` にマッチして `git status` にすら現れない（untracked のまま無視される）ことが判明．
+  さらに調査で，**Iter7（コミット b6d5a31）で追加された `tests/test_microbatch_bench.py` が依存する既存フィクスチャ
+  `tests/fixtures/microbatch_bench_sample.log` も同じ理由で一度も git 管理下に入っていなかった**ことを確認した
+  （`git log --all -- tests/fixtures/microbatch_bench_sample.log` が空）．これは Iter9 の単一レバーとは無関係な
+  Iter7 由来の既存欠陥であり，クリーンチェックアウトでは `test_microbatch_bench.py` がフィクスチャ欠如で失敗する
+  状態が Iter7 完了時点から潜在していたことになる．
+- **自動選択**: `.gitignore` に `!tests/fixtures/*.log` の例外パターンを追加し，`microbatch_bench_sample.log`
+  （Iter7 分）と `microbatch_bench_timing_sample.log`（Iter9 分）の両方を `git add -f` で追跡対象にする．
+  `tests/fixtures/rank0_sample.log` は元々追跡済み（`.gitignore` の `*.log` 追加以前に commit 済みだったと推測）
+  で影響なし．
+- **根拠**: (1) 今回追加したテストがコミット後にクリーンチェックアウトで動作するための前提条件であり，Iter9 の
+  「実装完了」の実質的な要件（テスト追加が意味を持つこと）に直結する．(2) `.gitignore` への例外追加はテスト
+  フィクスチャという限定的なパスのみを対象とし，本来の意図（ビルド成果物・実行時ログの除外）を損なわない．
+  (3) 変更は可逆（`.gitignore` の1行と `git rm --cached` で戻せる）．(4) Iter7 分の欠陥も同じコミットで拾って
+  修正する方が，同種の問題を二度に分けて対処するより一貫している．
+- **可逆性**: 可逆．`.gitignore` パターン追加とファイルの追跡開始のみで，本体ロジック（pipeline_inference.py 等）
+  には触れていない．
+- **要レビュー / 要人間判断**: なし．リポジトリ構成ファイル（`.gitignore`）の変更だが，除外パターンの微修正
+  であり public API・スキーマ・設定ファイルの意味的変更ではないため，CLAUDE.md の「事前確認が必要な変更」には
+  該当しないと判断した．念のため次回の journal/Slack 報告でこの判断自体も明示する．
+
+---
+
 ## B15 [auto-decided 2026-07-20] Iteration 9 の方向選定（実機 bench への per-microbatch timing ログ追加で直列化点を特定）
 - **状況**: Iteration 8（`pipeline_fill_microbench` ローカル Gloo 診断）を **採用（診断として結論確定）・収束**で確定．
   Decision1（blocking×sleep, N=16,M=32,repeat=5）で **FF=0.9716（≥0.7 の (1b)，閾値まで約 129σ）**．結論は

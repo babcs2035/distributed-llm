@@ -1,0 +1,7 @@
+[R0 INFO] Rank 0: levers NUM_MICRO_BATCHES=51 STAGGER_INTERVAL=3.0 SEQ_LEN=1 WORLD_SIZE=51
+[R50 INFO] MICROBATCH_BENCH_STEPS=100 > 0: running bounded _pipeline_loop bench (warmup=20, measure=100, repeats=3) before falling through to serving.
+[R49 INFO] Rank 49: received forward chunk
+[R50 [0;32mRESULT[0m] MICROBATCH_BENCH m=51 p=51 warmup=20 measure=100 elapsed_s=12.3456 steps_per_s=8.1000 microbatch_per_s=413.1000
+[R50 [0;32mRESULT[0m] MICROBATCH_BENCH m=51 p=51 warmup=20 measure=100 elapsed_s=12.1000 steps_per_s=8.2645 microbatch_per_s=421.4876
+[R50 RESULT] MICROBATCH_BENCH m=51 p=51 warmup=20 measure=100 elapsed_s=12.2000 steps_per_s=8.1967 microbatch_per_s=418.0328
+[R50 INFO] Inference loop paused: 360 steps executed. Relay mode active.

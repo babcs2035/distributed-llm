@@ -6,6 +6,687 @@ research-cycle が読み書きする実験ジャーナル．**新しいイテレ
 
 ---
 
+## Iteration 9
+
+### 考察・次計画 (Iter9)
+
+**担当**: 考察・次計画 subagent（rc-reflector，2026-07-20 JST）．`### 分析(解釈) (Iter9)` の判定（直列化点を rank14=wafl113 に
+一意特定・基準 (i) が閾値で成立・整合チェック未達は計測被覆漏れで診断信頼性は毀損せず・「ノード起因 vs 層 23/46 起因」の
+切り分けは未確定で追加反復 1 回で決着可能）を受け，Iter9 の単一レバーの採否と Iteration 10 の方向を reflector として確定した．
+実機非接続（journal・backlog・state の読み書きと commit 操作のみ，`pipeline_inference.py` 非改変）．**逆時系列維持のため本ブロックを
+Iteration 9 内の最上段に置く**．
+
+**1. 採否判定: 採用（診断として成功）＝この計時レバーは収束（accepted-as-diagnostic / converged）**
+
+- 本イテレーションのレバー（bench 経路 `_process_microbatch`/`_run_microbatch_bench` への 3 区間 per-microbatch 計時
+  `recv_wait_s`/`compute_s`/`send_wait_s` ログ追加）は「レバーが効いたか」を測る感度実験ではなく，Iter7 の見かけの完全直列
+  （`time_per_step ∝ m`）の**直列化点がどこか**を特定する診断実験である．その診断課題に対して **明確な結論が出た**ため
+  「採用（診断として成功）」と判定する．具体的には全 51 rank×3 区間の分解で，直列化点＝律速ボトルネック段が **rank14
+  （物理ノード wafl113，層 23，1 層割当）に一意に局在**した（基準 (i)：rank14 の compute/per-step=0.758 ≥ 0.60 が閾値で成立，
+  3 repeat CV<0.1% で反転なし，約 55σ 級の外れ値）．「rank0〜13 は send_wait 支配（下流バックプレッシャ）→ rank14 は両側無待ちの
+  compute 律速 → rank15〜50 は recv_wait 支配（上流飢餓）」という**単一ボトルネック段の教科書的署名**を得た．serving 経路は
+  非改変（`self._bench_timing` は既定 `None` で計時コード非実行）で可逆．
+- **診断としての収束**: 「直列化点はどこか」という Iter8 が積み残した未解決点は rank14 に一意特定できて決着した．この計時ログ
+  自体は今後も診断資産として残るが，**この単一レバーでこれ以上得られる情報は無い**（直列化点は特定済み）ため収束させ，次は
+  新たに立ち上がった未解決点（rank14/wafl113 が遅い理由＝ノード起因か層起因か）へレバーを移す．
+
+**2. 非自明な学び（次の自分向け）**
+
+- **(i) Iter7/Iter8 の見かけの矛盾は「単段 straggler による負荷不均衡」で解消（今回の最重要の学び）**: Iter7「ほぼ完全直列
+  （含意 FF≈1/p）」× Iter8「blocking でも段が真並列なら FF=0.97 で fill する」の矛盾は，**実クラスタに単一の遅い段（rank14，
+  per-mb compute 0.297s）が存在し全 microbatch がそこを直列通過するため，実効スループットが rank14 の compute×m で律速**される
+  ことで説明できた．パイプライン自体は概ね fill しているが，単段 straggler で約 3 倍劣化し「あたかも完全直列」に見えていた．
+  すなわち Iter7 の見かけの完全直列は，**通信構造（async 大改修 B14(b)）でも全層 compute（量子化）でもなく，段間の負荷不均衡
+  （straggler ノード）が主因**という切り分けが得られた．これは Iter8 §1(iii) が想定した「rank0 直列生成・barrier 等のハードな
+  同期点由来」という予想を**修正**する（同期点ではなく負荷不均衡だった）．
+- **(ii) 調査の候補(a)「rank0 生成が直列元凶」は反証**: rank0 の recv_wait は 6.4e-5s（他 rank compute の 1/1450）で無視でき，
+  rank0 が待つのは生成コストではなく下流バックプレッシャ（send_wait 支配 0.304s）だった．事前確度「低」の見立てと整合し，
+  「作る前に測る／攻める前に直す点を特定する」診断系譜が誤った処方箋（rank0 生成の並列化）への投資を未然に防いだ．
+- **(iii) 整合チェック 77%（95% 未達）は診断を毀損しない＝残差の一様性が鍵**: 残差（per-mb 0.392s − 3 区間合計）は**層数に
+  依らず全群でほぼ一定**（rank0=0.0881s，1 層 rank 平均 0.0887s，2 層 rank 平均 0.0886s）で，KV キャッシュを持たない rank0 も
+  同一残差を持つ．よって実験フェーズが主因候補とした `_reset_kv_cache_for_bench`（層数比例するはず）は残差主因では**ない**と
+  否定でき，残差の正体は計時窓（t0〜t3）の外側の**全 rank 共通の per-step 定数オーバーヘッド**（measure ループの Python
+  ステップ制御・tqdm・ステップ境界処理）と特定した．定数オフセットは rank 間の相対構造を変えないため直列化点の局在という
+  結論に影響しない．**教訓: 整合率が閾値未達でも，残差が診断対象の軸（ここでは層数/rank 位置）に相関しなければ診断は成立する**．
+  backlog 候補として「measure ループ全体を t_step で挟む 4 点目の計時を足し残差を per-step overhead 区間として明示回収する」を
+  申し送る（B17 に記載，任意の将来課題）．
+- **(iv) 2 番手 straggler（rank37=wafl136，層 46，2.30 倍・約 34σ）の存在**: rank37 の recv_wait が他の下流 rank より小さい
+  （0.075s vs 0.20s）のは rank37 自身の compute が長く待ち時間を食っているためで，**rank14 を解消すると rank37 が次の律速に
+  昇格する**と読める．負荷分散を処方する場合，単一ノードだけでなく straggler 群として扱う必要がある．
+- **(v) 記録上の軽微な齟齬（結論に影響なし）**: analyst(実行) が (a) 2 層 rank の compute 絶対値レンジ表記（報告
+  「0.201〜0.231s」対 実測「0.1988〜0.2323s」の丸め齟齬），(b) 基準 (i) の次点は報告の rank37（比 0.573）ではなく 2 層 rank9
+  （比 0.586〜0.593）が 0.60 に僅かに近い（報告漏れ），の 2 点を検出した．いずれも整合チェック比率・rank14/37 の数値・診断基準
+  の判定（rank14 のみ 0.60 超）には影響しない．次回以降，絶対値レンジ表記と次点の言及を正確にすること．
+
+**3. Iteration 10 の方向決定: 示唆 (a)＝全 51 ノードで単層 local マイクロベンチ（SL1 型）を回し straggler ノードを特定（B17 に自動記録）**
+
+- **決定**: 次イテレーションの単一レバーを **「全 51 ノードで単層 local マイクロベンチ（SL1 型・通信なし）を回し，各物理ノードの
+  単層 compute 時間を直接ランキングして wafl113/wafl136 が突出するか確認する」**（analyst 示唆 (a)）とする．
+- **なぜ (a) を選び (b) を見送るか（情報利得 × 可逆・低リスクの一貫方針）**: 未確定点が「rank14/wafl113（および rank37/wafl136）が
+  遅い理由は**ノード起因（straggler）か，層 23/46 の構造的な重さか**」の二択に集約されている（層→rank 割当固定による交絡）．
+  (a) は**全ノードで同一の単層ワークロード（層を固定）を走らせる**ため，差が出ればそれは純粋にノード起因と直接帰属でき，逆に
+  wafl113/wafl136 が突出しなければ層起因（層 23/46 が重い）と切り分けられる——**二択を一度で決着させる最も情報利得の高い設計**．
+  かつ通信を伴わない **SL1 型 local マイクロベンチ（Iter5 の系譜）で完全に可逆・低リスク**．一方 (b)（層→rank 割当のシャッフルで
+  遅さがノードに追従するか層に追従するかを見る）は **deploy 側の割当変更を伴い実装規模がやや大きく**，同じ問いに答えるのに
+  (a) より重い．過去の一貫方針（Iter5 の B8＝「大規模な relay 改修の前に near-zero コストの local マイクロベンチで先に測る」，
+  Iter8 の「棄却の前に一次証拠を取る」）に従い，**可逆・低リスクで情報利得が高い (a) を優先**する．
+- **可逆性の判断（自律判断ポリシーとの照合）**: (a) は通信なしの local マイクロベンチ（各ノードで単層 forward の実行時間を測る
+  だけ）で，`pipeline_inference.py` の serving/relay ロジックも層割当も変更しない．コード変更は計測スクリプトの追加のみで可逆．
+  51 ノードへの実行は SSH を伴うが**非破壊**（B7 の包括承認範囲内）．したがって **Iteration 10 の方向選定は可逆＝自動判断とし，
+  B17 に記録**する（調査・計画・実装はコードのみで進め，実験の実機実行も B7 の範囲内）．具体的なベンチ設計（測定する層の選定・
+  ウォームアップ・反復数・全ノード並列 SSH の収集経路）は次の rc-planner が決める．
+- **処方箋への含意（次イテレーション以降）**: (a) で **straggler 起因と確定**すれば，処方箋は async 大改修（B14(b)）や全層量子化
+  ではなく**負荷分散**（遅ノードへ層を減らす／遅ノードを除外して WORLD_SIZE を調整）に向かい，config `levers` の WORLD_SIZE 軸
+  （削減は要ホスト健全性確認）と接続する．**層起因と確定**すれば当該層の compute 最適化（量子化・attention 実装）へ向かう．
+  いずれも (a) の結果を見てから改めて単一レバーを立てる（今は二択の決着を優先し，処方箋レバーには踏み込まない）．
+- **フォールバック / 温存レバー**: (a) の実装が予想外に過大と判明した場合は (b)（層割当シャッフル）へ振り替える．config `levers`
+  （`STAGGER_INTERVAL`/`SEQ_LEN`/`WORLD_SIZE`）は下位フォールバックとして温存（B14(a)）．async ホットパス大改修（B14(b)）は
+  真因が straggler と確定し，かつ async で解消可能と分かるまで着手しない（不可逆・大規模のため，妥当と判明した時点で改めて
+  `[needs-human]` 登録＋Slack 確認）．
+- **B9（B3 本体＝relay プロトコル改修＝SL3）との関係**: (a) は local 単層計測で relay プロトコルには一切触れず軸が直交．
+  **B9 は今回も温存（`[needs-human]` 維持，reflector では自動判定しない）**．
+
+**4. 要人間判断の有無**
+
+- 本フェーズで新規の要人間判断（不可逆・破壊的判断）は発生していない．Iteration 10 の方向（全ノード単層 local マイクロベンチ）は
+  通信なし・serving 非改変で可逆のため自動判断（B17）とした．B9 は従来どおり人間回答待ちで温存する．
+- なお `results/Iter9.jsonl`（実験生データ 153 レコード）は今回のコミット対象に含めず**未追跡のまま残した**（タスク指定の
+  コミット対象ファイル一覧に含まれないため）．診断の一次証拠として実機に紐づく生データであり，追跡要否は別途の判断に委ねる
+  （本イテレーションの学びは journal に確定済みで，結論の再現に生データ commit は必須ではない）．
+- git commit/push は本フェーズで実施した（下記コミットで journal・backlog・state・実装差分を確定）．
+
+---
+
+### 分析(解釈) (Iter9)
+
+**担当**: 分析(解釈)フェーズ subagent（2026-07-20 JST）．`### 実験 (Iter9)` の一次事実と `### 分析(実行) (Iter9)` の独立検算
+（数値は完全一致・軽微な丸め齟齬 1 件のみ）を前提に，`results/Iter9.jsonl`（153 レコード）を全 51 rank×3 区間で再集計し直し，
+`### 検討・計画 (Iter9)` §6 の成功条件に照らして「直列化点を一意に特定できたか」を判定した．追加で `tools/deploy.py::get_assigned_layers`／
+`hosts.txt`／`pipeline_inference.py::_reset_kv_cache_for_bench`（:978-1002）を Read で確認した．実機非接続（既存データの再解釈のみ）．
+**逆時系列維持のため本ブロックを `### 分析(実行) (Iter9)` の上に置く．**
+
+**1. 全 rank 3 区間分解で見えた構造（実験フェーズが §5 で提示しきれていなかった全体像）**
+
+- 各 rank の 3 区間合計（recv_wait+compute+send_wait，3 repeat 平均）は**全 51 rank でほぼ一定（≈0.304s，per-mb）**．
+  変動するのは「合計」ではなく「その 0.304s を recv待ち／compute／send待ち のどれに費やしているか」の内訳である．
+  これは blocking 同期パイプラインで**全 rank の 1 ステップ周期が大域的にロックステップ同期している**ことの直接の署名．
+- **支配区間が rank 位置で階段状に切り替わる**（per-mb 3 repeat 平均）:
+  - rank0（wafl-ctrl1，0 層）: **send_wait 支配** 0.304s（recv=6.4e-5s，compute=4.2e-4s）＝下流が受信 post するまで送れない待ち．
+  - rank1〜13（wafl100〜112）: compute（2 層 rank）または send_wait（1 層 rank11〜13，send≈0.20s）が支配．
+  - **rank14（wafl113，1 層）: compute 支配 0.2973s，recv待ち・send待ち はともに ≈0（0.0017s／0.0003s）＝ステップ中ほぼ常時計算中で両側とも待たない．**
+  - rank15〜50（wafl114〜wafl209）: **recv_wait 支配** ≈0.20s（compute≈0.095s，send≈0）＝上流が未送出で飢える待ち．
+- この「rank0〜13 は send待ち（下流バックプレッシャ）→ rank14 は無待ちの compute 律速 → rank15〜50 は recv待ち（上流飢餓）」
+  という**バックプレッシャと飢餓が rank14 の一点で交わる**パターンは，教科書的な「単一ボトルネック段」の署名そのものである．
+  上流の余剰能力は send待ちに，下流の余剰能力は recv待ちに現れ，両者の境界（送信待ち→受信待ちの反転点）が rank14 に一致する
+  ことで，**直列化点＝ボトルネック段が rank14（物理ノード wafl113）に一意に局在**すると読める．
+
+**2. 「整合チェック 95% 未達（実測約 77%）」の解釈 — 計測漏れか，診断の信頼性毀損か（委譲元 問い 1）**
+
+- **結論: 計測漏れ（per-step ループの被覆漏れ）であり，診断の信頼性は毀損しない．** 根拠は残差の分布にある．
+- 残差（per-mb 時間 0.3924s − 3 区間合計）は**層数に依らずほぼ完全に一定**: 0 層 rank（rank0）=0.08814s，1 層 rank（40 台）=
+  平均 0.08867s（0.08727〜0.09421），2 層 rank（10 台）=平均 0.08864s（0.08807〜0.08945）．**rank0 は KV キャッシュを一切持たない
+  のに他 rank と同一の残差を持つ**．
+- したがって実験フェーズが「主因候補」として挙げた `_reset_kv_cache_for_bench()` は残差 23% の主因では**ない**．同関数を Read で
+  確認した通り，中身は `self.kv_cache` の各層 `key_cache.zero_()/value_cache.zero_()` と `_kv_cache_write_pos_ref` のローカル 0 代入
+  のみ（跨 rank 同期なし・軽量）で，**層数に比例するはず**である．もし reset が残差主因なら 2 層 rank は 1 層 rank の約 2 倍，rank0 は
+  ≈0 の残差になるはずだが，実測は全群で一定＝reset 起源ではないと否定できる（実験フェーズの「reset がどの区間にも計上されない構造」
+  という観察自体は正しいが，その所要は残差の規模を説明しない）．
+- 残差の正体は，`_process_microbatch` の計時窓（t0 受信前〜t3 送信後）の**外側**にある**全 rank 共通の per-step オーバーヘッド**
+  （measure ループの Python ステップ制御・`_reset_kv_cache_for_bench` 呼び出し込みのステップ境界処理・tqdm・最後の mb 送信完了から
+  次ステップ先頭 recv までの空隙）である．per-step 0.354s（=0.0886×4mb）が全 rank に等しく加算される定数オフセットにすぎず，
+  **rank 間の相対構造（どの rank がどの区間で待つか）を一切変えない**ため，直列化点の局在という診断結論には影響しない．
+- 整合チェックは「計時の被覆率」を測る健全性指標としては未達（77%）だが，これは「計時が per-microbatch 窓に限定され per-step 定数
+  オーバーヘッドを取り漏らした」という**計測設計上の被覆漏れ**であって，収集値の信頼性や診断の一意性を損なうものではない
+  （backlog 候補: measure ループ全体を t_step で挟む 4 点目の計時を足せば残差を明示的に per-step overhead 区間として回収できる）．
+
+**3. 診断基準 (i)(ii)(iii) への当てはまり（委譲元 問い 2）**
+
+- **(i) compute 支配（ある rank で compute_s ≥ per-step の 60%）: 成立．** rank14 の compute_mean_s/per-step = 0.2973/0.3924 = **0.758 ≥ 0.60**．
+  かつ rank14 は recv/send 待ちが両側ほぼ 0 の**クリティカルパス上の段**であり，基準 (i) が捉えようとした「compute 律速の段が fill を
+  阻む」機構と正確に一致する．基準 (i) は成立し，直列化機構を正しく指している．
+- **(ii) recv_wait の rank 勾配（単調かつ ±5% 超）: 字義どおりには不成立だが，捉えたかった現象はより鋭い形で成立．** 観測は滑らかな
+  単調勾配ではなく rank14→15 境界での約 127 倍の階段状ジャンプ（send待ち→recv待ちの支配反転）である．計画は「リング状の連続勾配」を
+  想定していたが，実データは**単一ボトルネック段の前後で待ち種別が二値的に切り替わる**構造で，これは基準 (ii) が意図した「待ち分布が
+  ボトルネックを局在させる」ことを字義以上に明瞭に満たす．計画の想定パターンとは異なるが「想定外で解釈不能」ではなく，
+  **より単純な原因（単段ボトルネック）に対応する予期可能なパターン**として扱うのが妥当．
+- **(iii) rank0 の recv_wait（`normal_()` 生成コスト）: 不成立＝候補(a)を反証．** rank0 の recv_wait_mean_s=6.4e-5s は他 rank の compute
+  最小値の約 1/1450 で無視できる．ただし rank0 は**send_wait 支配**（0.304s）である＝rank0 が待つのは生成コストではなく下流への
+  バックプレッシャであり，「rank0 の入力生成が直列ボトルネック」という Iter9 調査の候補(a)は明確に否定された（調査の事前確度「低」と整合）．
+- **総括**: 診断は主に基準 (i)（rank14 の compute≥60%）で成立し，(ii) の待ちパターン（階段状反転）が補強証拠として rank14 を一意に指す．
+  計画は「(i)(ii)(iii) のいずれか 1 つ成立で診断成功」としており，(i) が閾値で成立し 3 repeat（rank14 CV<0.1%）で判定が反転しない
+  ことを確認済みのため，**成功条件を満たす**．
+
+**4. rank14・rank37 異常値の解釈（委譲元 問い 2 の最重要手がかり）**
+
+- rank↔ホスト対応（`hosts.txt` 行順＝rank 番号，`read_hosts`）: **rank14=wafl113，rank37=wafl136**（ともに wafl100-139 群，物理的に別ノード）．
+  層割当（`get_assigned_layers`，layers_high=11）: **rank14→層 23，rank37→層 46**（ともに 1 層のみ，他の 1 層 rank と同種の通常 decoder 層）．
+- 1 層 rank（rank11〜50，14・37 除く 38 台）の compute_mean_s は mean=0.09761s，sd=0.00361s，max=0.10668s と**極めて密に分布**（CV≈3.7%）．
+  これに対し rank14=0.2973s は分布平均の **3.05 倍・約 55σ 相当**，rank37=0.2249s は **2.30 倍・約 34σ 相当**の外れ値で，
+  3 repeat とも高精度に再現（rank14 CV<0.1%，rank37 CV<0.5%）．**単発ノイズでは断じてなく，明確な信号**（過去のノイズ幅 Iter7 CV0.07〜0.14%・
+  Iter8 CV0.2〜1.5% と比べても桁違いの逸脱）．
+- **層構造要因より「ノード性能ばらつき（straggler）」が有力**: Gemma-4 の decoder 層は全層で shape・FLOPs がほぼ同一で，層 23・46 が
+  近傍層より 3.0×・2.3× 重くなる構造的理由は乏しい（sliding-window/global attention の別は seq_len=512 の bench では層あたり総コストを
+  3 倍にはしない）．一方，CPU 推論（`docker stats` で CPU 192%）では周波数スケーリング・熱スロットリング・同居負荷等でノード単位の 2〜3 倍
+  の遅速差は容易に生じ，1 デプロイセッション内で持続すれば高い再現性（CV<0.5%）とも整合する．よって **wafl113・wafl136 が遅い物理ノード
+  （straggler）で，rank14 が現在の律速ボトルネック，rank37 は「rank14 の陰に隠れた 2 番手の straggler」**（rank37 の recv待ち 0.075s が他の
+  下流 rank の 0.20s より小さいのは，rank37 自身の compute が長く待ち時間を食っているため＝rank14 を解消すると rank37 が次の律速になる）
+  と解釈するのが最も整合的．**ただし「ノード起因」か「層 23/46 起因」かは本データだけでは確定できない**（層→rank 割当が固定のため交絡）．
+
+**5. Iter7/Iter8 との接続（前回比・仮説整合）**
+
+- Iter7「time_per_step ∝ m（含意 FF≈1/p のほぼ完全直列に見える）」× Iter8「blocking パイプラインは段が真並列なら FF=0.97 で fill する」
+  の見かけの矛盾を，Iter9 は**負荷不均衡で説明して解消した**: 実クラスタには単一の遅い段（rank14）が存在し，全 microbatch が rank14 を
+  直列通過するため throughput が rank14 の per-mb compute（0.297s）×m で律速される．per-step≈1.57s ≈ 4×0.297s(=1.19s)＋per-step overhead0.35s と
+  概ね対応し，パイプライン自体は概ね fill しているが**単段 straggler により実効スループットが約 3 倍劣化**して「あたかも直列（FF≈1/p）」に
+  見えていた，と読める．すなわち Iter7 の見かけの完全直列は**通信構造（async 大改修 B14(b)）でも全層 compute（量子化）でもなく，
+  段間の負荷不均衡（straggler ノード）が主因**という切り分けができた．
+
+**6. 総合判定（委譲元 問い 3，採否の確定は reflector に委ねる示唆として）**
+
+- **単一レバー（bench 経路への 3 区間計時ログ追加）: 診断ツールとして機能した＝採用が妥当．** 全 rank×3 区間の分解により直列化点を
+  一意に局在でき，調査の候補(a)（rank0 生成）を反証し，Iter7/8 の矛盾を負荷不均衡で解消した．serving 経路は非改変で可逆．
+- **研究目的（直列化点の特定）に照らして: 診断成功（部分的成功ではない）．** 直列化点＝ボトルネック段は rank14（wafl113）に一意特定され，
+  基準 (i) が閾値で成立し repeat 間で反転しない．整合チェック 77% 未達は「per-step 定数オーバーヘッドの計測被覆漏れ」であって診断の
+  一意性・信頼性を毀損しないことを残差の一様性（rank0 含む全群一定）で立証した．
+- **確信度**: 直列化点の局在（rank14 が律速ボトルネック）は高確信（52σ 級外れ値・CV<0.1%・待ちパターンの一致）．一方で**「ノード起因 vs 層 23/46 起因」
+  の切り分けは未確定**（層→rank 割当固定による交絡）で，ここは**追加反復 1 回で決着可能**．
+- **次イテレーションへの有力仮説と示唆（レバー案，収束/追加反復の別）**:
+  - 有力仮説: 「wafl113・wafl136 が straggler ノードで，rank14 が律速」．対立仮説: 「層 23・46 が構造的に重い」．
+  - 切り分けレバー候補（単一レバー原則）: (a) **全 51 ノードで単層 local マイクロベンチ（SL1 型・通信なし）**を回し，各物理ノードの単層 compute
+    時間を直接ランキングして wafl113/wafl136 が突出するか確認（可逆・低リスク・ノード起因説を直接検証）．(b) 層→rank 割当をシャッフル
+    （例 offset/shuffle）して**遅さがノードに追従するか層に追従するか**を見る（deploy 側の割当変更が必要）．
+  - もし straggler 起因と確定すれば，処方箋は async 大改修や全層量子化ではなく**負荷分散（遅ノードへ層を減らす／遅ノードを除外して WORLD_SIZE を
+    調整）**に向かう（config `levers` の WORLD_SIZE 軸・ノード健全性確認と接続）．層起因と確定すれば当該層の compute 最適化（量子化・attention 実装）へ．
+  - **レバー収束はまだ早い**（真因の二択が未確定）．次は上記 (a) を最優先の追加反復として推奨する（reflector 判断）．
+- git commit/push は本フェーズでは行っていない．
+
+---
+
+### 分析(実行) (Iter9)
+
+**担当**: 分析(実行)フェーズ subagent（2026-07-20 JST）．`### 実験 (Iter9)` §5 が報告した集計値（一次事実として提示された
+比率・境界・rank14/37 の異常値）を，`results/Iter9.jsonl` を Python で独立に再集計して検算した．実機非接続（再デプロイ・
+再実験は行っていない，既存データの独立検算のみ）．
+
+**1. 検算方法**
+
+- `results/Iter9.jsonl` を Read／Python（`json.loads` を行ごとに適用）で直接読み込み，レコード件数・`rank`／`repeat`
+  の網羅性（0〜50 × 0〜2 の 153 通りに過不足なく 1 件ずつ対応するか）・`n_samples`／`num_micro_batches`／`world_size`／
+  `schema_version`／`record_type` の一様性を確認した後，実験フェーズと同じ定義式で独立に再計算した．
+- **制約（申し送り）**: per-step-per-mb 時間の算出に使う `elapsed_s`（rank50 の `MICROBATCH_BENCH`＝スループット行）は
+  `results/Iter9.jsonl` に**保存されていない**（本ファイルは `--microbatch-bench-timing` で収集した
+  `microbatch_bench_timing` レコードのみを含み，`collect_results.py` は `MICROBATCH_BENCH`（スループット）を別収集経路
+  として扱う設計．journal 該当ブロックの申し送りとも整合）．実機への再接続・再収集はこのフェーズの範囲外のため，
+  `### 実験 (Iter9)` §5 に記載された `elapsed_s`（repeat0=157.0292，repeat1=157.0793，repeat2=156.7528）を**外部入力
+  として採用**し，そこから導出される比率・閾値判定のみを独立に再計算した．`elapsed_s` 自体の生ログ照合は行っていない
+  （次回コミット等で `MICROBATCH_BENCH` 行も `results/Iter9.jsonl` へ保存する収集経路を追加すれば，この外部依存は解消
+  できる＝ backlog 候補として申し送る）．
+- 検算項目: (a) 全 153 レコードでの整合チェック比率（`(recv_wait_mean_s+compute_mean_s+send_wait_mean_s)/per_step`）の
+  repeat 別 min/max/mean，(b) rank14・rank37 の `compute_mean_s` と他 1 層 rank との比，(c) `recv_wait_mean_s` の
+  rank 方向の並び（rank14→15，rank36→37→38，rank0→1 の各境界），(d) 診断基準 (i)〜(iii) の再判定，(e) 層割当
+  （`get_assigned_layers`，`tools/deploy.py:228-248`）の式をコード読解で直接確認．
+
+**2. 検算結果**
+
+- **(a) 整合チェック比率**: repeat0: min=0.7603, max=0.7788, mean=0.7748／repeat1: min=0.7602, max=0.7769,
+  mean=0.7737／repeat2: min=0.7592, max=0.7780, mean=0.7737／全 153 件通算: min=0.7592, max=0.7788, mean=0.7741．
+  **報告値と完全一致**（小数第 4 位まで一致，通算 mean≈0.774 も一致）．per-step-per-mb 時間（0.392573s／0.392698s／
+  0.391882s）も一致．
+- **(b) rank14・rank37 の `compute_mean_s`**: rank14 は 3 repeat で 0.297174〜0.297550s（CV=0.058%，「CV<0.1%」と整合），
+  比は 0.7567〜0.7584（報告の repeat0 比 0.7579 と一致）．rank37 は 0.224399〜0.225394s（CV=0.183%，「CV<0.5%」と整合，
+  報告の下限・上限値 0.224399s／0.225394s も完全一致），比は 0.5714〜0.5752（報告の repeat0 比 0.5732 と一致）．
+  1 層 rank（11〜50，rank14・37 除く）の `compute_mean_s`（3 repeat 平均）は min=0.093517s, max=0.106676s
+  （報告「0.09〜0.11s」と整合）で，rank14 はその平均（0.097608s）比 **3.046 倍**，rank37 は **2.305 倍**（報告の
+  「約 3.0 倍・2.3 倍」と一致）．
+  - **軽微な不一致を 1 件検出**: 2 層 rank（rank1〜10）の `compute_mean_s` の実際のレンジは **0.198798s〜0.232286s**
+    （3 repeat×10 rank＝30 件の最小・最大）であり，報告値「0.201〜0.231s」とは下限・上限とも約 0.001〜0.002s
+    ずれている（最小値は rank10 repeat1 の 0.198798s，最大値は rank9 repeat2 の 0.232286s）．比率換算（0.5062〜0.5927，
+    報告「0.51〜0.59」）は丸めれば整合する．絶対値レンジのみの表記誤差であり，整合チェック比率・rank14/37 の数値・
+    診断基準の判定には影響しない．
+- **(c) `recv_wait_mean_s` の rank 方向の並び**: rank14→15 の境界ジャンプは repeat0: 0.001620s→0.206308s（倍率 127.35
+  倍），repeat1: 0.001667s→0.205946s（123.54 倍），repeat2: 0.001711s→0.207446s（121.24 倍）で，**報告の
+  「rank14→15 で 0.001620s→0.206308s へ約 127 倍」は repeat0 の値として完全一致**．rank36→37→38 の非単調性も
+  3 repeat とも再現（例 repeat0: 0.205095s→0.075522s→0.201133s，報告値と完全一致）．rank0→1（repeat0:
+  0.000064s→0.001688s）も完全一致．**全て報告どおりデータに存在することを確認**．
+- **(d) 診断基準の再判定**: (i) 全 153 件中，`compute_mean_s/per_step ≥ 0.60` を満たすのは rank14 の 3 repeat
+  （0.7567〜0.7584）のみで確認．次点は rank9（2 層 rank，0.5856〜0.5927）で rank37（0.5714〜0.5752）より僅かに
+  0.60 に近いが，いずれも未達（報告は rank37 のみ言及し rank9 には触れていないが，矛盾ではなく報告漏れの可能性がある
+  追加事実として申し送る）。(ii) recv_wait_s は単調勾配ではなく rank14/15 境界・rank36/37/38 周辺の階段状変化として
+  確認，報告と一致．(iii) rank0 の `recv_wait_mean_s`（0.000063〜0.000064s）は他 rank の `compute_mean_s` 最小値
+  （rank39 等 約 0.093056s）の約 1/1453 で「1,000 分の 1 以下」と整合，不成立の判定も一致．
+- **(e) 層割当の式**: `tools/deploy.py::get_assigned_layers`（:228-248）を Read で確認し，`layers_high = total_layers -
+  world_size + 2` で `total_layers=60, world_size=51` のとき `layers_high=11`，rank<11（rank1〜10）は 2 層
+  `[(rank-1)*2, (rank-1)*2+1]`，rank≥11（rank11〜50）は 1 層，という報告の記述と完全に一致することをコードで確認した．
+
+**3. 結論（数値の一致・不一致のみ，良否判定は行わない）**
+
+- 報告された主要数値（整合チェック比率の min/max/mean，per-step-per-mb 時間，rank14/37 の `compute_mean_s` と比率・CV，
+  recv_wait_mean_s の境界ジャンプ，診断基準 (i)〜(iii) の判定，層割当の式）は**独立再計算・コード確認いずれも完全一致**．
+- **軽微な不一致 1 件**: rank1〜10（2 層 rank）の `compute_mean_s` 絶対値レンジの表記が「0.201〜0.231s」（報告）に対し
+  実際は「0.198798〜0.232286s」（検算）で，下限・上限とも約 0.001〜0.002s のずれがある（比率換算では整合）．
+  過去イテレーションで見られた「標準偏差表記の軽微な齟齬」と同種の丸め・記述レベルの齟齬であり，主要な結論（整合
+  チェック未達・診断基準の判定）には影響しない．
+- **追加で気づいた事実**: 診断基準 (i) の次点は，報告が言及した rank37（比 0.5714〜0.5752）ではなく，2 層 rank である
+  rank9（比 0.5856〜0.5927）の方が 0.60 の閾値に近い．報告はこの事実に触れていないが，矛盾する記載ではなく，1 層
+  rank に限定した記述（rank37 の言及箇所は「同じ 1 層割当」の文脈）だった可能性がある．機構的な解釈・重要性の判断は
+  次フェーズ（分析(解釈)）に委ねる．
+- `results/Iter9.jsonl` 自体には `elapsed_s`（per-step-per-mb 時間の算出根拠）が保存されておらず，本検算はこの値を
+  実験フェーズの報告どおり外部入力として採用した．生ログでの `elapsed_s` 照合は未実施（次回以降，`collect_results.py`
+  の収集経路に `MICROBATCH_BENCH`（スループット）行も同一 `results/Iter{n}.jsonl` へ保存する拡張を行えば，この外部
+  依存なしに完全な再現ができるようになる．backlog 候補として申し送る）．
+- git commit/push はこのフェーズでは行っていない．
+
+---
+
+### 実験 (Iter9)
+
+**担当**: 実験フェーズ subagent（2026-07-20T13:36〜13:54 JST，約 18 分）．`### 実装 (Iter9)` §5 の申し送りに従い，
+実機 51 ノードクラスタ（master wafl-ctrl1 + worker wafl100-139/200-209）へ deploy → パイロット → 本掃引 →
+収集 → クラスタ復元まで**完走した**．固定構成（`NUM_MICRO_BATCHES=4`・`WORLD_SIZE=51`・`STAGGER_INTERVAL`/
+`SEQ_LEN` 既定）は変更していない．事前に `unset VIRTUAL_ENV && uv run pytest tests/ -q` で **123 passed**
+（Iter9 実装フェーズ完了時点と同数，回帰なし）を確認済み．
+
+**1. 事前ヘルスチェック**
+
+- `uv run python tools/healthcheck.py` で **51/51 healthy** を確認してから着手．
+
+**2. パイロット（`MICROBATCH_BENCH_STEPS=5, MICROBATCH_BENCH_WARMUP_STEPS=2, MICROBATCH_BENCH_REPEATS=1`）**
+
+- deploy 51/51 成功（52.77 秒）．
+- 全 51 rank が `MICROBATCH_BENCH_TIMING`（`n_samples=20`＝measure5×m4）を出力し，クラッシュ・Traceback・
+  ハングは皆無（`tools/show_logs.py --all` の全ログを grep 確認）．最終 rank の `MICROBATCH_BENCH`（スループット行）
+  も `elapsed_s=8.3937s`（測定 5 ステップ）で正常出力．1 ステップあたり約 1.68s/step と見積もり，本掃引
+  （measure=100, warmup=20, repeats=3 → 総ステップ 360）の所要時間を **約 10 分**と概算した．
+
+**3. 本掃引（`MICROBATCH_BENCH_STEPS=100`，warmup/repeats は既定 20/3 のまま）**
+
+- deploy 51/51 成功（44.53 秒，13:39:51 UTC 開始）．
+- rank50（最終段）の `MICROBATCH_BENCH`（スループット）行: repeat0 `elapsed_s=157.0292`，repeat1
+  `elapsed_s=157.0793`，repeat2 `elapsed_s=156.7528`（いずれも measure=100，warmup=20，3 repeat 完走）．
+  `docker stats` で CPU 192%・メモリ 9.06GiB/15GiB を確認し，ハングではなく計算が進行中であることを確認した．
+- 待機中は `poll_interval_sec`（60s）目安で SSH 経由 `docker logs --tail` をポーリングし，そのたびに
+  `state.json.updated_at` を更新（heartbeat）．
+- 完了後 `uv run python tools/healthcheck.py` で **51/51 healthy** を再確認．クラッシュ・エラーは一切観測されなかった
+  （`tools/show_logs.py --all` の全 1734 行を `traceback|exception|fatal|crash`（大小文字無視）で grep して 0 件）．
+
+**4. 収集（`tools/collect_results.py --iter Iter9 --microbatch-bench-timing`）**
+
+- `[INFO] appended 153 MICROBATCH_BENCH_TIMING record(s) to results/Iter9.jsonl`．
+  153 = 51 rank × 3 repeat（過不足なし，欠損 rank・欠損 repeat なし）．各レコード `n_samples=400`
+  （measure100×m4）で統一．`results/Iter9.jsonl` は本フェーズで新規作成（既存ファイルなし）．
+
+**5. 完了条件（`### 検討・計画 (Iter9)` §6）との対比（数値提示のみ，良否判定は analyst に委ねる）**
+
+- **必須完了条件**: 達成（全 51 rank が `MICROBATCH_BENCH_TIMING` を出力し，`results/Iter9.jsonl` へ per-rank
+  レコードとして保存済み）．
+- **整合チェック**（`recv_wait_mean_s+compute_mean_s+send_wait_mean_s` が per-step の 1-mb あたり時間の 95% 以上を
+  説明するか）: **未達**．per-step-per-mb 時間 = `elapsed_s/(measure×m)` は repeat0=0.392573s，repeat1=0.392698s，
+  repeat2=0.391882s．各 rank の 3 区間合計との比（ratio）は repeat0: 全 51 rank で **min=0.7603, max=0.7788,
+  mean=0.7748**，repeat1: min=0.7602, max=0.7769, mean=0.7737，repeat2: min=0.7592, max=0.7780, mean=0.7737
+  （全 3 repeat・全 51 rank を通じて 0.95 に届く rank は 0 件）．つまり 3 区間の合計は per-step 時間の
+  約 77%（残差約 23%）しか説明していない．コード読解で確認した事実として，`_run_microbatch_bench` の
+  measure ループは各ステップ冒頭で `self._reset_kv_cache_for_bench()` を呼んでから `step_start_time` を
+  取得し `_process_microbatch` の 3 区間打刻（t0〜t3）を開始する構造であり，**この reset 呼び出し自体の所要時間は
+  どの 3 区間にも計上されない**（`elapsed`（全体計測）には含まれるが，rank ごとの `recv/compute/send` 配列には
+  含まれない）．残差の原因がこの reset コストか，Python ループ呼び出しオーバーヘッドか，他の要因かは本フェーズ
+  では特定していない（事実の提示のみ，原因分析は analyst に委ねる）．
+- **診断成功の判定基準（3 分岐，事実の提示のみ）**:
+  - **(i) compute 支配（ある rank で `compute_s ≥ per-step時間の60%`）**: repeat0 の per-step 時間 0.392573s の
+    60% = 0.235544s に対し，**rank14 の `compute_mean_s=0.297550s`（比 0.7579）が唯一この閾値を超えた**
+    （他の 1-layer rank は概ね 0.09〜0.11s，比 0.23〜0.28 程度）．rank37 も `compute_mean_s=0.225024s`（比 0.5732）
+    で近いが 0.60 未満．rank1〜10（2-layer rank，`get_assigned_layers` で rank<11 は 2 層割当）は
+    `compute_mean_s≈0.201〜0.231s`（比 0.51〜0.59）で全て 0.60 未満．3 repeat とも rank14 の `compute_mean_s` は
+    0.297174〜0.297550s（CV<0.1%）で高精度に再現し，rank37 も 0.224399〜0.225394s で再現した．
+  - **(ii) recv_wait_s の rank 勾配（隣接rank間で単調かつ±5%超で増減）**: 観測されたのは滑らかな単調勾配ではなく，
+    **rank14→15 の境界で `recv_wait_mean_s` が 0.001620s→0.206308s へ約 127 倍に階段状に跳ぶ**（以降 rank15〜50 は
+    概ね 0.075〜0.22s のレンジで推移し，rank36→37 で 0.205095s→0.075522s に低下，rank37→38 で 0.075522s→0.201133s
+    に再上昇する非単調な例外を1 箇所含む）．rank0→1 も 0.000064s→0.001688s（rank0 は生成のみでこの区間の意味が
+    他 rank と異なる）．いずれも「隣接 rank 間の滑らかな単調勾配」ではなく，特定 rank（14, 37）を境にした階段状の
+    パターンとして観測された．
+  - **(iii) rank0 の `recv_wait_s`（`normal_()` 生成コスト）が他 rank の `compute_s` と同等以上**: **不成立**．
+    rank0 の `recv_wait_mean_s`（3 repeat 平均で 0.000063〜0.000064s）は他 rank の `compute_mean_s`
+    （最小でも rank39 等の約 0.093〜0.095s）の 1,000 分の 1 以下で，明確に小さい．
+- **付随して判明した事実（layer 割当との対応）**: `tools/deploy.py::get_assigned_layers` は `layers_high=60-51+2=11`
+  で rank1〜10 に 2 層，rank11〜50 に 1 層を割り当てる．rank1〜10 の `compute_mean_s`（0.201〜0.231s）は
+  rank11〜50 の大多数（0.093〜0.111s，ともに 1 層）のおよそ 2 倍で，層数比とおおむね対応する。ただし
+  **rank14（`compute_mean_s≈0.2975s`）と rank37（`compute_mean_s≈0.2250s`）は，同じ 1 層割当にもかかわらず，
+  他の 1 層 rank（0.09〜0.11s）よりそれぞれ約 3.0 倍・2.3 倍高い**．この 2 rank の異常値は 3 repeat すべてで
+  高精度に再現しており（CV<0.5%），単発ノイズではない．
+
+**6. 分析フェーズへの申し送り**
+
+- 生データは `results/Iter9.jsonl`（153 レコード，`record_type="microbatch_bench_timing"`，`schema_version=2`）．
+  上記 §5 の集計値（比・境界・rank14/37 の異常値）は本フェーズが `results/Iter9.jsonl` を Python で直接集計した
+  一次事実であり，機構的な解釈（なぜ rank14/37 が遅いか，23% 残差の正体，診断基準への最終的な当てはめ）は行って
+  いない．analyst には次を申し送る: (a) 整合チェック 95% 未達（実測約 77%）という完了条件の一部未達，
+  (b) 診断基準 (i) は rank14 のみで成立（rank37 は僅かに未達），基準 (ii) は「単調勾配」ではなく「rank14/15 境界
+  および rank36/37/38 周辺での階段状変化」，基準 (iii) は不成立，という 3 基準それぞれの事実関係，
+  (c) rank14・rank37 の compute_mean_s 異常値は layer 数（1 層で他と同一）では説明されない再現性の高い外れ値で
+  あること．
+- git commit/push はこのフェーズでは行っていない．
+
+**7. クラスタの状態**
+
+- bench 完了・収集後，env 未設定（bench 無効・`NUM_MICRO_BATCHES=4` 既定）で全 51 ノードを再 deploy
+  （44.92 秒，51/51 成功）し，`docker inspect`（rank0・rank50 で確認）で `NUM_MICRO_BATCHES=4` のみが設定され
+  `MICROBATCH_BENCH_*` 系 env が一切無いことを確認，`healthcheck.py` で 51/51 healthy を確認済み．**健全な
+  serving 状態に復元済み**．
+
+---
+
+### 実装 (Iter9)
+
+**担当**: 実装フェーズ subagent（2026-07-20 JST，セッション再開）．`### 検討・計画 (Iter9)` §4 の設計に対し，
+前回セッションが `pipeline_inference.py`／`tools/collect_results.py` の変更まで完了させた状態から再開し，
+残っていた単体テスト追加のみを実施した．実機非接続（journal・コード読解・pytest 実行のみ．`mise run deploy`／
+`predict:demo` は未実行）．**逆時系列維持のため本ブロックを `### 検討・計画 (Iter9)` の上に置く**．
+
+**1. 前回セッション分の内容確認（本フェーズでは変更していない）**
+
+- `pipeline_inference.py`: `git diff` で確認し，計画 §4 の設計（`__init__` での `self._bench_timing: dict[str,
+  list[float]] | None = None` 初期化，`_process_microbatch` での 3 区間 [A]recv_wait_s/[B]compute_s/[C]send_wait_s
+  の加算的計時，`_run_microbatch_bench` の warmup 中 `None` ガード・measure ループ直前の空リスト辞書セット・
+  measure ループ直後の**全 rank**による `MICROBATCH_BENCH_TIMING` RESULT 行出力）と完全に一致していることを確認．
+  `_relay_active` の早期 return・recv 例外の早期 return では打刻しない設計も計画どおり．serving/非 bench 経路
+  （`self._bench_timing` が既定 `None`）では `time.monotonic()` を一切呼ばず挙動不変．
+- `tools/collect_results.py`: `_MICROBATCH_BENCH_TIMING_RE`・`MicrobatchBenchTimingRecord`・
+  `parse_microbatch_bench_timing_log`・`build_microbatch_bench_timing_record`・`collect_all_rank_logs`
+  （`collect_worker_stage_timing_logs` と同型の全 rank 並列 SSH 取得，rank0 も含む）・
+  `run_microbatch_bench_timing_collect`・CLI `--microbatch-bench-timing` フラグを確認し，計画 §4 の設計と一致．
+  既存 `MICROBATCH_BENCH`（最終 rank のみ・スループット）収集は非改変．
+
+**2. 本フェーズで実施した変更**
+
+- **`tests/test_collect_results.py`**: `parse_microbatch_bench_timing_log`／`build_microbatch_bench_timing_record`
+  の単体テストを 7 件追加（既存の `parse_microbatch_bench_log`／`build_microbatch_bench_record`（Iter7 相当，
+  `tests/test_microbatch_bench.py`）と同じ書き方に合わせた）。
+  - 正常系: 全 rank・全 repeat（rank=0 repeat=0,1／rank=50 repeat=0）を出現順に抽出すること，ANSI カラーコード
+    混入行・非混入行の両方を正しく数値化すること．
+  - 境界: 最終 rank（rank=50）は `send_wait_*` が 0（次段が無いため）で他 rank と区別されること．
+  - 異常系: 該当行が無いログでは空リストを返すこと，既存 `MICROBATCH_BENCH`（スループットのみ）行は別の正規表現
+    のため抽出されないこと（型混同がないことの確認）．
+  - `build_microbatch_bench_timing_record`: `record_type="microbatch_bench_timing"` を含む全フィールドが
+    過不足なく組み立てられ，JSON シリアライズ可能であること．
+  - 実 SSH・実通信は一切使わず，`tests/fixtures/microbatch_bench_timing_sample.log`（固定ログ）のみを入力とする
+    純関数テスト．`collect_all_rank_logs`／`run_microbatch_bench_timing_collect`（SSH 収集を伴う経路）は，既存の
+    `collect_worker_stage_timing_logs`／`run_microbatch_bench_collect` 同様このリポジトリに単体テストが無い方針
+    （SSH 実行を伴うため）と整合させ，今回も対象外とした．
+- **`tests/fixtures/microbatch_bench_timing_sample.log`（既存ファイルの内容修正）**: 前回セッションが作成した
+  フィクスチャに ANSI エスケープシーケンスの実バイト（`\x1b`）が欠落しており（`[0;32m` が literal text のまま
+  ESC 文字なしで書かれていた），`_ANSI_RE`（`\x1b\[[0-9;]*m` のみに一致）が全く除去できず該当行がパースされない
+  不具合を発見した．実際の bench 出力（`_Color` クラス，ANSI カラー付き）を模すため，Python で `\x1b` を明示的に
+  埋め込み再生成した（`tests/fixtures/microbatch_bench_sample.log`（Iter7 作成分）の実バイトパターンと突き合わせて
+  確認済み）．
+- **`tests/test_pipeline_microbatch_bugfix.py`（既存回帰テストの最小修正・1 行追加）**: フルスイート実行で
+  `AttributeError: 'FullyOptimizedPipelineNode' object has no attribute '_bench_timing'` が 4 件発生した．
+  原因は `_build_single_node`（`object.__new__` で `__init__` を経由せず最小構成インスタンスを組み立てるテスト
+  ヘルパー，Iter7 由来）が，Iter9 で `__init__` に追加された `self._bench_timing = None` の初期化を経由しないため．
+  `_process_microbatch` の `timing = self._bench_timing` 参照で属性エラーになっていた．`_build_single_node` に
+  `node._bench_timing = None` を 1 行追加し（他の手動設定属性 `node.config`／`node.kv_cache` 等と同じパターン），
+  `__init__` の既定値と揃えた．**serving/非 bench 経路の挙動自体は変えておらず，テストヘルパーが `__init__` の
+  新しい既定属性に追従していなかった不整合の修正**（本体ロジックの変更ではない）．
+
+**3. 検証結果**
+
+- `unset VIRTUAL_ENV && uv run pytest tests/test_collect_results.py -q` → **52 passed**（既存 45 ＋新規 7）．
+- `unset VIRTUAL_ENV && uv run pytest tests/ -q` → **123 passed**（Iter8 完了時点の 116 ＋新規 7，回帰なし）．
+  変更前（`git stash` で本セッションの全差分を退避した状態，HEAD=`4e01490`）でも同一コマンドで **116 passed** と
+  なることを確認済みで，新規テストが正しく既存 116 件に対して非破壊であることを確認した．
+- 型チェッカー・リンタ: `pyproject.toml`／`mise.toml` を確認したが，mypy／ruff 等の設定・タスクは本リポジトリに
+  存在しない（Iter7/Iter8 の実装フェーズでも同様に未実行）．そのため今回も実行していない．
+- serving 経路への非影響確認: `_process_microbatch`／`_run_microbatch_bench` の計時コードは
+  `self._bench_timing is not None` のガード内でのみ動作し，serving（bench 無効時，`self._bench_timing` は既定
+  `None`）では `time.monotonic()` を一切呼ばない設計（前回セッションの実装をそのまま踏襲，本フェーズでは
+  `pipeline_inference.py` 本体を変更していない）．`tests/test_pipeline_microbatch_bugfix.py` の既存 4 件
+  （バグ A／B の回帰テスト，単一ノード・通信バイパス構成）が引き続き全件成功することでも間接的に確認した．
+
+**4. オーケストレータによる追補（B16）**
+
+- 上記テスト追加後，`tests/fixtures/microbatch_bench_timing_sample.log` が `.gitignore:35` の `*.log` に一致し
+  git 管理外（untracked）のままであることが判明した．さらに調べると，**Iter7 で追加された既存フィクスチャ
+  `tests/fixtures/microbatch_bench_sample.log` も同じ理由で一度も commit されていなかった**（`git log --all` が
+  空）．クリーンチェックアウトでは `test_microbatch_bench.py`／今回追加分ともにフィクスチャ欠如で失敗する状態
+  だったことになる．`.gitignore` に `!tests/fixtures/*.log` の例外を追加し，両フィクスチャを `git add -f` で
+  追跡対象にした（backlog B16，可逆な自動判断として記録）．本体ロジックには触れていない．
+
+**4. 完了条件（`### 検討・計画 (Iter9)` §6）との対比**
+
+- 実装フェーズ完了条件（コードとテストの整合）: 済．計画 §4 の全項目（`pipeline_inference.py`・
+  `tools/collect_results.py`・`tests/test_collect_results.py` 等）を実装済みで整合を確認．
+- 実機での完了条件（bench 実行→全 rank が `MICROBATCH_BENCH_TIMING` を出力→`results/Iter9.jsonl` へ保存）は
+  実験フェーズの役割であり，本フェーズでは未実施（実機 deploy/predict は行っていない）．
+
+**5. 次フェーズへの申し送り**
+
+- 実験フェーズは `mise run deploy` 後，`MICROBATCH_BENCH_STEPS>0` を設定した状態で `predict:demo` 相当を実行し，
+  その後 `uv run python tools/collect_results.py --iter Iter9 --microbatch-bench-timing` で全 rank の
+  `MICROBATCH_BENCH_TIMING` を収集する（コマンド例は `tools/collect_results.py` docstring 参照）．
+- 発見した 2 件の周辺不整合（フィクスチャの ANSI バイト欠落／テストヘルパーの新規属性未追従）はいずれも
+  「計画の単一レバー」自体の変更ではなく，その単一レバーを正しくテストするための整合性修正であり，
+  serving/bench 経路のロジック・既存テストの意図は変えていない．
+- なお `tests/fixtures/*.log` は `.gitignore` の `*.log` パターンに一致するため，`microbatch_bench_sample.log`
+  （Iter7 作成）・`microbatch_bench_timing_sample.log`（本イテレーション）とも **git 管理外（untracked）**の
+  ままである．`git status`／`git ls-files` で確認済み．次回コミット時にこのままでは両フィクスチャが commit
+  対象に含まれず，クリーンな checkout では `tests/test_microbatch_bench.py`／本フェーズで追加したテストが
+  フィクスチャ欠如で失敗する．`.gitignore` の変更は本イテレーションの単一レバー（計時ログ追加）の範囲外のため
+  実装フェーズでは変更していない．コミット時に `git add -f` で明示的に追跡するか，`.gitignore` に
+  `!tests/fixtures/*.log` の例外を追加するかの判断を委譲先（コミットを行うフェーズ）に委ねる．
+
+---
+
+### 検討・計画 (Iter9)
+
+**担当**: 検討・計画フェーズ subagent（rc-planner，2026-07-20 JST）．B15（自動選定）と `### 調査 (Iter9)` の示唆を
+実装可能な最小差分まで具体化し，本イテレーションの単一レバー・変更方針・成功条件を確定した．実機非接続
+（journal・backlog・config・`pipeline_inference.py`:960-1279・`tools/collect_results.py` の Read のみ，コード非改変）．
+**逆時系列維持のため本ブロックを `### 調査 (Iter9)` の上に置く**．B15 で方向は決定済みのため方向転換はせず，実装が
+過大にならない最小設計に絞る．
+
+**1. 仮説**
+
+- Iter8 で「blocking `recv→compute→send` は段が真並列なら本来ほぼ完全に fill する（FF=0.9716，129σ）」が確定し，
+  Iter7 実機の `time_per_step ∝ m`（含意 FF≈1/p でほぼ完全直列）は blocking 通信構造では説明できず**別のハードな
+  同期点由来**と切り分けられた．静的読解（調査）で候補(b)`_reset_kv_cache_for_bench` 同期・(c)per-mb barrier は
+  既に排除済み（measure ループ内に `dist.barrier()` は無く，リセットは跨 rank 同期を含まないローカル `zero_()`）．
+- したがって残る主容疑は各 rank の **recv 待ち／send 待ちの分布** か **compute 支配**（F1: 実機 ITL は compute≈92%）
+  のいずれか，および候補(a)rank0 の `normal_()` 生成直列である．**per-microbatch を「recv_wait_s / compute_s /
+  send_wait_s」の 3 区間に分解して全 rank で持ち寄れば，どの区間が per-step 時間を支配するかで直列化点を一意に
+  切り分けられる**（StageFrontier「単一 rank のタイマー最大値では真因を特定できず，compute と wait を分離して
+  rank 間で相関を取る必要がある」）．
+
+**2. 単一レバー（今回変更する唯一のもの）**
+
+- **bench 経路（`pipeline_inference.py` の `_process_microbatch` / `_run_microbatch_bench`）への
+  per-microbatch 3 区間計時（recv_wait_s / compute_s / send_wait_s）の加算的計測ログ追加**．
+  何を: 現状「最終 rank のみが計測窓ごとに `MICROBATCH_BENCH`（スループットのみ）を出力」→
+  「**全 rank が計測窓ごとに `MICROBATCH_BENCH_TIMING`（3 区間の mean/min/max）を追加出力**」へ変える．
+- serving/relay ロジック・計算結果・既存 `MICROBATCH_BENCH` 行は一切変更しない（読み取り専用の加算的計測，
+  Iter3/P1・Iter4/B7 の INFO ログ追加と同種で graph-break リスク低・可逆）．
+
+**3. 固定する構成（単一レバー原則）**
+
+- config `levers` は直近最良構成に固定: `NUM_MICRO_BATCHES=4`（既定）・`WORLD_SIZE=51`・`STAGGER_INTERVAL`/`SEQ_LEN`
+  は既定．bench の実行パラメータ（`MICROBATCH_BENCH_STEPS` の warmup/measure/repeats）は Iter7/Iter8 の判定点と
+  同等に固定し，計時ログ追加以外は変えない．relay プロトコル（B9/SL3）には触れない（軸直交・実装衝突なし，B9 は
+  `[needs-human]` 温存）．
+
+**4. 変更方針（最小差分・変更すべきファイルと設定キー）**
+
+- **`pipeline_inference.py::_process_microbatch`（:997-1050）**: `self._bench_timing`（既定 `None`）が非 `None` の
+  ときのみ `time.monotonic()` で 3 点打刻し 3 区間を append する．
+  - t0（:1019 直前）→ [A] rank0 は `normal_()`（:1021）／他 rank は `dist.recv`（:1024）→ t1 = **recv_wait_s**
+    （rank0 では生成コスト＝候補(a)の実測）．
+  - [B] compute（layers＋`send_buffers.copy_`，:1030-1036）→ t2 = **compute_s**．
+  - [C] `dist.send`（:1048）／最終 rank は pbar 分岐（bench では実質 no-op）→ t3 = **send_wait_s**．
+  - recv 例外の早期 return（:1027）や `_relay_active` return（:1017）の経路では append しない（bench では relay 非活性
+    のため通常は通らない）．`self._bench_timing is None` の serving/非 bench 経路は打刻ゼロで挙動完全不変．
+- **`pipeline_inference.py::_run_microbatch_bench`（:1221-1275）**: 各 repeat の **warmup 中は `self._bench_timing=None`**
+  （計測窓外は打刻しない），measure ループ直前（:1252 付近）に `self._bench_timing={"recv":[],"compute":[],"send":[]}` を
+  セット→ measure ループで累積→ measure ループ直後（:1265 付近）に **全 rank が**（`is_last_node` ゲートを付けず）
+  `[R{rank} RESULT] MICROBATCH_BENCH_TIMING m=.. p=.. rank=.. repeat=.. n_samples=.. recv_wait_mean_s=.. recv_wait_min_s=..
+  recv_wait_max_s=.. compute_mean_s=.. compute_min_s=.. compute_max_s=.. send_wait_mean_s=.. send_wait_min_s=..
+  send_wait_max_s=..` を 1 行出力（既存 `MICROBATCH_BENCH` の key=value 形式を踏襲）．計測擾乱回避のため
+  **per-mb ループ内に `dist.barrier()` を追加しない**（調査 §Q2「barrier 自体が fill を壊す」）．per-mb 生値は
+  stdout に吐かず measure 窓で集約する．`self._bench_timing` は `__init__` でインスタンス属性 `None` として初期化する．
+- **`tools/collect_results.py`**: (i) `_MICROBATCH_BENCH_TIMING_RE` と `parse_microbatch_bench_timing_log`（純関数）を
+  追加，(ii) `record_type="microbatch_bench_timing"` のレコードビルダ（`schema_version=2` 空間，rank/repeat/3 区間 stat
+  を保持）を追加，(iii) 計時行は**全 rank が出す**ため，現状 `collect_last_rank_log`（最終 rank のみ，:919）ではなく
+  `collect_worker_stage_timing_logs`（`--stage-timing` の全 rank 並列 SSH 取得経路，:836）と同型で全 rank の docker logs を
+  集めてパースする収集関数を追加する（`run_microbatch_bench_collect`:954 を拡張 or 兄弟関数）．既存
+  `MICROBATCH_BENCH`（スループット）収集は非改変・後方互換を保つ．
+- **`tests/test_collect_results.py` 等**: 新規 `MICROBATCH_BENCH_TIMING` パーサの正常・境界・複数 rank / 複数 repeat の
+  単体テストを追加（実 SSH・実通信なしで純関数として検証．Iter4/Iter8 のテスト方針と整合）．
+
+**5. 期待効果**
+
+- 全 rank × repeat の 3 区間 stat が得られ，(i) compute_s 支配なら fill 不成立の主因は計算量＝**量子化軸（示唆B）へ**，
+  (ii) recv_wait_s が rank 方向に単調勾配なら **Gloo p2p のリング状バックプレッシャ**，(iii) rank0 の recv_wait_s
+  （`normal_()` 区間）が想定外に大きければ **候補(a)を初めて実証**，と Iter7 のほぼ完全直列の一次証拠に基づく切り分けが
+  できる．これにより async 大改修（B14(b)）へ投資する前に真因を確定し，誤った処方箋を回避できる．
+
+**6. 成功条件（measurable）**
+
+- **完了条件（必須）**: bench モード（`MICROBATCH_BENCH_STEPS>0`）で `deploy`→`predict:demo` を実行後，
+  全 p 台の rank が `MICROBATCH_BENCH_TIMING`（recv_wait/compute/send_wait の mean/min/max）を docker logs に
+  出力し，`tools/collect_results.py` 経由で `results/Iter9.jsonl` に **per-rank レコード**として保存される．
+- **整合チェック**: 各 rank で `recv_wait_mean_s + compute_mean_s + send_wait_mean_s` が per-step の 1-mb あたり
+  時間（＝既存 `MICROBATCH_BENCH` の `elapsed_s / (measure × m)`）の **95% 以上**を説明する（計時漏れ・
+  オーバーヘッドが小さいことの確認）．
+- **診断成功（真因の分類）**: 過去反復のばらつき（Iter7 CV≈0.07〜0.14%，Iter8 CV≈0.2〜1.5%，安全側で repeat 間
+  ±5% をノイズ幅とみなす）を**超える有意差**で，次のいずれかに一意分類できる:
+  (i) compute_s 支配＝ある rank の critical path で `compute_s ≥ per-step 時間の 60%`，
+  (ii) recv_wait_s の rank 勾配＝隣接 rank 間で recv_wait_mean_s が単調かつ ±5% を超えて増減，
+  (iii) 候補(a)＝rank0 の recv_wait_s（`normal_()`）が他 rank の compute_s と同等以上．
+  いずれか 1 つが上記閾値で成立し，かつ repeat 間ばらつきがその判定を反転させないことを確認できれば診断成功とする．
+
+**7. フォールバック / 要人間判断**
+
+- **要人間判断: なし**（新規）．本変更は bench 経路への加算的な計測ログのみで serving/relay を変えず可逆．実機 deploy/
+  predict は B7 の包括承認（非破壊 SSH/deploy）の範囲内で破壊的操作を含まない（B15 記載どおり）．B9 は温存
+  （`[needs-human]` 維持，reflector で自動判定しない）．
+- **フォールバック（B15）**: 実装が予想外に serving 経路へ波及する（`_process_microbatch` の計時が serving の
+  非 bench ループ挙動を変える等）と判明した場合は，示唆(B)「重み int8 dynamic quantization を SL1 型 local マイクロ
+  ベンチで作る前に測る」（compute 92% を直接攻める・可逆）へ振り替える．config `levers` はさらに下位のフォールバックと
+  して温存．
+
+---
+
+### 調査 (Iter9)
+
+**担当**: 調査フェーズ subagent（rc-investigator，2026-07-20 JST）．B15（実機 51 ノード bench 経路への per-microbatch
+timing ログ追加で `time_per_step ∝ m`＝ほぼ完全直列の実際の直列化点を特定する）を受け，(1) 分散パイプライン並列推論の
+段間直列化・同期点の診断手法，(2) `torch.distributed`（Gloo）での軽量な分散 timing 収集のベストプラクティス，
+(3) rank0 が全 microbatch の入力生成を担う設計が直列化ボトルネックになりやすいかの既知知見，を文献調査した．
+併せて `pipeline_inference.py` の bench 経路（`_run_microbatch_bench`:1221-1275 / `_process_microbatch`:997-1050 /
+`_reset_kv_cache_for_bench`:971-995 / `_pipeline_loop`:1157-1219）を Read で確認し，どこに何のログを足すべきかの当たりを
+つけた．実機非接続・コード読解と tavily 検索のみ（`pipeline_inference.py` は一切改変していない）．
+
+**問い**
+
+- Q1: Megatron-LM／DeepSpeed／vLLM 等の PP 実装は，バブル・直列化の原因診断にどんな timing/tracing を使うか
+  （per-microbatch のどの時点で打刻し，rank 間でどう突き合わせるか）．
+- Q2: Gloo backend での軽量な分散 timing 収集のベストプラクティス（rank 間のローカル時計ずれの扱い，
+  オーバーヘッドを抑えつつ意味ある粒度で記録する方法）．
+- Q3: rank0 が全 microbatch の入力生成を担う設計は PP の直列化ボトルネックになりやすいという既知知見があるか．
+
+**分かったこと（出典付き）**
+
+- **[Q1] 直列化診断の基準は「バブル率式との乖離」**: 完全に fill したパイプラインのバブル率は `(p-1)/(m+p-1)`
+  （Megatron-LM 1T パラメータ論文，NVIDIA Technical Blog "Scaling Language Model Training..."／Narayanan et al.
+  "Efficient Large-Scale Language Model Training on GPU Clusters", people.eecs.berkeley.edu）．Iter7 の
+  `time_per_step ∝ m`（含意 FF≈1/p）はこの理想 fill から桁で外れており，「バブルが理論値を超えて増大」ではなく
+  「そもそも fill していない＝直列」の署名．
+- **[Q1] 診断の実務は per-microbatch × per-stage のイベント打刻→spacetime(Gantt) 再構成**: torch.profiler で
+  各 rank のトレースを取り `export_chrome_trace` で `chrome://tracing` に読ませる方式が標準だが，複数 rank の
+  トレースを 1 画面に重ねるのは未解決の課題として PyTorch issue が立っている（github.com/pytorch/pytorch#128292
+  "put profiling results from different ranks into one webpage"）＝**全 rank のフル profiler トレースを突き合わせる
+  のは重く扱いにくい**ので，軽量な手打ちの区間計時の方が本ケースには向く．
+- **[Q1・最重要] 「同期は症状を転移させる」**: StageFrontier（arXiv "Synchronization-Aware Stage Accounting for
+  Distributed ML Training"）が明言——"a slow data stage on one rank surfaces as backward wait on the others,
+  so the stage with the largest [timer] is not where the delay originated"．**単一 rank のタイマー最大値からは
+  真の直列化点を特定できず，各 microbatch を「compute 時間」と「wait(recv/send) 時間」に分解して rank 間で相関を
+  取る必要がある**．これが B15 のログ設計の中核指針になる．
+- **[Q1] blocking p2p の同期送信セマンティクス**: MPI 標準（mpi-forum.org "Nonblocking communication"）では
+  synchronous/standard mode の send は「matching receive が post されるまで完了が遅延しうる」．naive な
+  `recv→compute→send`（全 rank 同一）は rendezvous 型 send でも段が真並列なら fill しうる（Iter8 が FF=0.97 で実証）
+  ——つまり**実機の完全直列は blocking 構造単独では説明できず，各 rank の recv 待ち／send 待ちの偏りに出るはず**．
+  siboehm.com "Pipeline-Parallelism" も「first stage が microbatch 入力をロードし，各段のスケジュールを generator で
+  進める」構造を示し，段が詰まる箇所は wait 区間に現れると整理している．
+- **[Q2] 経過時間は monotonic clock，跨ノード絶対時刻は使わない**: wall clock（CLOCK_REALTIME）は NTP 同期で
+  前後に飛ぶため duration 計測・跨ノード順序付けに不適，monotonic clock を使うのが原則（codelit.io "Clock
+  Synchronization in Distributed Systems"，baeldung.com "Clock Offset vs Clock Skew"）．跨ノードの絶対時刻ずれ
+  （skew/offset）は一般に数十 ms オーダーで観測系にアラートを張るほどの量（oneuptime.com のスパン時刻補正記事は
+  50ms 閾値でアラート）．**51 ノードの絶対タイムスタンプを整列させるより，各 rank が自分の monotonic 区間長
+  （recv待ち・compute・send待ち）をローカルに測って持ち寄る方が，時計同期不要で自己完結し軽量かつ正確**．
+  既存コードは既に `time.monotonic()` を使用（:1042,:1201,:1247,:1252）でこの原則と整合している．
+- **[Q2] オーバーヘッドと計測擾乱の回避**: `time.monotonic()` 自体は ns オーダーで安価だが，microbatch×step×51 rank の
+  毎回 stdout 出力は洪水になる→**measure 窓のみ（warmup 除外）計時し，配列に貯めて repeat ごとに 1 行に集約
+  （mean/min/max/合計）して吐く**のが定石．また**計時目的の `dist.barrier()` を per-microbatch ループ内に入れては
+  ならない**（barrier 自体が直列化を生み，測ろうとしている fill を壊す＝観測が対象を変える）．barrier は measure 窓の
+  境界のみ．
+- **[Q3] first-stage 入力生成がボトルネックになる形はあるが本ケースでは軽い**: GPipe/1F1B の一般論では first stage が
+  各 microbatch の入力を供給し，供給が遅いと下流が飢える（siboehm.com が明記）．ただし本リポジトリの rank0 生成は
+  `recv_buffers[mb].normal_()`（:1021，ローカル RNG 充填）で，ディスク I/O や tokenize を伴わず**構造的に重くない**
+  ため，候補(a)「rank0 生成の直列」が主因である事前確度は低い（が，計測で潰す価値はある＝rank0 の normal_() 区間も
+  ログ対象にする）．
+
+**コード読解で判明した重要事実（ログ設計に直結）**
+
+- **B15 が挙げた候補(b)(c) は静的読解でほぼ排除できる**: measure ループ（`_run_microbatch_bench`:1237-1275）内に
+  `dist.barrier()` は存在せず，`_reset_kv_cache_for_bench`（:989-995）は KV テンソルの `zero_()` と write_pos の
+  ローカル初期化のみで**跨 rank 同期を含まない**．relay 側 barrier（:1430 等）は serving 経路で bench 経路とは別．
+  よって残る主容疑は候補(a)＝rank0 生成 ではなく，**各 rank の recv待ち/send待ちの分布に現れる何か**（Gloo p2p の
+  実ネット rendezvous コスト・下流バックプレッシャ等）に絞られる．これ自体が「barrier 由来ではない」という一次証拠と
+  してログで確認する価値がある．
+- **現状 RESULT は last rank でしか出ない**（:1265 `if is_last_node`）．per-rank の直列化点を見るには
+  **全 rank が自分の timing 集約行を出す**必要がある（`tools/collect_results.py --stage-timing` は Iter4/B7 で全 rank へ
+  SSH して `docker logs` を集める経路を既に持つので，各 rank が `[R{rank} RESULT] ...` を吐けば収集できる）．
+- **`_process_microbatch` は値を返さない**ため，計時値は `timing_accumulator` 等のオプション引数（bench 経路からのみ
+  非 None）か `self` の一時属性へ貯め，serving 経路（`timing_accumulator=None`）の挙動は不変に保つ設計が自然
+  （Iter3/P1 の per-request INFO 追加・可逆と同種）．
+
+**次フェーズ（rc-planner）への具体的な示唆**
+
+- **打刻箇所**（すべて `_process_microbatch`:1019-1050 内，bench フラグ時のみ有効化）: [A]recv 前 t0 →
+  rank0 は `normal_()`（:1021），他 rank は `dist.recv`（:1024）直後 t1＝**recv_wait_s**（＝上流が未送出なら大きい）→
+  [B]compute 後（send 前）t2＝**compute_s** → [C]`dist.send`（:1048）後 t3＝**send_wait_s**（＝下流が recv 未 post なら
+  大きい，rendezvous 由来のバックプレッシャ）．この 3 区間分解が StageFrontier の「compute と wait を分けて rank 間で
+  相関」を満たす最小構成．
+- **集約と出力**: warmup を除いた measure 窓で 3 区間を rank ごとに配列蓄積し，repeat 終了時（`_run_microbatch_bench`
+  の measure ループ直後，:1263 付近）に**全 rank が** `[R{rank} RESULT] MICROBATCH_BENCH_TIMING recv_wait_s=...
+  compute_s=... send_wait_s=... (mean/min/max)` を 1 行出力（既存 `MICROBATCH_BENCH` 行の key=value 形式を踏襲し
+  collect_results.py が拡張パースしやすい形に）．per-microbatch の生値を毎回 stdout に出さない．
+- **時計方針**: 追加も `time.monotonic()` で区間長のみ記録し，跨 rank の絶対時刻整列はしない（時計同期不要・軽量）．
+  spacetime 図が要る場合でも rank r の send_wait と rank r+1 の recv_wait を突き合わせれば直列パターン（staircase）は
+  相対値だけで読める．
+- **判定の当たり**: 集約後に (i) compute_s が支配的なら既知の compute 律速 92%（F1）で fill 不成立の主因は計算量→
+  量子化軸（示唆(B)）へ，(ii) recv_wait_s が上流ほど小さく下流ほど大きい／逆の勾配を持つなら Gloo p2p のリング状
+  バックプレッシャ＝blocking 構造の実機挙動，(iii) rank0 の normal_() 区間が想定外に大きければ候補(a) を初めて実証，と
+  切り分けられる．計測擾乱回避のため per-microbatch ループ内に barrier を足さないことを計画に明記すること．
+- **フォールバック（B15 記載）**: 本計測が予想外に serving 経路へ波及するなら示唆(B)（重み int8 dynamic quantization の
+  SL1 型 local マイクロベンチ）へ振り替え．新規の要人間判断は発生しない（加算的計測ログのみ・可逆，実機 deploy は B7
+  包括承認の範囲内で破壊的操作なし）．
+
+**出典**
+
+- NVIDIA Technical Blog, "Scaling Language Model Training to a Trillion Parameters Using Megatron"（バブル率
+  `(p-1)/(m+p-1)`，1F1B スケジュール），developer.nvidia.com．
+- Narayanan et al., "Efficient Large-Scale Language Model Training on GPU Clusters"（m,p,t_f/t_b の定式化），
+  people.eecs.berkeley.edu．
+- StageFrontier: "Synchronization-Aware Stage Accounting for Distributed ML Training"（同期が症状を転移させる／
+  compute と wait の分離が必要），arXiv．
+- MPI Forum, "Nonblocking communication"（synchronous send は matching recv まで完了遅延），mpi-forum.org．
+- S. Böhm, "Pipeline-Parallelism: Distributed Training via Model Partitioning"（first stage が入力供給・schedule
+  generator），siboehm.com．
+- PyTorch issue #128292 "put profiling results from different ranks into one webpage"（複数 rank トレース統合は
+  未解決課題），github.com/pytorch/pytorch．
+- "Clock Synchronization in Distributed Systems"（codelit.io）／"Clock Offset vs Clock Skew"（baeldung.com）／
+  "How to Fix Incorrect Span Timestamps Caused by Clock Skew"（oneuptime.com）——monotonic clock 使用・跨ノード
+  絶対時刻回避・skew は数十 ms オーダー．
+- torch.distributed docs（Gloo が CPU の send/recv を supports），docs.pytorch.org．
+
+---
+
 ## Iteration 8
 
 ### 考察・次計画 (Iter8)
@@ -1322,561 +2003,6 @@ continuous batching のバブル残存・prefill/decode 混在＝ TD-Pipe, arxiv
 動的マイクロバッチ・トークン予算, MDPI Sensors 26(4):1101, mdpi.com/1424-8220/26/4/1101；コード事実＝
 `pipeline_inference.py:611-623,963-1002,970-972,976,1004-1107,1020,1109-1147,1092-1107,1290,1739,2032`；本リポジトリの計算律速 92%・
 利用率 ≒1/51 ＝ journal Iter4 `### 調査/分析(解釈) (Iter4)`．
-
----
-
-## Iteration 6
-
-### 考察・次計画 (Iter6)
-
-**担当**: 考察・次計画 subagent（2026-07-19）．`### 分析(解釈) (Iter6)` の結論（go 方向を強める）を受け，単一レバー
-**SL2（draft 採択率のオフライン見積もり）**の採否を確定し，次イテレーション（Iteration 7）の方向を決めた．実機への新規
-接続・実行はしていない（記録の読み取り・`results/draft_acceptance.jsonl` の読み取り・commit 操作のみ）．
-
-**1. 採否判定: 採用で確定・収束（adopt & converged）**
-
-- **判定根拠**: SL2 は診断（計測）レバーであり，判定対象は「B3（speculative decoding）の**期待値側の因子＝draft 採択率**が，
-  SL1 で確定した compute 天井を実効利得として現実化させる下限条件を満たすか（向き）」．analyst 判定どおり実測は
-  **overall α=0.5856（≳0.5）・a_2=1.8562（≳1.5）**で計画 §4 の go 条件を**両方充足**し，no-go 域（a_K≈1・α≲0.1）からは
-  大きく離れる．ノイズは greedy ゆえ決定的量で，全体 α は 555 位置・全 4 カテゴリが位置数 ≥50 を満たし（doc_qa は 52 で
-  境界だが全体値優先），ラベルが反転する余地は無い．実装は新規 2 ファイル（`scripts/estimate_draft_acceptance.py`／
-  `tests/test_estimate_draft_acceptance.py`）＋ HF キャッシュ revision 固定のみで `pipeline_inference.py` 非改変，
-  `pytest` 83 passed（回帰なし）．計画 §4 の完了条件（α・カテゴリ別 α・経験 a_K・α→a_K 写像併記・prompt-lookup 層別・
-  SL1×SL2 合成の素数値・純関数テスト green）を全て満たした．**採用で確定**．
-- **追加反復の要否**: 不要．α・a_K は greedy で決定的（run 間分散ゼロ）ゆえ，同一プロンプト集合での反復では新情報は
-  得られない（推定誤差は位置数のみに支配され，555 位置で十分）．
-- **このレバーの収束状況**: SL2 は「採択率が SL1 の compute 天井を実効利得へ現実化する下限条件を満たすか」という単一の
-  問いに，決定的な答え（満たす＝下限クリア．ただし満額は取れず実効 compute 利得は最良 K=4 で ≈1.43 倍）を出したため
-  **このサブレバーは収束**．同じ問いへ SL2 を再び振っても新情報は得られない．次は B3 go/no-go（B9，人間判断待ち）へ
-  論点が移るが，それ自体はこの reflector では決めない（§3）．
-
-**2. 非自明な学び（次の自分向け）**
-
-- **(i) SL1 の 4.7 倍 compute 天井の大半は採択率が食い潰す**: SL1 単独では ratio_8=0.213＝per-token compute を最大
-  1/0.213≈4.7 倍にできる余地があった（Iter5 の学び）が，現実の採択率（α=0.586・a_K が K に届かない）を織り込むと
-  **SL1×SL2 合成の実効 compute 利得は最良でも ≈1.43 倍（K=4）**に縮む（K=2:1.23／K=4:1.43／K=8:1.35）．B3 の compute 側
-  期待値は「no-go にするほど低くはない（下限クリア）が，天井を満額は取れない」水準．Iter5 §2(iii)「残る不確実性は
-  期待値側（採択率）に集約」への定量的回答である．
-- **(ii) K=4 が最良点で，draft 長を伸ばすほど得ではない**: a_K は K とともに単調増加（1.86→2.16→2.29）するが増分は
-  逓減し，一方で検証コスト K·ratio_K は K=8 で増える（1.506→1.512→1.704）ため，実効利得は K=4 で最大・K=8 で目減り
-  （1.43→1.35）する．**B3 を進める場合の draft 長の第一候補は K=4**．K=8 への延伸は a_K の飽和で割に合わない．
-- **(iii) prompt-lookup（n-gram）は E2B 主軸の妥当性を補強しただけ**: prompt-lookup は open_chat（α=0.013）・code
-  （α=0.057）で無力で，入力接地が n-gram 重複として現れる要約・抽出的 QA（α=0.36／0.52）でのみ効く．同じ code で E2B は
-  α=0.516 と機能しており，**汎用 draft には n-gram 単独では不適，go/no-go は E2B に依存させた計画判断は正しかった**．
-  補助指標は主指標を動かさずに枠組みの妥当性検証に徹する使い方が有効，という運用面の学びでもある．
-- **(iv) B9 を諮る前に残る未測 3 因子（analyst 申し送り）**: (a) **relay 1 往復化のプロトコルオーバーヘッド**（＝SL3/B9
-  本体そのもので，1.43 倍の compute 利得を通信コストがどれだけ食うかが B3 の実 end-to-end 速度を左右する最大の未測因子），
-  (b) **プロンプト分布の代表性**（本測定は 4 カテゴリ均等 16 件のトイ集合．open_chat 比率が高い運用では全体 α は下振れ），
-  (c) **長文生成での α 安定性**（本測定は `N_MAX_NEW_TOKENS=48` の短い生成長）．(a) は B9 本体，(b)(c) はオフラインで
-  安価に潰せる余地があるが，本 reflector では次レバーを config 既定候補から選ぶ制約に従い自律選定の対象外とした（§4）．
-
-**3. B9（B3 本体＝relay プロトコル改修＝SL3 の go/no-go）の扱い: needs-human のまま維持（今回 reflector では自動判定しない）**
-
-- **判断**: SL1（compute 天井）×SL2（採択率）が出揃い，B9 の判断材料（実効 compute 利得 ≈1.4 倍・K=4 最良）は揃った．
-  ただし B9 は「不可逆・大規模な relay プロトコル改修（`pipeline_inference.py` ホットパス改変・検証木・51 ノード再デプロイ）」の
-  go/no-go であり，research-cycle の自律判断ポリシー（不可逆/大規模は人間判断）に該当する**不可逆判断**である．したがって
-  この reflector フェーズでは go/no-go を自動選択せず，B9 は `[needs-human]` のまま**維持（差し替えない）**．
-- **状況**: B9 の論点は「この ≈1.4 倍の compute 利得を relay プロトコル改修コスト（未測）が上回るか」へ移行しており，
-  既に別途 Slack（`<@U08GLKY1QCW>` mention 付き）で報告済み．今回の通常サマリー投稿では重複 mention を避ける．人間の
-  回答を待って continue 時に，回答内容に応じて SL3 着手（go）か別レバー継続（no-go/保留）を決める．
-
-**4. 次に振るレバーの決定（Iteration 7）: NUM_MICRO_BATCHES（research_frontier② のスループット感度）を自動選定**
-
-- **決定（自律判断・可逆）**: Iteration 7 の単一レバーを **`NUM_MICRO_BATCHES`（config `levers` 最優先候補，
-  research_frontier② の「マイクロバッチ数・stagger interval のスループット感度分析」の枠組みで振る）**とする．B9 の人間
-  回答を待たずに自律実行できる軽量な項目で，B3 の compute 律速（B9，人間判断待ち）とは**直交する軸**であり，人間回答を
-  待つ間に研究を停滞させないための選定である．
-- **選定理由**: (1) B9 が人間判断待ちの間，reflector が自律的に選べる項目は config `research_frontier` ②③④ または `levers`
-  の 4 候補に限られる（不可逆な SL3/B9 へは踏み込まない）．その中で `NUM_MICRO_BATCHES` は `levers` 一覧の**最優先**
-  （順序＝優先度）で，B6 が ②/⑤ 着手時の実験前提条件（`--iter Iter{n}` 変数化・冷開始交絡除去・各水準 n≥3〜5 反復・
-  主指標 ITL/TTFT）を既に申し送り済みで planner が即着手できる．(2) 実機 deploy/predict を伴うが B7 の包括承認（非破壊
-  SSH/deploy）の範囲内で自律実行可．(3) 破壊的操作を含まず可逆．
-- **重要な留保（planner への申し送り）**: Iter4 で「`NUM_MICRO_BATCHES` は**単一リクエストの ITL では Σcompute 不変・
-  残差止まり**（支配項 compute に効かない）」と確定済みである．したがって単発デモ（`"Hello!"` 1 件）を回すだけでは
-  スループット差は出ない．②の感度を意味あるものにするには，**planner が複数リクエスト同時投入／連続バッチのワークロード
-  を設計し，パイプラインバブル低減が効く条件（micro-batch 数を増やすと段間の遊びが埋まる状況）を作る**必要がある．
-  この設計が過大（`pipeline_inference.py` ホットパス改変を要する等）と判明した場合は，SEQ_LEN（④）や STAGGER_INTERVAL
-  へ振り替えるか，backlog へ `[needs-human]` 登録して諮ること．
-- **見送り（非選定）の理由**: SL3／B3 本体は §3 のとおり B9（人間判断待ち・不可逆）．STAGGER_INTERVAL は起動時
-  thundering herd 回避が主目的で単発 ITL への寄与が小さく，SEQ_LEN（④）・WORLD_SIZE（③）は品質/メモリ・層割当粒度の
-  トレードオフで今回の「軽量に振れる待ち時間の使い道」としては `NUM_MICRO_BATCHES`（最優先レバー）に劣後する．
-  backlog に `## B12 [auto-decided 2026-07-19]` として本決定を記録した．
-
-**次イテレーションへの結論**: Iteration 6（SL2: draft 採択率のオフライン見積もり）を**採用で確定・収束**（overall α=0.5856・
-a_2=1.8562 で go 条件を両方充足＝SL1 の compute 天井を実効利得へ現実化する下限条件をクリア．SL1×SL2 合成の実効 compute
-利得は最良 K=4 で ≈1.43 倍）．B3 本体（SL3）go/no-go の B9 は判断材料が揃ったが不可逆判断のため `[needs-human]` のまま
-維持し，人間の回答を待つ．Iteration 7 は `NUM_MICRO_BATCHES`（research_frontier② のスループット感度）を自動選定して開始
-する（B9 回答を待つ間，直交軸で研究を進める）．
-
-### 実験（再実行・成功） (Iter6)
-
-**担当**: 実験フェーズ subagent（2026-07-19T15:35〜16:15 JST）．`### 実装（HF キャッシュ revision 修正）(Iter6)` の
-対処後，`unset VIRTUAL_ENV && uv run python scripts/estimate_draft_acceptance.py` を再実行（既に起動済みだったプロセス
-PID 1097153/1097157 を監視するのみで，新規プロセスは起動していない）．実機クラスタへの接続・deploy・SSH・HF キャッシュ
-の書き換えは行っていない．
-
-- **結果: 正常完了**．所要時間 約 39 分（開始 15:35 → `results/draft_acceptance.jsonl` 書き込み完了 16:15:17）．
-  `run.log` にエラー・例外なし（`torch_dtype` deprecated 警告のみ）．デッドライン 17:35 に対し余裕あり．
-- **出力先**: `results/draft_acceptance.jsonl` 1 行目に 1 レコード追記（新規ファイル，既存 `Iter1/3/4.jsonl` や
-  `bench_compute_ceiling.jsonl` は無変更）．
-
-#### 主要数値（解釈・良否判定は analyst フェーズへ）
-
-- `overall_alpha_e2b = 0.5856`（E2B draft の全体採択率）．カテゴリ別: `open_chat=0.5000`／`summarization=0.7197`／
-  `doc_qa=0.6923`／`code=0.5156`．
-- prompt-lookup（n-gram, 補助・A-2 検証用）カテゴリ別 α: `open_chat=0.0130`／`summarization=0.3567`／
-  `doc_qa=0.5192`／`code=0.0573`（入力接地型で高く開放チャットでほぼゼロ，計画で想定した傾向と一致）．
-- 経験 `a_K`（K別平均採択長，E2B）: `K=2: 1.8562`／`K=4: 2.1595`／`K=8: 2.2934`．α からの予測値
-  （`K=2: 1.9285`／`K=4: 2.2469`／`K=8: 2.3935`）と近似し，大きな乖離なし．
-- **SL1×SL2 合成**（`a_K × ratio_K` と `gain_over_baseline`，SL1 の実測 `ratio_K={2:0.753,4:0.378,8:0.213}` と合成）:
-  `K=2: product=1.3977, gain=1.2325`／`K=4: product=0.8163, gain=1.4283`／`K=8: product=0.4885, gain=1.3459`．
-- プロンプト数 16（4 カテゴリ×4 件），`n_max_new_tokens=48`．per-prompt 内訳は `results/draft_acceptance.jsonl`
-  の `per_prompt` フィールドに全件保存済み．
-
-### 分析(解釈) (Iter6)
-
-**担当**: 分析(解釈) subagent（2026-07-19）．`### 実験（再実行・成功） (Iter6)` の実測値と `results/draft_acceptance.jsonl`
-の `per_prompt` 全 16 件を Read し，`### 検討・計画 (Iter6)` §4 の成功条件・判定の解釈指針（位置数 ≥50 のみ有意な層別値／
-a_2≳1.5・α≳0.5 で go 方向／a_K≈1・α≲0.1 で no-go 方向／中間は SL1 ratio_K との積で期待値レンジ）に照らして解釈した．
-実機への接続・実行・`results/draft_acceptance.jsonl` への書き込みはしていない（読み取りのみ）．α は greedy で決定的
-（run 間分散ゼロ）ゆえ，ノイズ評価は位置数（＝参照トークン数）で行い，過去反復の標準偏差ではなく決定的量の位置数依存性で判定した．
-
-**前提（判定の枠組み）**: SL2 の判定対象は「B3（speculative decoding）の**期待値側の因子＝draft 採択率**が，draft の per-token
-compute 削減（SL1 で確定した compute 天井）を実効利得として現実化させる下限条件を満たすか」であり，B3 本体の実レイテンシ低減量
-そのものではない．判定は E2B draft の全体 α・a_K を主根拠とし，prompt-lookup は A-2 検証（E2B を主軸に据える妥当性の裏付け）
-の補助に留める（計画 §2 の一本化どおり，prompt-lookup で go/no-go を動かさない）．
-
-**1. ノイズ判定: 全 4 カテゴリが位置数 ≥50 を満たし，層別値は全て有意（ただし doc_qa は下限ぎりぎり）．全体 α は十分な母数**
-
-- `per_prompt` の `num_reference_tokens` をカテゴリ別に集計した位置数（＝α を測った照合位置数）: **open_chat=154／
-  summarization=157／doc_qa=52／code=192，全体=555**．計画 §4 の閾値「位置数 ≥50 のみ有意な層別値」を**全カテゴリが充足**する
-  ため，カテゴリ別 α は 4 種とも有意な層別値として扱える．ただし **doc_qa は 52 と閾値ぎりぎり**（計画 §3 が目標とした
-  ≈150 位置/カテゴリには届かない．doc_qa の参照出力が短い＝QA 回答が 18/10/15/9 トークンと簡潔なため）で，doc_qa の α=0.6923 は
-  有意だが層別推定としては相対的に薄い（解釈は全体値優先）．
-- **全体 α=0.5856 は 555 位置に基づく**（計画 §3 の全体 ≈600 位置想定にほぼ一致）．greedy ゆえ α は決定的量で run 分散はゼロ，
-  推定誤差は位置数のみに支配される．555 位置は「見かけの増減か有意か」を論じるまでもなく，**全体値を主たる判断根拠に据えられる
-  水準**である（計画の指針どおり，doc_qa の薄さを含む層別ノイズは全体値で吸収する）．
-- カテゴリ内ばらつき（per-prompt α の min/max）: open_chat 0.479–0.542／summarization 0.629–0.783／doc_qa 0.556–0.778／
-  code 0.417–0.625．各カテゴリ内で符号が割れる（一部が α≈0 に落ちる）ことはなく，**層別値の向きは安定**している．
-
-**2. 判定結果: go 方向を強める（下限条件クリア）．全体 a_2=1.86≳1.5 かつ α=0.586≳0.5 に明確に該当**
-
-- 計画 §4 の解釈ガイド「**E2B の全体 a_2≳1.5（α≳0.5）**なら SL1 の compute 天井が実効利得として現実化する下限条件クリア＝
-  B3 go 方向を強める」に対し，実測は **a_2=1.8562（≳1.5）・overall_α=0.5856（≳0.5）**で**両条件とも充足**．no-go 方向の
-  条件（a_K≈1・α≲0.1）からは大きく離れる（最小の a_2=1.86 でも 1 を大幅に超える）．したがって本 SL2 は **go 方向を強める**
-  領域に該当し，中間域（SL1 ratio_K との積で期待値レンジを提示して B9 で諮る）ではなく**下限条件を明確にクリアした**と判定する．
-- **α→a_K 写像の整合**: A-1 の式 `E=(1-α^(K+1))/(1-α)` による予測 a_K（K=2:1.9285／4:2.2469／8:2.3935）と経験 a_K
-  （1.8562／2.1595／2.2934）の乖離は各 K で 3.8%／3.9%／4.2% と小さく，**経験値が一貫して予測をわずかに下回る**．これは iid 幾何
-  近似に対し実系列が非 iid（序盤位置ほど採択されやすく，後半で不一致が出やすい）であることの符号として自然で，想定外の挙動
-  ではない．写像が数％以内で成立するため，α と a_K は相互変換可能な整合した量として扱える．
-- 想定外挙動（言語崩れ・発散・OOM 等）は無し．実験は 39 分で正常完了し，run.log にエラーなし（`torch_dtype` deprecated 警告のみ）．
-
-**3. prompt-lookup（A-2 検証）: 開放チャット≈0 は予想どおり．ただし code も低く，E2B を主軸に据える妥当性をむしろ補強**
-
-- prompt-lookup（n-gram）カテゴリ別 α: open_chat=0.0130／summarization=0.3567／doc_qa=0.5192／code=0.0573．**開放チャットで
-  ほぼゼロ（0.013）**は A-2 の予想「開放チャットでは入力↔出力の n-gram 重複が乏しく採択率≈0」と**一致**．summarization=0.357／
-  doc_qa=0.519 が高いのも「入力接地型で高い」予想と一致する．
-- **予想からの部分的ズレ（重要な補強材料）**: A-2 は code（コード編集）も入力接地型として高採択を予想したが，実測 code=0.0573 は
-  open_chat 並みに低い．本イテレーションの code タスク（docstring 追加・バグ修正・型ヒント付与・実装補完）は**出力が入力の
-  n-gram コピーではなく新規生成**のため，直近 n-gram の入力内マッチが効かなかったと解釈できる．一方で**同じ code で E2B は
-  α=0.5156 と機能している**．すなわち prompt-lookup は「入力接地の形が n-gram 重複として現れるタスク（要約・抽出的 QA）」に
-  限って効き，code のような生成的タスクでは開放チャット同様に崩れる．これは計画 §2 が E2B を主軸（開放チャットでも効く汎用性・
-  prompt-lookup の弱点 A-2 を持たない）に据えた判断を**むしろ補強する**（prompt-lookup 単独では code・open_chat の 2 カテゴリで
-  無力＝汎用 draft には不適，go/no-go は E2B に依存させて正解）．
-
-**4. B9（B3 本体＝relay プロトコル改修 go/no-go）への材料: compute 側の実効利得は 1.23〜1.43 倍（K=4 が最良）．上限側は埋まったが期待値側の一部と relay コストは未測**
-
-- **合成利得の意味**: `gain_over_baseline = a_K /(K·ratio_K)`（実測で K=2:1.2325／K=4:1.4283／K=8:1.3459．算出式を per_prompt から
-  逆算し確認済み）は，「1 検証ステップで draft の K 提案を 1 回の GEMM（K 位置）で検証し a_K トークンを確定する」ときの，通常の
-  逐次 GEMV（per-token compute=1）に対する **per-token compute の実効削減倍率**である．SL1（GEMM 効率＝ratio_K）と SL2（採択率＝a_K）
-  を掛け合わせた B3 の **compute 側実効利得の期待値**にあたる．
-- **数値の大小の意味づけ（B9 の核心）**: SL1 単独では ratio_8=0.213＝理論上 per-token compute を最大 1/0.213≈4.7 倍にできる余地が
-  あった（Iter5 の学び）．しかし採択が理想化されない現実（α=0.586，a_K が K に届かない）を織り込むと，**compute 側利得は最良でも
-  ≈1.43 倍（K=4）に縮む**．つまり **SL1 の 4.7 倍の compute 天井のうち，採択率が大半を食い潰し，残る実効 compute 利得は 1.4 倍
-  程度**というのが SL1×SL2 合成の結論である．これは Iter5 §2(iii)「残る不確実性は期待値側（採択率）に集約」への定量的回答で，
-  採択率は「B3 を no-go にするほど低くはない（下限クリア）が，compute 天井を実効利得として満額は取れない」水準だと分かった．
-- **K 依存性の解釈**: 利得は **K=4 で最大（1.43 倍）**．a_K は K とともに単調増加（1.86→2.16→2.29）するが増分は逓減し，一方
-  K·ratio_K（検証コスト）は K=8 で増える（1.506→1.512→1.704）ため，積の比は K=4 が最良点になる．**B3 を進める場合の draft 長は
-  K=4 が第一候補**．K=8 まで伸ばしても a_K の伸びが飽和し検証コスト増で利得はむしろ目減りする（1.43→1.35）．
-- **何が測れて何が未知か（B9 の残論点）**:
-  - 測れた: (i) draft 採択率 α と a_K（E2B・16 プロンプト・4 カテゴリ層別），(ii) SL1×SL2 合成の compute 側実効利得（1.23〜1.43 倍，
-    K=4 最良），(iii) 生成品質は greedy exact-match 採択の構成上ロスレス（speculative decoding のアルゴリズム的性質で品質劣化なし）．
-  - **未知（B9 で人間が織り込むべき）**: (a) **relay 1 往復化のプロトコルオーバーヘッド（SL3/B9 本体）**＝分散 51 ノードで draft 提案と
-    target 検証を 1 往復に畳む通信コストは本 SL2 に含まれない．この relay コストが 1.4 倍の compute 利得をどれだけ食うかが B3 の
-    実 end-to-end 速度を左右する最大の未測因子．(b) **プロンプト分布の代表性**: 実運用のタスク構成（開放チャット比率が高いか，
-    入力接地型が多いか）で全体 α は動く（本測定は 4 カテゴリ均等 16 件のトイ集合．open_chat が多い運用なら α は下振れ）．
-    (c) 本測定は N_MAX_NEW_TOKENS=48 の短い生成長での α．長文生成での α の安定性は未確認．
-
-**分析の結論**: SL2（E2B draft 採択率）は **go 方向を強める**（全体 a_2=1.86≳1.5・α=0.586≳0.5 で下限条件を明確にクリア，
-no-go 域からは遠い）．ノイズ判定は全 4 カテゴリが位置数 ≥50 を満たし層別値は有意（doc_qa は 52 で薄いため全体値を優先），
-全体 α=0.5856 は 555 位置に基づく決定的量で確信度は高い．prompt-lookup は open_chat・code で崩れ E2B 主軸の妥当性を補強．
-SL1×SL2 合成の compute 側実効利得は 1.23〜1.43 倍（**K=4 が最良**）で，SL1 の 4.7 倍 compute 天井の大半は採択率が食い潰すが
-B3 を棄却するほど低くはない．B3 go/no-go は「この 1.4 倍の compute 利得を relay プロトコル改修コスト（未測）が上回るか」に論点が
-移る．追加反復の要否: SL2 の judgment 自体は決定的量ゆえ**追加反復不要**．ただし B9 を諮る前に，relay オーバーヘッドの見積もり
-（別レバー）とプロンプト分布の代表性の確認が残課題として次の考察・次計画フェーズ（rc-reflector）へ申し送る．
-
-### 調査 (Iter6)
-
-**担当**: 調査フェーズ subagent（2026-07-19）．単一レバー **SL2（draft 採択率のオフライン見積もり）**の計画に必要な，
-(A) 採択率見積もり手法の先行研究，(B) 既存コード（`pipeline_inference.py` の生成・トークナイズ・サンプリング）と
-ローカル資産（モデル重み・トークナイザ）の制約，を調べた．実機クラスタへの接続・deploy・relay 改修は一切していない
-（コードと文献の読み取り，および `~/.cache/huggingface`・`models/splits` のメタデータ確認のみ）．
-
-#### 調査の問い
-
-1. speculative decoding の draft 採択率（acceptance rate）をオフラインで見積もる標準手法は何か（prompt-lookup/n-gram
-   と小 draft モデルの両系統）．測定指標はどう定義され，採択率から実効速度への写像はどう与えられるか．
-2. 本リポジトリのユースケース（Gemma-4-31B・分散パイプライン並列・CPU・greedy 生成）で，relay 改修・再デプロイなしに
-   「draft 生成 → 検証 → 採択率算出」を単一プロセスで完結できるか．既存コード・ローカル資産の制約は何か．
-
-#### A. 分かったこと（採択率見積もり手法・出典付き）
-
-- **A-1 採択率の指標定義（写像が計画の要）**: speculative decoding の実効利得は「1 検証ステップあたり確定するトークン数
-  （block efficiency / mean accepted length）」で決まる．greedy target 検証では **draft の第 i トークンは target の argmax と
-  一致したときのみ採択**（決定的な exact-match）で，最初の不一致で打ち切り＋target が 1 個の bonus トークンを出す．
-  Leviathan et al. 2023「Fast Inference from Transformers via Speculative Decoding」の期待トークン数は
-  **E[生成トークン/ステップ] = (1 − α^(γ+1)) / (1 − α)**（α＝1 トークンあたり採択確率，γ＝draft 長＝K）．
-  これが **SL2 で測る α を実効利得へ写像する式**であり，SL1 の per-token compute 比（ratio_K）と掛け合わせると B3 の
-  期待利得レンジが数値で括れる（出典: arxiv.org/abs/2211.17192，および vLLM の acceptance/mean-acceptance-length 定義
-  docs.vllm.ai の `vllm.v1.spec_decode.metrics`）．
-- **A-2 prompt-lookup（n-gram）draft の傾向と測定法**: draft モデルを使わず，直近生成 n-gram を **入力（プロンプト＋既生成）
-  内で文字列マッチ**し，一致継続列を candidate として提案する（apoorvumang/prompt-lookup-decoding，github.com）．著者の
-  実測条件は **max n-gram=3・continuation length=10・greedy**．**入力接地型タスク（要約・文書 QA・コード編集・多ターン
-  チャット）で入力↔出力の n-gram 重複が高いとき 2〜4 倍高速化，品質不変**．逆に**開放的な短文チャットでは重複が乏しく
-  採択率はほぼゼロに落ちる**（zenml.io，aphrodite/vLLM の ngram prompt-lookup 解説も同旨）．**含意（重要）**: 本リポジトリの
-  デモプロンプトは `"Hello!"`（出力 15 トークン `"Hello! How can I help you today?\nthought"`，`results/Iter4.jsonl`）で入力接地性が
-  無く，prompt-lookup をこの 1 プロンプトだけで測ると採択率≈0 という**過小評価**になる．prompt-lookup を公平に測るなら
-  要約・QA・コードなど入力接地型プロンプト集合が要る．
-- **A-3 小 draft モデルの採択率オフライン測定法**: 標準手順は「target の greedy 参照系列を確定 → 同一プレフィックスを
-  draft に食わせ K トークン提案 → target argmax と逐位置照合し，最初の不一致までの採択長を集計」．必要データは
-  (i) target と **同一トークナイザ／語彙**の小 draft モデル，(ii) 評価プロンプト集合，(iii) target の参照 argmax 系列．
-  採択率が低いと draft の予測精度不足で利得が出ない点が既知の弱点（Online Speculative Decoding, arxiv.org/abs/2310.07177）．
-- **A-4 本ユースケースに近い事例**: CPU・分散パイプライン・Gemma に完全一致する公開事例は見当たらなかった（Gemma-3 の
-  spec decoding は主に GPU ランタイム LM Studio/Ollama/TensorRT-LLM 文脈）．ただし **採択率の測定自体はランタイム非依存**で，
-  target と draft の logits/argmax があれば CPU 単機でも成立する（採択率はモデル対の性質で，実行ハードに依らない）．
-
-#### B. 既存コード・ローカル資産の制約（SL2 をローカル単一プロセスで完結できるか）
-
-- **B-1 生成規則（複製すべき target の判定則）**: 最終 rank は `hidden → final_norm → lm_head(F.linear) →
-  final_logit_softcapping=30 の tanh → argmax`（`pipeline_inference.py:1600-1618`）で **greedy・決定的**．softcapping は
-  単調変換で argmax を変えないが，参照再現では忠実に含めてよい．**greedy なので採択判定は exact-match で厳密**（サンプリング
-  時の確率的採択の近似は不要）＝オフライン測定が素直．
-- **B-2 トークナイズ**: `_tokenize()`（`:110-129`）が Gemma-4 chat template（`apply_chat_template` + `encode`,
-  `add_generation_prompt=True`）を適用．参照系列・draft の入出力は**この同じ経路でトークナイズすべき**（生テキスト直 encode は
-  IT モデルで挙動が変わる）．
-- **B-3 ローカル資産（オフライン化の決定的な後押し）**:
-  - target **`google/gemma-4-31B-it` のフル重みがローカルに二重に存在**: `~/.cache/huggingface/hub/models--google--gemma-4-31B-it`
-    （59GB・safetensors 5 本，tokenizer/config 含む）と `models/splits/`（60GB・`embed_tokens`＋`layer_0..59`＋`lm_head`）．
-    語彙は embed サイズ 2818572416B ÷ (5376 hidden × 2B bf16) ≈ **262144**．
-  - **小 draft 候補 `google/gemma-4-E2B` がローカルに存在**（`~/.cache/.../models--google--gemma-4-E2B`，9.6GB・
-    `model.safetensors`，tokenizer/config 揃い）．`model_type=gemma4`・**`vocab_size=262144`＝target と一致**（＝同一トークナイザ，
-    token ID 直接照合可），`num_hidden_layers=35`・`hidden_size=1536`・`num_kv_heads=1`（実効 ~2B 級）．**同一 Gemma-4 系
-    ＝語彙一致の小 draft が既に手元にある**のは A-3 の要件 (i) を満たす理想条件．
-  - 実行ホスト RAM: 125GB（available 89GB）．draft(E2B)＝軽量で確実に載る．target 31B は bf16 で 59GB＝**単機ロードも一応可能
-    （余裕は小）**．より安全には `models/splits` を layer 単位でストリーム（load→compute→free）して参照生成する手もあるが，
-    **手元 HF キャッシュに 31B フル重みがある以上，`transformers` で `AutoModelForCausalLM.from_pretrained(..., torch_dtype=bfloat16,
-    device_map="cpu", local_files_only=True)` を単機ロードして greedy 参照を出すのが最短**（クラスタ・relay・deploy 完全不要）．
-- **B-4 既存ログの限界**: `results/*.jsonl` は `result_text`（デコード済み文字列）は持つが **generated_ids（トークン列）を持たない**
-  し，プロンプトは `"Hello!"` 1 種のみ（`results/Iter4.jsonl`）．よって**既存ログだけでは採択率は測れず**，参照系列は
-  ローカルで新規生成する必要がある（B-3 によりこれはクラスタ非接触で可能）．
-- **B-5 relay 改修は不要**: SL2 は「採択率という**モデル対の統計量**」の推定であり，実運用の relay 1 往復化（SL3/B9）を一切
-  含まない．`pipeline_inference.py` ホットパスも 51 ノード再デプロイも不要で，B10 の申し送り「クラスタ本体への大改変が要れば
-  needs-human 登録」に**抵触しない**（ローカル単一プロセスで完結する見込み）．
-
-#### C. 次フェーズ（rc-planner）への具体的示唆
-
-- **測定指標の定義（planner が固定すべき）**: 主指標は **K∈{2,4,8} ごとの平均採択長 a_K＝1 検証ステップで確定するトークン数**
-  （＝1＋最初の不一致までの採択数）と，**1 トークンあたり採択率 α**．A-1 の式で a_K と α は相互変換でき，SL1 の ratio_K と
-  組めば実効利得 ≈ a_K × (per-cycle コスト)⁻¹ の期待値レンジが出る．SL1 の K 値（2/4/8）に採択率の K を揃えると接続が綺麗．
-- **候補 draft 戦略（2 系統，両方測るのが安価で情報量大）**:
-  - **(C-1) 小 draft モデル＝`gemma-4-E2B`**: 語彙一致・ローカル在・軽量で第一候補．target(31B)greedy 参照に対する
-    exact-match 採択長を測る．**開放チャットでも効く**汎用性が prompt-lookup より高い見込み．
-  - **(C-2) prompt-lookup（n-gram, max=3・cont=10）**: モデル追加ゼロ・実装数十行．ただし A-2 より**入力接地型プロンプトで
-    ないと採択率≈0**．`"Hello!"` 単独では過小評価になるため，公平比較には入力接地型プロンプトが必須．
-- **参照データの取り方**: (a) **プロンプト集合**を小規模（例: 開放チャット数件＋要約/QA/コード編集など入力接地型数件，計
-  10〜30 件）に定義し，(b) 各プロンプトで **target(gemma-4-31B-it) を単機 greedy 生成**（`_tokenize` と同じ chat template・
-  `final_logit_softcapping=30`・argmax を再現）して参照 argmax 系列を作る（クラスタ非接触）．(c) 同系列上で (C-1)(C-2) の
-  採択長を集計．prompt-lookup の弱さを可視化するため**タスク種別ごとに採択率を層別集計**すること．
-- **既存コードとの接続点**: トークナイズは `pipeline_inference.py:_tokenize()` を再利用（chat template 一致），採択判定則は
-  `:1600-1618` の greedy+softcapping+argmax を複製．実装は Iter5 の `scripts/bench_compute_ceiling.py` と同じ **`scripts/` 配下の
-  独立スクリプト＋純関数テスト**方針が踏襲可能（`pipeline_inference.py` 非改変）．結果は `results/*.jsonl` へ追記（SL1 と同形式）．
-- **想定コスト/リスク**: target 31B の CPU 単機 greedy 生成は低速（実機 i5 で ~7s/token，実行ホスト 64 コアなら数倍速いが
-  依然重い）．**参照生成の総トークン数を絞る**（プロンプト数×最大新規トークン数を小さく）ことで数十分〜数時間に収める設計を
-  planner が置くべき．採択率は決定的量（greedy）ゆえ n=1 でも安定だが，プロンプト多様性が結論を左右する（A-2 の教訓）．
-- **人間判断の要否**: 現時点では **needs-human 事項は発生していない**（SL2 はローカル完結・可逆）．ただし planner が
-  「31B 参照生成を実機クラスタ経由で取得する」設計を選ぶ場合は B7 包括承認内の非破壊 SSH で可（それでも破壊的操作なし）．
-  ローカル完結（B-3 の HF キャッシュ利用）が最短かつクラスタ無負荷で推奨．
-
-**出典**: Leviathan et al. 2023, arxiv.org/abs/2211.17192（採択率→期待トークン式）; apoorvumang/prompt-lookup-decoding,
-github.com（n-gram draft・入力接地型で 2〜4×・max n-gram=3/cont=10/greedy）; Online Speculative Decoding, arxiv.org/abs/2310.07177
-（低採択率が利得を削ぐ）; vLLM `vllm.v1.spec_decode.metrics`, docs.vllm.ai（acceptance rate / mean acceptance length 定義）;
-zenml.io・aphrodite prompt-lookup 解説（n-gram 適用範囲）; ローカル資産: `~/.cache/huggingface/hub/models--google--gemma-4-{31B-it,E2B}`,
-`models/splits/split_info.json`, `pipeline_inference.py:110-129,1600-1618`, `results/Iter4.jsonl`．
-
-### 検討・計画 (Iter6)
-
-**担当**: 計画フェーズ subagent（2026-07-19）．`### 調査 (Iter6)` の結論（A-1 写像式・A-2 prompt-lookup の適用域・A-3
-小 draft の測定法・B-1〜B-5 のローカル資産と非改変性）を受け，単一レバー **SL2（draft 採択率のオフライン見積もり）**を
-実装可能な粒度へ落とし込んだ．本フェーズは実機クラスタへの接続・deploy・推論を一切行わない（コード／config／HF キャッシュ
-メタデータの読み取りのみ）．**確認事実**: `google/gemma-4-31B-it`（target, vocab=262144, `final_logit_softcapping=30.0`）と
-`google/gemma-4-E2B`（draft, `model_type=gemma4`, text vocab=**262144 一致**, softcapping=30.0, 35 層, hidden=1536,
-単一 `model.safetensors` 9.6GB）が HF キャッシュにローカル在．**語彙・softcapping が完全一致**＝**token ID を直接 exact-match
-照合可**．softcapping は単調変換で greedy argmax を変えない（B-1）ため，参照 argmax はモデル logits の argmax で取得してよい．
-
-#### 1. 仮説
-
-B3（speculative decoding）の**期待値側の因子＝draft 採択率**を，relay 改修・再デプロイなしにオフライン単一プロセスで
-見積もれる．具体的には，target(31B) の greedy 参照系列に対し draft(E2B) が提案する K トークンの exact-match 採択長を測れば，
-**1 トークンあたり採択率 α** と **K∈{2,4,8} ごとの平均採択長 a_K** が確定する．α が十分高ければ（例 α≳0.5 で a_2≳1.5），
-SL1 の実機 ratio_K（0.753/0.378/0.213）と組んで B3 の実効利得レンジを数値で括れる（go 方向を強める）．逆に α≈0（a_K≈1）なら
-draft は無力で，SL1 の compute 天井があっても B3 の実効利得は崩れる（no-go 方向）．prompt-lookup（n-gram）は入力接地型
-タスクでのみ α>0，開放チャットでは α≈0 という A-2 の傾向が，タスク種別層別で再現するはずである．
-
-#### 2. 単一レバー・変更内容
-
-**単一レバー**: 「診断対象を，SL1 の compute マイクロベンチ（GEMV vs GEMM）から，**draft/target 対の採択率オフライン測定**へ移す」
-の 1 点．クラスタ・relay・`pipeline_inference.py` は一切変更しない（固定）．draft 戦略の位置づけは以下に一本化する（単一レバー原則）:
-
-- **主軸（go/no-go の決定的入力）＝小 draft モデル `gemma-4-E2B`**．理由: (i) 語彙・softcapping が target と一致し token ID 直接
-  照合可，(ii) 軽量・ローカル在で単一プロセス完結，(iii) 開放チャットでも効く汎用性（prompt-lookup の弱点 A-2 を持たない），
-  (iv) B3/SL3 が実運用で載せる draft の実体に最も近い．**SL2 完了判定と B3 期待値レンジの数値化は E2B の α・a_K で行う**．
-- **補助（安価な比較・A-2 の検証のみ）＝prompt-lookup（n-gram, max=3・cont=10）**．追加モデルゼロ・実装数十行．**主指標には
-  用いず**，タスク種別層別で「入力接地型では α>0／開放チャットでは α≈0」を可視化して E2B を主軸に据える妥当性を裏付けるだけの
-  位置づけとする（結論は E2B に依存させ，prompt-lookup の結果で go/no-go を動かさない）．
-
-**変更ファイル（新規のみ・クラスタ非接触，Iter5 の `scripts/` 独立スクリプト方針を踏襲）**:
-- 新規 `scripts/estimate_draft_acceptance.py`．責務: target(31B) の greedy 参照生成 → draft(E2B) 提案 → exact-match 採択判定 →
-  α・a_K 算出 → SL1 ratio_K との合成で B3 実効利得レンジを出力．
-- 新規 `tests/test_estimate_draft_acceptance.py`（純関数の単体テスト）．
-- （`pipeline_inference.py`・`tools/*.py` は非改変．結果は `results/draft_acceptance.jsonl` へ追記＝SL1 と同形式．）
-
-**スクリプト設計**:
-- **(a) プロンプト集合（層別）**: 4 カテゴリ × 4 件 = **計 16 プロンプト**をスクリプト内に定数定義する．カテゴリは
-  `open_chat`（開放チャット・入力非接地，既存デモ `"Hello!"` を含む）／`summarization`（短文書＋要約指示）／`doc_qa`（提示文脈への
-  QA）／`code`（短いコード補完・編集）．入力接地型 3 種を含めることで prompt-lookup を過小評価しない公平な設計にする（A-2）．
-- **(b) トークナイズ**: `pipeline_inference.py:_tokenize()`（:110-129, Gemma-4 chat template・`add_generation_prompt=True`）を
-  複製し，target・draft とも同一経路でトークナイズする（生 encode は IT モデルで挙動が変わるため不可，B-2）．
-- **(c) target 参照生成**: `AutoModelForCausalLM.from_pretrained("google/gemma-4-31B-it", torch_dtype=bfloat16,
-  device_map="cpu", local_files_only=True)` を単一プロセスにロードし，各プロンプトで **greedy に最大 `N_MAX_NEW_TOKENS` 個**
-  生成して参照 argmax token 列を得る（`torch.set_num_threads` は SL1 と同条件・EOS で打ち切り）．判定則は `:1600-1618` の
-  greedy を踏襲するが，softcapping は argmax 不変（B-1）のため **model logits の argmax を参照に採る**（softcap 適用は任意，
-  適用しても結果同一）．参照系列はカテゴリ別に `results/draft_acceptance.jsonl` へ保存し，再現・再解析可能にする．
-- **(d) draft 提案と採択判定（純関数化）**: 参照系列上を **検証ステップのブロック単位**で歩く．各ブロック開始プレフィックス
-  （chat template + 既確定 token）を draft(E2B) に食わせ **greedy に K トークン自己回帰提案**，参照 argmax と逐位置 exact-match
-  照合して**最初の不一致まで**を採択（最大 K）＋bonus 1 個で前進（accepted+1）．これを K∈{2,4,8} それぞれで実施し，
-  ブロック集計から **経験的 a_K（1 検証ステップで確定するトークン数）**を得る．
-- **(e) α と写像の相互検証**: K 非依存の**1 位置あたり採択率 α**（＝「真プレフィックス条件下で draft の greedy top-1 が target
-  argmax に一致する位置割合」）も別途集計する．A-1 の式 **E=(1-α^(K+1))/(1-α)** で α から予測した a_K と，(d) の経験 a_K を
-  併記し，iid 幾何近似の妥当性（実際は序盤位置ほど採択されやすく非 iid）を可視化する．
-- **(f) B3 実効利得レンジ（SL1×SL2 の合成・本イテレーションの成果物）**: 実機 SL1 の `ratio_K`（K=2/4/8=0.753/0.378/0.213）と
-  経験 a_K を組み，**1 検証サイクルで a_K トークンを K 位置 GEMM 1 回のコストで確定する**関係から，per-token compute の実効
-  利得レンジ（例 `a_K /(K·ratio_K)` 等の候補式）を数値出力する．**最終的な式選定と解釈は analyst に委ねる**が，スクリプトは
-  a_K・ratio_K・その積/比を素の数値として吐き，analyst が B9 go/no-go の材料にできる形にする．
-- **(g) prompt-lookup（補助）**: draft を使わず直近 n-gram（max=3）をプレフィックス内マッチ・continuation=10（K で切詰）で提案し，
-  同じ採択判定でカテゴリ別 α を出す．主指標に混ぜず，**A-2 検証用の層別テーブルとして併記**する．
-
-**定数化（マジックナンバー回避）**: `K_VALUES=(2,4,8)`（SL1 と一致）・`N_MAX_NEW_TOKENS=48`・`NUM_PROMPTS=16`（4 カテゴリ×4）・
-`NGRAM_MAX=3`・`NGRAM_CONT=10`・`TARGET_DTYPE=torch.bfloat16`・`DRAFT_DTYPE=torch.bfloat16`．
-
-#### 3. 実験規模（target 31B CPU 生成が律速．具体値）
-
-- **参照生成の総量上限**: 16 プロンプト × 最大 48 新規トークン = **target forward ≤ 768 ステップ**．SL1 実測（本 research-cycle
-  実行ホスト 64 コアで GEMV 1 層中央値 80.97ms）から 60 層＋lm_head で 1 トークン概ね数秒と見積もり，**総計 1〜2 時間程度**を想定
-  （EOS 早期打ち切りで実際は下振れ）．超過・OOM 時のフォールバック: (i) `N_MAX_NEW_TOKENS` を 48→32 に，(ii) 31B 単機ロードが
-  RAM 逼迫（bf16 59GB / available 89GB）で不安定なら `models/splits` の layer ストリーム（load→compute→free）に切替．いずれも
-  クラスタ非接触で可逆．
-- **draft(E2B) の生成コストは無視できる**（35 層・hidden 1536・9.6GB）．採択判定はブロック当たり最大 K 回の draft forward のみ．
-- **統計的安定性**: greedy ゆえ α・a_K は**決定的（run 間分散ゼロ）**．推定誤差は位置数に支配される．各カテゴリ 4 プロンプト×
-  最大 48 位置 ≈ **150 位置/カテゴリ**を確保し，カテゴリ別 α を安定推定する（全体 α は ≈600 位置）．
-
-#### 4. 成功条件（measurable．「SL2 が完了」と言える基準）
-
-実装・実行の完了条件（決定的）:
-1. `scripts/estimate_draft_acceptance.py` が単一プロセス（クラスタ・relay 非接触）で完走し，**E2B draft** について
-   (a) 全体 α，(b) カテゴリ別 α（`open_chat`/`summarization`/`doc_qa`/`code`），(c) K∈{2,4,8} ごとの**経験 a_K** を出力する．
-2. α→a_K の写像式 `E=(1-α^(K+1))/(1-α)` で予測した a_K と経験 a_K を**併記**し，乖離を数値で示す．
-3. prompt-lookup（補助）のカテゴリ別 α を併記し，**入力接地型>開放チャット**の傾向（A-2）を層別テーブルで可視化する
-   （傾向の向きが出れば可．prompt-lookup では go/no-go を判定しない）．
-4. **SL1×SL2 合成**: 実機 ratio_K（0.753/0.378/0.213）と経験 a_K を組んだ B3 実効利得レンジの素数値（a_K・ratio_K・積/比）を
-   出力する＝本イテレーションの成果物（analyst が B9 go/no-go の材料に使える形）．
-5. 純関数（exact-match 採択判定＝最初の不一致で打切り＋bonus，ブロック前進 accepted+1，α↔a_K 写像，n-gram lookup 提案）の
-   単体テストが **green（最低 4 件）**，`uv run python -m py_compile scripts/estimate_draft_acceptance.py
-   tests/test_estimate_draft_acceptance.py` がエラー無し．
-6. 変更は `scripts/estimate_draft_acceptance.py`／`tests/test_estimate_draft_acceptance.py` の**新規 2 ファイルのみ**
-   （`pipeline_inference.py` 他既存本体は非改変），結果は `results/draft_acceptance.jsonl` へ追記．
-
-判定の解釈指針（判定は analyst．ノイズは決定的量ゆえ位置数依存）:
-- α は greedy で決定的（run 分散ゼロ）．**カテゴリ別 α は位置数 ≥50 を満たすものだけを有意な層別値**として扱う．
-- 解釈ガイド（analyst 向け・拘束はしない）: **E2B の全体 a_2≳1.5（α≳0.5）**なら SL1 の compute 天井が実効利得として現実化する
-  下限条件クリア＝B3 go 方向を強める．**a_K≈1（α≲0.1）**なら draft 無力で B3 実効利得は崩れ no-go 方向．中間は SL1 ratio_K との
-  積で期待値レンジを提示し B9 で人間に諮る．
-
-#### 5. 実装フェーズ（rc-implementer）への申し送り
-
-- **対象ファイル・キー**: 新規 `scripts/estimate_draft_acceptance.py`（定数 `K_VALUES`／`N_MAX_NEW_TOKENS`／`NUM_PROMPTS`／
-  `NGRAM_MAX`／`NGRAM_CONT`／`TARGET_DTYPE`／`DRAFT_DTYPE`，純関数 `accepted_length()`（exact-match 打切り）／
-  `simulate_block_walk()`（ブロック前進で a_K 集計）／`alpha_to_expected_len()`（A-1 写像）／`ngram_lookup_propose()`，
-  参照生成 `generate_target_reference()`／draft 提案 `draft_propose()`），新規 `tests/test_estimate_draft_acceptance.py`．
-  トークナイズは `pipeline_inference.py:_tokenize()`（:110-129）を複製，判定則は `:1600-1618` の greedy を踏襲（softcap は
-  argmax 不変ゆえ任意）．実行は `unset VIRTUAL_ENV && uv run python scripts/estimate_draft_acceptance.py`（SL1 と同様の
-  `VIRTUAL_ENV` 汚染回避）．
-- **ローカル資産パス**: HF キャッシュに `google/gemma-4-31B-it`・`google/gemma-4-E2B` 在（`local_files_only=True` で単機ロード）．
-  E2B は `AutoModelForCausalLM`／`Gemma4ForConditionalGeneration` の text バックボーンとして読み込む（vocab 262144 一致）．
-- **やらないこと**: 実機 relay・deploy・`pipeline_inference.py` 改変・分散推論は本イテレーションでは一切行わない（**ローカル
-  単一プロセス完結・クラスタ本体への大改変を要さないため needs-human 事項なし**＝B10 の申し送りに非抵触）．B3 本体（SL3:
-  relay プロトコル改修）は B9 として温存し，本 SL2 の α・a_K・実効利得レンジを SL1 と合わせて別途人間に go/no-go を諮る．
-
-### 実装（HF キャッシュ revision 修正）(Iter6)
-
-**担当**: 実装フェーズ subagent（2026-07-19）．`### 実験 (Iter6)` が報告した `AutoTokenizer.from_pretrained` 失敗
-（HF キャッシュ `refs/main` の不完全スナップショット参照）の対処として，backlog B11 で自動選定された対処案 (A) を
-実施した．実機クラスタへの接続・deploy・SSH・HF キャッシュの書き換えは一切行っていない（`~/.cache/huggingface` は
-読み取り確認のみ）．
-
-- **裏取り**: `~/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/` を確認し，完全なスナップショット
-  （`config.json`・`tokenizer.json`・`model-0000{1,2}-of-00002.safetensors` を含む）が `fb9ae262347c3945692f09a612f8bb189def854f`
-  （および内容同一の `3548789868c5356dbf307c98e6f609007b82b3eb`）であることを確認した．journal 記載のハッシュと一致．
-  **draft(`google/gemma-4-E2B`) 側も同様の不整合を発見**: `refs/main` は `d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f` を
-  指すが，このハッシュに対応する snapshot ディレクトリ自体が存在しない（target よりさらに壊れた状態）．実在する
-  スナップショットは `19f17d3255f458aa49ebe8843d65ec7b7386db1f`（Jul 10）と `63db66a33dc06d58c02b1e887446e103c202602c`
-  （Jul 8）の 2 つで，両者は全ファイル（`config.json`/`tokenizer.json`/`model.safetensors`/`generation_config.json`/
-  `tokenizer_config.json`）の blob ハッシュが完全一致（内容同一の重複スナップショット）．より新しい
-  `19f17d3255f458aa49ebe8843d65ec7b7386db1f` を採用した．
-- **変更ファイル**: `scripts/estimate_draft_acceptance.py` のみ．
-  - 定数追加（`TARGET_MODEL_NAME`/`DRAFT_MODEL_NAME` 直後，:52-60）: `TARGET_MODEL_REVISION =
-    "fb9ae262347c3945692f09a612f8bb189def854f"`，`DRAFT_MODEL_REVISION = "19f17d3255f458aa49ebe8843d65ec7b7386db1f"`．
-    直前にコメントで固定理由（`refs/main` 不整合の暫定回避，キャッシュ自体は非改変）を明記．
-  - `main()` 内の 3 箇所の `from_pretrained` 呼び出し（旧 :542-549 相当）に `revision=TARGET_MODEL_REVISION` /
-    `revision=DRAFT_MODEL_REVISION` を追加（`AutoTokenizer.from_pretrained`／target `AutoModelForCausalLM.from_pretrained`／
-    draft `AutoModelForCausalLM.from_pretrained` の全て）．他のロジック・定数・プロンプト集合・純関数は無改変．
-- **検証**: `unset VIRTUAL_ENV && uv run python -m py_compile scripts/estimate_draft_acceptance.py
-  tests/test_estimate_draft_acceptance.py` → エラー無し．`uv run pytest tests/test_estimate_draft_acceptance.py -v`
-  → **30 passed**（回帰無し，モデルロードを伴わない純関数テストのみで revision 追加の影響を受けない範囲）．
-  `uv run pytest`（全体）→ **83 passed**．実際のモデルロード・生成の実行（revision 固定が実機で解決するかの確認）は
-  本フェーズでは行っていない（次の実験フェーズへ委譲）．
-- **申し送り**: `AutoModelForCausalLM.from_pretrained(...)` が `Gemma4ForConditionalGeneration` アーキテクチャを
-  直接ロードできるかは，実験フェーズの診断（`AutoConfig`/`AutoTokenizer` は revision 指定で成功済み）で有望だが
-  実際の重みロードは未確認．revision 修正後も同様のロード時エラーが出た場合は，前回申し送りどおり
-  `AutoModelForImageTextToText` 等への切替を検討すること．draft 側 revision の選定は「2 スナップショットが内容同一」
-  という確認に基づく（内容が違えば選定基準を人間に諮る必要があったが，今回は不要だった）．
-
-### 実験 (Iter6)
-
-**担当**: 実験フェーズ subagent（2026-07-19T15:26 JST）．`unset VIRTUAL_ENV && uv run python
-scripts/estimate_draft_acceptance.py` をバックグラウンド起動（nohup）．**結果: 失敗（tokenizer ロード段階，即時終了・
-数十分待たず数秒で `ValueError`）**．`results/draft_acceptance.jsonl` は未生成（既存 `results/*.jsonl` は無変更）．
-
-#### エラー内容
-
-`AutoTokenizer.from_pretrained(TARGET_MODEL_NAME, ...)` にて:
-
-```
-ValueError: Couldn't instantiate the backend tokenizer from one of:
-(1) a `tokenizers` library serialization file,
-(2) a slow tokenizer instance to convert or
-(3) an equivalent slow tokenizer class to instantiate and convert.
-You need to have sentencepiece or tiktoken installed to convert a slow tokenizer to a fast one.
-```
-
-#### 原因調査（実装フェーズが懸念していた `Gemma4ForConditionalGeneration` 非対応ではない）
-
-- `~/.cache/huggingface/hub/models--google--gemma-4-31B-it/refs/main` が指すスナップショット
-  `b9ea41a2887d8607f594846523f94c6cc75ac8a4`（更新日時 2026-07-19T10:41，本日の SL1/Iter4 系実行と時刻が近接）は
-  `config.json` **のみ**を含む不完全なスナップショットであり，`tokenizer.json`・weights を含まない．
-- 一方，同リポジトリ配下には完全なスナップショット（`3548789868c5356dbf307c98e6f609007b82b3eb` と
-  `fb9ae262347c3945692f09a612f8bb189def854f`）が存在し，`tokenizer.json`・`model-0000{1,2}-of-00002.safetensors`
-  （計 59GB）・`config.json`（`main` と同一内容）を保持している．`local_files_only=True` かつ revision 未指定のため
-  `AutoTokenizer`/`AutoModelForCausalLM` は `refs/main` の不完全なスナップショットを解決してしまい失敗した．
-- **診断（読み取りのみ・キャッシュ改変なし）**: 完全なスナップショット `fb9ae262...` を revision 指定で明示的に読み込むと，
-  `AutoConfig.from_pretrained(...)` は `architectures=['Gemma4ForConditionalGeneration']`／
-  `type(cfg) in MODEL_FOR_CAUSAL_LM_MAPPING == True`（transformers 5.9.0 で登録済み）となり，`AutoTokenizer` も
-  `GemmaTokenizer` として正常ロードできた．すなわち実装フェーズが未検証としていたリスク（`Gemma4ForConditionalGeneration`
-  を `AutoModelForCausalLM` が扱えるか）は，**この診断範囲では解消**（`refs/main` を経由しなければロード可能）．
-  ただし重み込みの実フォワードまでは実行していないため，モデル本体の完全な動作確認はまだ済んでいない．
-- `refs/main` の不整合発生原因は未特定（本日 10:41 前後に別プロセスが `local_files_only=False` でオンライン解決した際，
-  config.json のみ取得できて weights/tokenizer の再取得が走らなかった可能性がある，推測の域を出ない）．
-
-#### 実施した操作・変更していないもの
-
-- 診断のための `AutoConfig`/`AutoTokenizer.from_pretrained(..., revision="fb9ae262...")` 読み取りのみ実行．
-  `refs/main` ファイルは読み取り前後で内容不変（`b9ea41a2887d8607f594846523f94c6cc75ac8a4` のまま）を確認済み．
-- `scripts/estimate_draft_acceptance.py`・HF キャッシュとも一切変更していない（禁止事項の破壊的操作も未実施）．
-- `python -c "import sentencepiece"` / `import tiktoken"` は共に `ModuleNotFoundError`（`pyproject.toml` の
-  dependencies に含まれていない）．ただし `tokenizer.json`（fast tokenizer serialization）が完全スナップショットに
-  存在するため，正しい revision が解決されれば sentencepiece/tiktoken は不要（`GemmaTokenizer` は `tokenizers` backend
-  で動作，診断ログで確認済み）．
-
-#### 申し送り（analyst/planner 判断事項）
-
-- 対処案の候補（判断は analyst/planner に委ねる）:
-  (A) `scripts/estimate_draft_acceptance.py` の `AutoTokenizer`/`AutoModelForCausalLM.from_pretrained` 呼び出しに
-      `revision="fb9ae262347c3945692f09a612f8bb189def854f"`（または `3548789868c5356dbf307c98e6f609007b82b3eb`）を
-      明示指定する．
-  (B) ローカル HF キャッシュ側で `refs/main` を完全スナップショットのハッシュに修復する（キャッシュ操作，人間確認が
-      望ましい可能性あり）．
-- 環境未検証事項（次回実験時に確認要）: 上記いずれかの対処後，実際に target 31B の重みロード＋ greedy 生成が完走するか
-  （メモリ 125GB 中空き 87GB，bfloat16 で target 62GB 程度＋draft 19GB 程度と見積もられ理論上は収まる想定だが未実測）．
-
----
-
-### 実装 (Iter6)
-
-**担当**: 実装フェーズ subagent（2026-07-19）．`### 検討・計画 (Iter6)` §2〜§5 の設計どおり，新規 2 ファイルのみを追加した
-（`pipeline_inference.py` を含む既存ファイルは一切改変していない）．実機クラスタへの接続・deploy・SSH は行っていない．
-モデルの実ロード・実推論（target 31B・draft E2B）はこのフェーズでは実行していない（次の実験フェーズへ委譲）．
-
-#### 変更ファイル
-
-- 新規 `scripts/estimate_draft_acceptance.py`（624 行）: 計画 (a)〜(g) を実装．
-  - 定数: `K_VALUES=(2,4,8)`／`N_MAX_NEW_TOKENS=48`／`NUM_PROMPTS=16`／`NGRAM_MAX=3`／`NGRAM_CONT=10`／
-    `TARGET_DTYPE=DRAFT_DTYPE=torch.bfloat16`／`NUM_THREADS=4`／`NUM_INTEROP_THREADS=1`（SL1 と同条件，計画 (c)）／
-    `SL1_RATIO_BY_K={2:0.753,4:0.378,8:0.213}`（Iteration 5 実測値）．
-  - `build_prompt_set()`: 4 カテゴリ（`open_chat`/`summarization`/`doc_qa`/`code`）×4 件＝16 プロンプト．`open_chat` に
-    既存デモの `"Hello!"` を含む．`summarization`/`doc_qa`/`code` は入力接地型（prompt-lookup を過小評価しない設計，A-2）．
-  - `tokenize_prompt()`: `pipeline_inference.py:_tokenize()`（:110-129）を複製（chat template + `add_generation_prompt=True`）．
-  - `generate_target_reference()` / `draft_teacher_forced_predictions()`: モデル呼び出しを伴う関数として分離（単体テスト対象外）．
-    **設計判断（計画からの効率化）**: draft の block 提案は，計画で想定された「各ブロックで K トークンずつ自己回帰生成」の
-    代わりに，**参照系列全体に対する draft の 1 回の teacher-forced forward**から全位置の greedy top-1 予測を事前計算し，
-    `make_block_propose_fn()` で `simulate_block_walk()` の `propose_fn` に変換する方式にした．根拠:
-    一致が続く区間では「draft の自己回帰提案」と「真の参照プレフィックスを条件とした teacher-forced 予測」は同一コンテキスト
-    から計算されるため常に一致し，判定に使うのは最初の不一致位置までなので，不一致後の自己回帰予測との差は判定へ影響しない
-    （`draft_teacher_forced_predictions()` の docstring に理由を明記）．これにより 1 プロンプトあたり draft forward が
-    K×プロンプト数回ではなく 1 回で済み，実験フェーズの実行時間を大幅に削減できる見込み．計画の意図（exact-match 採択判定・
-    K∈{2,4,8}集計・α算出）は変えていない．
-  - 純関数（単体テスト対象）: `accepted_length()`（exact-match 打切り＋bonus+1）／`simulate_block_walk()`（ブロック前進で
-    a_K 集計，終端クリップ処理を追加）／`alpha_to_expected_len()`（A-1 写像，α=1.0 の特異点を極限値 K+1 で処理）／
-    `compute_alpha()`（teacher-forced 一致率）／`ngram_lookup_propose()`（prompt-lookup, 直近一致優先）／
-    `compute_ngram_alpha()`／`aggregate_alpha_by_category()`（位置数重み付き）／`compute_effective_gain_candidates()`
-    （SL1×SL2 合成，`product_a_k_ratio_k`・`gain_over_baseline` を算出）．
-  - `main()`: target/draft モデルをロードし，全プロンプトを処理して `results/draft_acceptance.jsonl` へ 1 レコード追記．
-- 新規 `tests/test_estimate_draft_acceptance.py`（30 件）: `accepted_length`（全一致／即不一致／部分一致／K=1相当／
-  提案空）5 件，`simulate_block_walk`（常時一致／常時不一致／終端クリップ／K≤0拒否）4 件，`alpha_to_expected_len`
-  （具体値検証／α=0／α=1極限／範囲外拒否／K≤0拒否）5 件，`compute_alpha` 3 件，`ngram_lookup_propose`（直近一致／
-  不一致／continuation打切り）3 件，`compute_ngram_alpha`（入力接地型で正／開放チャットでゼロ）2 件，
-  `aggregate_alpha_by_category` 2 件，`compute_effective_gain_candidates` 2 件，`build_prompt_set` 2 件，
-  `BlockWalkResult` frozen 検証 1 件．計画の最低 4 件要件を超える網羅度で実装した．
-
-#### 検証結果
-
-- `unset VIRTUAL_ENV && uv run python -m py_compile scripts/estimate_draft_acceptance.py
-  tests/test_estimate_draft_acceptance.py` → エラー無し．
-- `unset VIRTUAL_ENV && uv run pytest tests/test_estimate_draft_acceptance.py -v` → **30 passed**（モデルロードなしの
-  純粋関数テストのみ．target/draft の実ロード・実推論は含まない）．
-- `unset VIRTUAL_ENV && uv run pytest`（既存スイート全体）→ **83 passed**（Iter5 時点の 53 passed + 新規 30 件，回帰無し）．
-
-#### 計画との差異・申し送り
-
-- **計画からの唯一の設計逸脱**: draft 提案を「ブロックごとの自己回帰生成」から「1 回の teacher-forced forward」に効率化
-  （上記「設計判断」参照）．exact-match 判定・K∈{2,4,8}集計という計画の意図・出力形式は変えていない．次の実験フェーズで
-  実行した際，何らかの理由でこの前提（一致区間での自己回帰予測とteacher-forced予測の同値性）が成立しないと判明した場合は
-  （通常は成立するはずだが），`draft_propose()` 相当の素朴な自己回帰実装への切り替えを検討すること．
-- **`AutoModelForCausalLM.from_pretrained` の適用可否は未検証**: 両モデルの `config.json` の `architectures` は
-  `Gemma4ForConditionalGeneration`（マルチモーダルラッパークラス）であり，`AutoModelForCausalLM` が this checkpoint を
-  直接ロードできるかは実機で未確認．計画 §5 の指示どおり `AutoModelForCausalLM.from_pretrained(...)` を実装したが，
-  実験フェーズで `ValueError` 等が出た場合は `AutoModelForImageTextToText` または `Gemma4ForConditionalGeneration` への
-  切り替えを検討すること（本実装フェーズではモデル実ロードを行っていないため未検証，計画・制約どおり）．
-- 実験を開始してよい状態: **可**（新規ファイル 2 点のみ，構文健全性・純関数テスト・既存スイート回帰確認済み．
-  `pipeline_inference.py` 他既存ファイルは非改変）．
 
 ---
 
