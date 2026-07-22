@@ -97,12 +97,19 @@ class LinearMeasurement:
 # ====================================================================
 
 
-def build_linear_shapes(config_path: Path | None = None) -> LinearShapeResult:
+def build_linear_shapes(
+    config_path: Path | None = None,
+    layer_idx: int = 0,
+) -> LinearShapeResult:
     """実 `Gemma4TextDecoderLayer` を random-init で構築し，`nn.Linear` の形状一覧を取得する．
 
     重みファイルはロードしない（形状のみが必要なため）．transformers の Gemma4 実装や
     HuggingFace Hub への config 取得に失敗した場合は，`config.json` とフォールバック定数から
     形状を導出する（`_build_linear_shapes_from_config_fallback` を参照，仮定値は warnings に明記する）．
+
+    Args:
+        config_path: config.json のパス．None の場合はデフォルトパスを使用．
+        layer_idx: 構築する decoder 層のインデックス．既定値 0 で後方互換を保つ．
     """
 
     try:
@@ -112,7 +119,7 @@ def build_linear_shapes(config_path: Path | None = None) -> LinearShapeResult:
         config = AutoConfig.from_pretrained(GEMMA4_MODEL_NAME, trust_remote_code=True)
         text_config = config.text_config if hasattr(config, "text_config") else config
 
-        layer = Gemma4TextDecoderLayer(text_config, layer_idx=0)
+        layer = Gemma4TextDecoderLayer(text_config, layer_idx=layer_idx)
         layer.eval()
 
         shapes = [
