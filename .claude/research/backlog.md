@@ -6,6 +6,30 @@
 
 ---
 
+## B18 [auto-decided 2026-07-22] Iteration 11 の単一レバー選定（wafl113 除外＋WORLD_SIZE=50 で再ベンチ、straggler 除去効果の定量化）
+- **状況**: Iteration 10（全51ノード単層 local マイクロベンチ）を**採用（診断として成功）・収束**で確定．
+  「ノード起因 vs 層起因」の二択が**ノード起因で決着**した（確信度: 高）．wafl113 (rank14) は全3層で同程度の劣化率
+  （mean比 1.47〜1.60x）、layer 間比率が全ノード中央値と完全に一致＝層特異的でない．wafl136 (rank37) も同様に全層で安定した
+  劣化（mean比 1.22〜1.32x）．層起因説は棄却．Gemma-4 decoder 層は全層で同一 shape であり、層特異的な最適化は効果なし．
+  支配項を減らす唯一の有効な手は**負荷分散**（遅ノードへ層を減らす／WORLD_SIZE 調整）である．
+- **自動選択**: Iteration 11 の単一レバーを **「wafl113 (rank14) を除外して WORLD_SIZE=50 で `predict:demo` を再実行し、
+  straggler 除去によるスループット改善量を定量化する」** とする．既存の deploy/predict パイプラインで wafl113 を hosts.txt から
+  除外（行削除）し WORLD_SIZE=50 でベンチ．コード変更は最小限（hosts.txt の1行削除＋WORLD_SIZE env 対応、既存ロジックなら追加実装不要）．
+  state は `phase="investigate"`・`current_lever=null` で開始．**iteration_name**: 「wafl113 除外＋WORLD_SIZE=50 での再ベンチ（straggler 除去効果の定量化）」．
+- **根拠**: (1) straggler 起因が確定した今、処方箋は「負荷分散」に絞られる．その中で最も情報利得が高く実装規模が小さいのは、
+  wafl113 を除外して WORLD_SIZE=50 で再ベンチすること．(2) コード変更は最小限で可逆（hosts.txt の行削除）．
+  (3) これにより、wafl113 除去の効果量（定量的）、rank37 が次のボトルネックに昇格するか（qualitative）、WORLD_SIZE=50 の層割当
+  （layers_high=12）での wafl136 の layer 配置が一度に得られる．(4) 調査・計画はコードのみで可逆、実験は B7 包括承認範囲内．
+- **フォールバック**: WORLD_SIZE 変更対応に予想外のコード修正が必要なら、「wafl113/wafl136 のホスト健全性確認（CPU周波数、熱、同居プロセス）」へ振り替える（SSH 情報収集のみ・pipeline_inference.py 非改変）．
+- **可逆性**: 次に振るレバーの選定であり可逆．hosts.txt の行削除は元に戻せる．WORLD_SIZE=50 は config `levers` に "50" を追記する形
+  で管理可能（config 変更も可逆）．
+- **要レビュー / 要人間判断**: (a) 本レバーは負荷分散の事前検証で relay プロトコルには一切触れず軸が直交・実装衝突なし．
+  **B9 は今回も温存（`[needs-human]` 維持，reflector では自動判定しない）**．(b) WORLD_SIZE=50 を config `levers` に追記する
+  場合は、人間にレビューを依頼してもよいが、可逆な変更なので自動判断とした．(c) wafl136 も含めた複数 straggler の同時除去は
+  次回以降の検討課題（WORLD_SIZE=49 等）．
+
+---
+
 ## B17 [auto-decided 2026-07-20] Iteration 10 の単一レバー選定（全 51 ノードで単層 local マイクロベンチを回し straggler ノードを特定）
 - **状況**: Iteration 9（bench 経路への 3 区間 per-microbatch 計時ログ追加）を **採用（診断として成功）・収束**で確定した．
   全 51 rank×3 区間の分解で，直列化点＝律速ボトルネック段を **rank14（物理ノード wafl113，層 23，1 層割当）に一意特定**

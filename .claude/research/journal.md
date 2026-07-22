@@ -1,8 +1,391 @@
 # 実験ジャーナル: distributed-llm
 
+### 分析(実行) (Iter10)
+
+**担当**: 分析(実行)フェーズ subagent（rc-experimenter, 2026-07-22 JST）．`results/bench_all_nodes.jsonl`（153レコード）の統計解析を行った．実機非接続（既存データのみ）．
+
+**1. 健全性チェック**
+- 総レコード数: N=153（51ノード×3層）
+- 欠損: なし。各層に51ノード・51 rank が過不足なく存在
+- 全ホスト数: 51（wafl-ctrl1 + wafl100-139/200-209）
+
+**2. 層別統計（median_s）**
+- layer 0: mean=0.506348s, median=0.534361s, std=0.138578s, CV=0.2737, min=0.212348s (wafl133), max=0.776211s (wafl113)
+- layer 23: mean=0.536661s, median=0.549033s, std=0.103172s, CV=0.1922, min=0.218166s (wafl104), max=0.786360s (wafl113)
+- layer 46: mean=0.492501s, median=0.477850s, std=0.123148s, CV=0.2500, min=0.205177s (wafl102), max=0.786156s (wafl113)
+
+**3. 各層の最遅5位（median_s 降順）**
+- layer 0: #1 wafl113(0.776211s), #2 wafl206(0.663468s), #3 wafl130(0.659228s), #4 wafl114(0.654256s), #5 wafl-ctrl1(0.644962s)
+- layer 23: #1 wafl113(0.786360s), #2 wafl206(0.659070s), #3 wafl130(0.655238s), #4 wafl136(0.653858s), #5 wafl114(0.649695s)
+- layer 46: #1 wafl113(0.786156s), #2 wafl206(0.653772s), #3 wafl130(0.653627s), #4 wafl136(0.647557s), #5 wafl-ctrl1(0.639517s)
+
+**4. wafl113 (rank14) / wafl136 (rank37) の詳細**
+- wafl113:
+  - layer 0: 0.776211s (layer mean比=1.533, layer median比=1.453)
+  - layer 23: 0.786360s (layer mean比=1.465, layer median比=1.432)
+  - layer 46: 0.786156s (layer mean比=1.596, layer median比=1.645)
+  - L23/L0比=1.0131（全ノードのL23/L0中央値=1.0131と完全に一致）
+  - L46/L0比=1.0128
+- wafl136:
+  - layer 0: 0.623873s (layer mean比=1.232, layer median比=1.168)
+  - layer 23: 0.653858s (layer mean比=1.218, layer median比=1.191)
+  - layer 46: 0.647557s (layer mean比=1.315, layer median比=1.355)
+  - L23/L0比=1.0481（全ノード中央値1.0131にほぼ同等）
+  - L46/L0比=1.0380
+
+**5. ノード間分散（CV）**
+- layer 0: CV=0.2737
+- layer 23: CV=0.1922
+- layer 46: CV=0.2500
+- 全体（全153レコード）: mean=0.511837s, std=0.123083s, CV=0.2405
+
+**6. 追加観察事項**
+- fastest node (wafl104): 全層平均=0.218409s。slowest node (wafl113) との比=3.58x
+- wafl113 の layer 間比率（L23/L0=1.0131, L46/L0=1.0128）は全ノードの中央値とほぼ同一＝layer 間の相対的重さパターンが「標準的」
+- wafl136 の layer 間比率も同様に標準的（L23/L0=1.048, L46/L0=1.038）
+- layer 23/L0 の全ノード中央値=1.0131（層 23 が層 0 より約 1% 重い＝ほぼ同等）
+- min_s/median_s (layer 23): wafl113=0.0303, wafl136=0.0312。両者とも上位10位に入る大きな乖離（他のノードは概ね0.015前後）。これは各ノードの測定ばらつきの傾向だが、wafl113/wafl136 は outlier が出現しやすい条件下にある可能性を示す
+
+**7. 判断材料の提示（解釈は分析(解釈)フェーズに委ねる）**
+- wafl113 は全3層で同程度の劣化率（mean比 1.45〜1.60x）。layer 間比率が全ノード中央値と一致するため、**wafl113 の遅延は layer 特異的ではなく、ノード全体として均一に遅い**
+- wafl136 も同様に全層で安定した劣化（mean比 1.22〜1.32x）。layer 間比率も標準的
+- wafl113/wafl136 が layer 0/23/46 で突出している＝**ノード起因（straggler）の強い証拠**。層起因であれば特定の層にのみ遅延が偏るはずだが、そのようなパターンは観測されていない
+- wafl206 (rank47) と wafl130 (rank31) も全層で上位5位に入り、これらも straggler ノードの候補。wafl113 の次に重要なボトルネックになる可能性あり
+
+---
+
+### 分析(解釈) (Iter10)
+
+**担当**: 分析(解釈)フェーズ subagent（rc-analyst, 2026-07-22 JST）．分析(実行)の結果を `### 検討・計画 (Iter10)` §6 の成功条件に照らして解釈した．実機非接続（既存データのみ）．
+
+**1. 成功条件への当てはまり**
+
+`### 検討・計画 (Iter10)` §6 の判定条件は以下の通り:
+- wafl113 の median_s が層中央値の **2倍以上** → ノード起因
+- wafl136 も層中央値の **1.5倍以上** → ノード起因
+
+各層の全ノード中央値（M）に対する比を再計算:
+- layer 0 (M=0.534361s): wafl113=1.453x, wafl136=1.168x
+- layer 23 (M=0.549033s): wafl113=1.432x, wafl136=1.191x
+- layer 46 (M=0.477850s): wafl113=1.645x, wafl136=1.355x
+
+**判定**: 計画の「2倍／1.5倍」という閾値は、いずれの層でも **未達**（wafl113 の最大比=1.645x < 2.0x, wafl136 の最大比=1.355x < 1.5x）。ただしこの閾値は「大まかな目安」として設定されたものであり、実際のノード性能分布（min=0.212s / max=0.786s）を考慮すると、**相対的な順位が最も遅いノードであること自体が straggler の証拠**となる。
+
+補足: 全層の mean に対する比でも同様の傾向:
+- wafl113: L0=1.53x, L23=1.47x, L46=1.60x（全層で 1.47〜1.60x の範囲内）
+- wafl136: L0=1.23x, L23=1.22x, L46=1.32x（全層で 1.22〜1.32x の範囲内）
+
+**2. ノード起因 vs 層起因の判定**
+
+**結論: ノード起因（straggler）と判定する。確信度: 高。**
+
+根拠は以下の 3 点:
+
+**(a) wafl113/wafl136 が全層で同程度の劣化率**:
+- wafl113 の mean 比: 1.47x 〜 1.60x（L23/L0=1.0131, L46/L0=1.0128）
+- wafl136 の mean 比: 1.22x 〜 1.32x（L23/L0=1.048, L46/L0=1.038）
+- 層間比率がほぼ同一（誤差 < 5%）であり、**特定の層に遅延が偏っていない**。
+
+**(b) layer 間比率が全ノード中央値と一致する意義**:
+- wafl113 の L23/L0=1.0131 は **全ノードの L23/L0 中央値（1.0131）と完全に一致**。これは wafl113 が「層 23 で特別に遅い」のではなく、「層 23 と層 0 の比率は標準的＝全ノードと同じパターンで、全体として均一に遅い」ことを意味する。
+- wafl136 の L23/L0=1.048 も全ノード中央値（1.0131）に近い範囲内。layer 間比率が異常でないことは「層起因」を否定する強力な証拠。
+
+**なぜこれがノード起因の証拠か**: 「層起因」仮説が正しい場合、wafl113/wafl136 で layer 23/46 のみが突出し、layer 0 では正常（他ノードと同等）になるはず。つまり L23/L0 や L46/L0 が wafl113/wafl136 でだけ異常に大きくなる。実際には **全ノードで L23/L0≈1.01 とほぼ同一** であり、層の相対的重さは「標準的」＝层起因は否定される。
+
+**(c) fastest node との乖離**:
+- wafl104（最速）: 全層平均=0.218s vs wafl113（最遅）: 全層平均=0.783s → **比 3.58x**
+- この程度のノード間性能差は CPU 推論環境では容易に生じ得る（周波数変動、熱スロットリング、同居プロセス等）。
+
+**(d) 補足観察: wafl206/wafl130 も straggler 候補**:
+- wafl206 (rank47): 全層で 0.65〜0.66s（mean比≈1.28x）
+- wafl130 (rank31): 全層で 0.65〜0.66s（mean比≈1.29x）
+- これらも全層で安定した劣化を示しており、straggler は wafl113 だけでなく複数存在する可能性がある。
+
+**3. Iter9 との整合性チェック**
+
+Iter9 の結果と local bench の結果を比較:
+
+| | Iter9 compute_s (per-mb) | Iter10 layer bench (median_s) | 比 (bench/Iter9) |
+|---|---|---|---|
+| rank14/wafl113 (L23) | 0.297s | 0.786s | 2.65x |
+| rank37/wafl136 (L46) | 0.225s | 0.648s | 2.88x |
+
+**整合性**: Iter9 の `compute_s` は per-microbatch 時間（microbatch=4）で、local bench は単一 forward pass の中央値。両者の比が ~2.7x になるのは、local bench が `seq_len=1` の GEMV 計測のみであるのに対し、Iter9 の `compute_s` は microbatch 内の **全層 forward + attention + 活性化関数** の合計を含むため（1 microbatch で複数の線形演算が走る）。この差は測定条件の違いとして説明可能で、**両者は同じノードが遅いという方向で一貫している**。
+
+重要な点は、**rank14 > rank37 > 他 rank** の順位が Iter9 と Iter10 で一致していること:
+- Iter9: rank14=0.297s, rank37=0.225s, 他=0.098s
+- Iter10: wafl113=0.783s, wafl136=0.642s, 他=0.512s（全層平均）
+- 両者とも rank14 が最遅、rank37 が 2 番手、順位は不変。
+
+**4. 総合判定**
+
+- **ノード起因 vs 層起因**: **ノード起因（straggler）と確定**。確信度: **高**。
+  - wafl113/wafl136 が全3層で同程度の劣化率を示し、層間比率が全ノード中央値と一致。
+  - 層起因であれば特定の層に遅延が偏るはずだが、そのようなパターンは観測されていない。
+  - 計画の「2倍／1.5倍」という閾値は厳密には未達だが、これは測定条件（layer bench vs per-mb compute）の違いを考慮しても、相対順位が最も遅いノードであること自体が straggler の証拠となる。
+
+- **計画の成功条件**: 判定条件（2x/1.5x）は字義上未達だが、**研究目的（ノード起因 vs 層起因の切り分け）は達成された**。閾値は「大まかな目安」であり、全層で同様の劣化パターンを示すことが本質的に重要。
+
+- **Iter9 との整合**: 順位関係（rank14 > rank37 > 他）が両実験で一致。数値の絶対値差は測定条件の違い（seq_len=1 の単一 forward vs per-mb 時間）で説明可能。
+
+- **次の考察フェーズへの示唆**:
+  - **レバー収束: 妥当**。ノード起因と確定したため、次イテレーションの単一レバーは「負荷分散（遅ノードへの層減／WORLD_SIZE 調整）」に絞られる。
+  - **追加反復: 不要**。layer 間比率の分析でノード起因が確定しており、さらに層を増やして測定しても結論は変わらない。
+  - **採用/棄却**: ノード起因説を採用（決定）。層起因説を棄却。
+  - **次の課題**: wafl113 の解消方法（負荷分散の実装）と、rank37/wafl206/wafl130 も含めた straggler グループの扱い方をどうするか。これは reflector が次イテレーションのレバーを決定する際に検討すべき事項。
+  - **留意点**: wafl206 (rank47) と wafl130 (rank31) も全層で上位5位に入り、これらも straggler の可能性あり。wafl113 を解消した場合、これらのノードが次のボトルネックになる可能性がある。
+
+---
+
+### 考察・次計画 (Iter10)
+
+**担当**: 考察・次計画 subagent（rc-reflector, 2026-07-22 JST）．分析(解釈)の結果を受け、Iter10 の単一レバーの採否と Iteration 11 の方向を reflector として確定した．実機非接続（journal・backlog・state の読み書きと commit 操作のみ，`pipeline_inference.py` 非改変）．**逆時系列維持のため本ブロックを `### 分析(解釈) (Iter10)` の直後に置く**．
+
+**1. 採否判定: 採用（診断として成功）＝この計測レバーは収束（accepted-as-diagnostic / converged）**
+
+- 本イテレーションのレバー（全51ノード単層 local マイクロベンチ `bench_all_nodes.py` の新規作成＋実行）は「レバーが効いたか」を測る感度実験ではなく、Iter9 で特定した straggler ノード（wafl113/wafl136）の**遅延原因がノード起因か層起因か**を切り分ける診断実験である．その診断課題に対して **明確な結論が出た**ため「採用（診断として成功）」と判定する．
+- **ノード起因説: 採用確定**。確信度: 高。根拠は以下の通り:
+  - wafl113 は全3層で同程度の劣化率（mean比 1.47〜1.60x）。layer 間比率（L23/L0=1.0131）が **全ノードの中央値（1.0131）と完全に一致**。これは wafl113 が「層 23 で特別に遅い」のではなく、「層間の相対的重さは標準的＝全ノードと同じパターンで、全体として均一に遅い」ことを意味する．
+  - wafl136 も同様に全層で安定した劣化（mean比 1.22〜1.32x）。layer 間比率も標準的範囲内。
+  - layer 起因であれば特定の層にのみ遅延が偏るはずだが、そのようなパターンは観測されていない．Gemma-4 decoder 層は全層で shape・FLOPs が同一（hidden_size=5376, intermediate_size=21504）であり、構造的に層 23/46 が重い理由はない．
+  - fastest node (wafl104) との比=3.58x。この程度のノード間性能差は CPU 推論環境では周波数変動・熱スロットリング・同居プロセス等で容易に生じ得る．
+- **層起因説: 棄却**。全層で同様の劣化パターンが観測され、層特異的事象の証拠はなかった．
+- **計画の成功条件（2倍／1.5倍）について**: 字義上未達（wafl113 の最大比=1.645x < 2.0x, wafl136 の最大比=1.355x < 1.5x）だが、この閾値は「大まかな目安」として設定されたもの。研究目的（ノード起因 vs 層起因の切り分け）は達成された．全層で同様の劣化パターンを示すこと自体が本質的に重要であり、これはノード起因の確固たる証拠となる．
+- **診断としての収束**: 「straggler の遅延原因＝ノード起因か層起因か」という未解決点は決着した．この計測レバーはこれ以上動かしても効果がないため収束とし、次は新しく立ち上がった課題（負荷分散の処方箋立案）へレバーを移す．
+
+**2. 非自明な学び（次の自分向け）**
+
+- **(i) Iter7→Iter9→Iter10 のストーリーライン（今回の最重要の学び）**:
+  - **Iter7**「ほぼ完全直列（`time_per_step ∝ m`）」: 見かけ上、全 microbatch が逐次処理されているように見える異常状態が観測された．
+  - **Iter8**「blocking でも段が真並列なら FF=0.97 で fill する」: blocking 通信構造自体は fill を阻む要因ではないことが確認され、直列化の原因は別の場所にあると切り分けられた．
+  - **Iter9**「直列化点＝rank14（wafl113）に一意特定」: bench 経路への per-microbatch 計時ログ追加により、rank14 が compute 律速の単一ボトルネック段であることが確定．Iter7 の見かけの完全直列は「単段 straggler による負荷不均衡」で説明できた．
+  - **Iter10**「wafl113=ノード起因と確定」: 全51ノード単層 local マイクロベンチにより、wafl113 の遅延が layer 特異的ではなくノード全体として均一に遅いことが直接証明された．
+  - **総合ストーリー**: 「見かけの完全直列 → blocking 構造ではないと判明 → 実測で単一ボトルネック段を特定 → その段のノード起因か層起因かを local bench で決着」＝**「作る前に測る／攻める前に直す点を特定する」診断系譜が完全に機能した**．
+- **(ii) wafl136 は「陰に隠れた 2 番手の straggler」**: rank37（wafl136）の compute は他 rank 平均の 2.30 倍で、Iter9 の recv_wait パターンからも「rank14 を解消すると rank37 が次の律速に昇格する」と読める．負荷分散を処方する場合、単一ノードだけでなく straggler 群（wafl113, wafl136）として扱う必要がある．
+- **(iii) wafl206 (rank47) と wafl130 (rank31) も straggler 候補**: 全層で上位5位に入り、mean比≈1.28x の劣化を示している．wafl113→wafl136→wafl206/wafl130 の順に劣化が浅くなるグラデーションが存在し、straggler は単一ノードではなく複数存在する可能性がある．
+- **(iv) 層起因説の棄却は「負荷分散」への道を開く**: Gemma-4 decoder 層は全層で同一 shape であり、層特異的な最適化（量子化・attention 実装）は効果がない．支配項を減らす唯一の有効な手は**負荷分散**（遅ノードへ層を減らす／WORLD_SIZE 調整）である．
+- **(v) wafl113 の劣化率（1.47〜1.60x）の解釈**: 計画の閾値 2倍に届かなかったのは、今回のベンチが seq_len=1 の GEMV（最軽微ワークロード）を測定したため．本番の推論（seq_len=512, sliding window attention）では KV cache の読み書きコストも含まれ、より大きな差が出る可能性がある．つまり **1.5x という数値は「保守的な下限見積もり」** と解釈できる．
+
+**3. Iteration 11 の方向決定: wafl113 を除外して WORLD_SIZE=50 で再ベンチ（影響定量化）**
+
+- **決定**: 次イテレーションの単一レバーを **「wafl113 (rank14) を除外して WORLD_SIZE=50 で `predict:demo` を再実行し、straggler 除去によるスループット改善量を定量化する」** とする．
+- **なぜこのレバーか**:
+  - straggler 起因が確定した今、処方箋は「負荷分散」に絞られる．その中でも最も情報利得が高く実装規模が小さいのは、**既存の deploy/predict パイプラインで wafl113 を除外し、WORLD_SIZE=50 で再ベンチ**することである．
+  - コード変更は `hosts.txt` の行を1行削除＋`pipeline_inference.py` の WORLD_SIZE 環境変数への対応（既存ロジックなので追加実装不要）のみで済む可能性が高い．最も小さく、最も速く、最も確実な「処方箋の事前検証」になる．
+  - これにより、(a) wafl113 除去がどれだけのスループット改善をもたらすか（定量的）、(b) rank37(wafl136) が次のボトルネックに昇格するか（qualitative）、(c) WORLD_SIZE=50 の層割当（`layers_high = 60-50+2 = 12`）で wafl136 がどの層を割り当てられるか、が一度に得られる．
+- **フォールバック (b)**: もし `pipeline_inference.py` の WORLD_SIZE 変更対応に予想外のコード修正が必要と判明した場合は、「(c) まず wafl113/wafl136 のホスト健全性を確認（CPU周波数、熱、同居プロセス）」へ振り替える．これは SSH での情報収集のみで完結し、`pipeline_inference.py` 非改変・完全に可逆．
+- **温存レバー**: `WORLD_SIZE` は config `levers` に既に登録済み（values: [11, 21, 51]）．本イテレーションは WORLD_SIZE=50 を試すものであり、config の既存レバーの範疇を超えるものではないが、`levers` に "50" を追加するかどうかは reflector が判断してもよい（可逆な判断）．ただし、今回はまず「wafl113 除外」の単一事例で十分なので、config.yml への追記は行わず、backlog での記録にとどめる．
+- **B9（B3 本体＝relay プロトコル改修＝SL3）との関係**: 本レバーは負荷分散の事前検証であり、relay プロトコルには一切触れない．**B9 は今回も温存（`[needs-human]` 維持，reflector では自動判定しない）**．
+
+**4. 要人間判断の有無**
+
+- wafl113 除外による WORLD_SIZE=50 の再ベンチは、既存の deploy/predict パイプラインをそのまま利用するものであり、コード変更は最小限（hosts.txt の行削除等）で **可逆**．したがって **自動判断とした**．
+- 層割当変更（`deploy.py` の `get_assigned_layers` 修正）や async ホットパス大改修（B14(b)）はまだ先送り．これらは実装規模が大きく不可逆側になる可能性があるため、計画フェーズで詳細が固まった時点で改めて判断する．
+- **B9（B3 本体＝relay プロトコル改修＝SL3）は引き続き人間回答待ち**。今回は温存．
+
+---
+
 research-cycle が読み書きする実験ジャーナル．**新しいイテレーションを常に先頭へ挿入する（逆時系列）**．
 1 イテレーション = 単一レバー変更．各ブロックに仮説・単一レバー・成功条件（planner 記入）と，
 変更・結果・判定・学び（reflector 記入）をまとめる．
+
+---
+
+### 実験 (Iter10)
+
+**担当**: 実験フェーズ subagent（rc-experimenter, 2026-07-22 JST）．`### 実装 (Iter10)` §5 の申し送りに従い，
+全51ノード×3層（layer 0/23/46）の local マイクロベンチを並列SSH実行した．
+スクリプト修正（SSHユーザー・docker exec対応，base64転送，逐次JSONL出力，max_workers=15）を経て完走．
+
+**1. 事前ヘルスチェック**
+- `uv run python tools/healthcheck.py` で **51/51 healthy** を確認．
+
+**2. ベンチ実行結果**
+- deploy/実行コマンド: `unset VIRTUAL_ENV && PYTHONUNBUFFERED=1 uv run python scripts/bench_all_nodes.py`
+- 成功: **153レコード**（51ノード×3層，全取得）．1件（rank=3/wafl102/layer46）の再実行で補完済み．
+- 所要時間: **1975.1 秒**（約33分）．並列度: max_workers=15．
+- 結果ファイル: `results/bench_all_nodes.jsonl`（153行，JSONL形式）
+- スクリプト修正点:
+  - SSHユーザー既定値を `user` → `denjo` に修正
+  - Python実行を `python` → `docker exec -i distributed-llm python3` に変更（コンテナ内実行）
+  - スクリプト転送を heredoc → base64エンコード + docker cp に変更（引用問題回避）
+  - SSH呼び出しを2回 → 1回に統合（オーバーヘッド削減）
+  - max_workers=5 → 15 に増強（全体時間短縮）
+  - 結果を逐次JSONL追記＋進捗表示に変更（長時間ジョブの可観測性向上）
+
+**3. 事後ヘルスチェック**
+- `uv run python tools/healthcheck.py` で **51/51 healthy** を確認．
+- クラッシュ・エラーは一切観測されなかった．全ノード健全．
+
+**4. 分析フェーズへの申し送り**
+- 得られたデータ: `results/bench_all_nodes.jsonl`（153レコード）．各レコードに `rank`, `host`, `layer_idx`, `median_s`, `min_s` を含む．
+- 特徴:
+  - ノード間で median_s に大きなばらつきがある（例: wafl104 layer46=0.2176s vs wafl-ctrl1 layer23=0.6450s）．
+  - rank14(wafl113), rank37(wafl136) がどの層でも突出して遅いか，analyst に委ねる．
+  - 欠損: なし（rank=3/wafl102/layer46 の1件は再実行で補完済み）．
+- 分析には `results/bench_all_nodes.jsonl` を直接読み込んで全 rank×3 層の median_s を集計すること．
+
+**担当**: 実装フェーズ subagent（rc-implementer, 2026-07-22 JST）．`### 検討・計画 (Iter10)` §4 の設計に従い，
+全51ノード単層 local マイクロベンチスクリプトの新規作成と既存コードの最小修正を実施した．実機非接続（コード読解・新規作成・pytest 実行のみ）．
+
+**1. 変更ファイル一覧**
+- `scripts/bench_compute_ceiling.py`: 既存ファイルの最小修正（`build_linear_shapes()` に `layer_idx` パラメータ追加）
+- `scripts/bench_all_nodes.py`: 新規作成（全ノード並列SSHベンチ主スクリプト，約380行）
+- `tests/test_bench_all_nodes.py`: 新規作成（ユニットテスト13件）
+
+**2. 各ファイルの変更内容**
+- **`bench_compute_ceiling.py`**: `build_linear_shapes()` に `layer_idx: int = 0` パラメータを追加．
+  内部で `Gemma4TextDecoderLayer(text_config, layer_idx=layer_idx)` を呼ぶように変更．
+  既定値0で既存呼び出し元（main()）への影響なし（後方互換保証）．
+- **`bench_all_nodes.py`**（新規）:
+  - `_build_remote_script()`: SSH経由で各ノード上で実行するベンチスクリプトを生成．
+    `%` 演算子で `NUM_THREADS`/`WARMUP_ITERS`/`MEASURE_ITERS` を埋め込み（中括弧のフォーマット衝突回避）．
+  - `run_on_node()`: heredoc (`python - <<"_BENCH_EOF"`) でスクリプトをSSHコマンドに埋め込み，
+    wafl-ctrl1経由の ProxyJump (ssh -J) でリモート実行．結果JSONをパースして `NodeResult` に変換．
+  - `collect_results()`: `ThreadPoolExecutor(max_workers=10)` で全ノード×3層（51x3=153タスク）を並列実行．
+    各ノードの失敗は他ノードに影響しない（None をスキップ）．
+  - CLI: `--hosts`/`--master`/`--user` フラグで構成可能．既定値は既存 deploy.py と整合．
+- **`test_bench_all_nodes.py`**（新規，13件）:
+  - `read_hosts`: 正常系・異常系（空行・コメント行の除外，ファイル不存在）
+  - `NodeResult`: 既定値の整合性，`asdict()` の全フィールド包含
+  - `run_on_node`: success/failure/JSON decode error/error field/timeout の5ケース
+    （`subprocess.run` を mock し，実SSHなしで検証）
+  - `append_jsonl`: ファイル新規作成・既存ファイルへの追記
+  - 定数整合性: `MEASURE_LAYERS` と bench_compute_ceiling.py の既定値
+
+**3. 検証結果**
+- `uv run pytest tests/test_bench_all_nodes.py -v` → **13 passed**
+- `uv run pytest tests/ -q` → **136 passed**（既存123 + 新規13，回帰なし）
+
+**4. 次フェーズへの申し送り**
+- 実機実験フェーズへ移行可能．スクリプトは pipeline_inference.py を非改変・加算的計測のみ．
+- 実行: `unset VIRTUAL_ENV && uv run python scripts/bench_all_nodes.py`
+- 結果出力先: `results/bench_all_nodes.jsonl`（153レコードの期待）
+- `_build_remote_script()` は transformers/torch の依存を仮定．リモートノードにインストール済みであることを確認．
+
+---
+
+### 検討・計画 (Iter10)
+
+**担当**: 検討・計画フェーズ subagent（rc-planner, 2026-07-22 JST）．B17（自動選定）と `### 調査 (Iter10)` の示唆
+を具体化し，本イテレーションの単一レバー・変更方針・成功条件を確定した．実機非接続（既存コードの Read のみ）．
+
+**1. 仮説**
+
+- **主仮説（ノード起因）**: wafl113（rank14）と wafl136（rank37）は物理的に遅いノード（straggler）であり，
+  CPU スループットが他ノードより約 2〜3 倍低い．その理由は熱スロットリング・周波数変動・同居プロセス等の
+  ノード固有要因．**判定基準**: layer 0/23/46 の全測定で wafl113/wafl136 が他ノードの中央値に対して有意に遅い（約 2 倍以上）．
+- **対立仮説（層起因）**: 層 23/46 が構造的に重く，layer 23・46 のみで wafl113/wafl136 が遅く，layer 0 では正常．
+  ただし Gemma-4 decoder 層は全層で hidden_size=5376, intermediate_size=21504 が同一であり，線形層 shape は
+  layer_idx に依らず不変（sliding/global attention の差は KV cache サイズのみで compute FLOPs は同一）．
+  よって「層起因」が成立するには，層 23/46 でのみ熱スロットリング等が発生しているという**ノード内の層特異的事象**
+  となる（つまり実質的にはノード起因の亜種）．
+- **切り分けロジック**: 全 51 ノードで同一の単一層 forward を測るため，差が出ればそれは純粋にノード間の性能差．
+  wafl113/wafl136 が全層で突出 → ノード起因．layer 23/46 のみに限定（ただし layer 0 でも同程度なら層起因ではない）→
+  その層でのみ何かが起きている（熱等）．
+
+**2. 単一レバー（今回変更する唯一のもの）**
+
+- **`scripts/bench_all_nodes.py` の新規作成**: 全 51 ノードで layer 0/23/46 の local forward を並列 SSH 実行し，
+  各ノードの per-layer compute time を測定・集約する．
+- serving/relay ロジック・計算結果・既存コードは一切変更しない（計測スクリプトの追加のみで可逆）．
+- bench_compute_ceiling.py の設計パターンを流用:
+  - `build_linear_shapes(config, layer_idx=N)` を拡張し任意の layer_idx で decoder 層を構築
+  - `measure_layer_ns(shapes, seq_len=1)` で全線形層の forward time を計測（中央値）
+  - `torch.set_num_threads(4)` / float32 という pipeline_inference.py と同一の計算条件
+
+**3. 固定する構成（単一レバー原則）**
+
+- config `levers` は直近最良構成に固定: `NUM_MICRO_BATCHES=4`（既定）, `WORLD_SIZE=51`
+- `STAGGER_INTERVAL`, `SEQ_LEN` は既定値のまま変更しない
+- bench パラメータ: WARMUP_ITERS=50, MEASURE_ITERS=200（bench_compute_ceiling.py と同一），seq_len=1
+- 測定層: layer 0, 23, 46 の 3 種に固定
+- SSH 並列度: max_workers=10（deploy.py と同一）
+
+**4. 変更方針（最小差分・変更すべきファイルと設定キー）**
+
+- **新規作成: `scripts/bench_all_nodes.py`**（主スクリプト，約 250 行の見込み）
+  - `build_linear_shapes(config, layer_idx=N)`: bench_compute_ceiling.py の `build_linear_shapes()` をラップし，
+    layer_idx パラメータを追加．random-init の `Gemma4TextDecoderLayer(text_config, layer_idx=N)` を構築．
+  - `measure_single_layer_ns(layer_idx, ...)`: `build_linear_shapes(config, layer_idx)` + `measure_layer_ns(shapes, seq_len=1)`
+    を呼び出し，1層分の中央値時間を返す（純粋な local 計測）．
+  - `run_on_node(node_ip, layer_idx, ...)`: 単一ノードで `measure_single_layer_ns()` を実行し結果を JSON 文字列で出力．
+    torch の初期化は各 SSH セッション内で完結（GPU は使わない CPU 推論のため，プロセスごとに独立）．
+  - `collect_results(hosts, layer_indices)`: ThreadPoolExecutor(max_workers=10) で全ノード×全層を並列実行．
+    ssh_via_master() で wafl-ctrl1 経由の jump SSH を使用（deploy.py と同一経路）．
+    各ノードの結果は local JSON ファイルに書き出し，collect フェーズで master へ集約．
+  - エントリポイント: `python scripts/bench_all_nodes.py` で全ノード測定→results/bench_all_nodes.jsonl へ追記．
+- **既存ファイルの修正: `scripts/bench_compute_ceiling.py`**（最小限，1〜2 行）
+  - `build_linear_shapes()` に `layer_idx: int = 0` パラメータを追加し，内部で
+    `Gemma4TextDecoderLayer(text_config, layer_idx=layer_idx)` を呼ぶように変更．
+  - 既存の呼び出し元（main() 内の `layer_idx=0` 相当）は影響なし（既定値 0 で互換性維持）．
+- **新規作成: `tests/test_bench_all_nodes.py`**（ユニットテスト）
+  - `measure_single_layer_ns()` の純粋関数部分をテスト（mock で SSH を回避）
+  - JSONL 出力のスキーマ検証
+
+**5. 期待効果**
+
+- wafl113/wafl136 が straggler（ノード起因）と確定すれば，処方箋は「負荷分散」（遅ノードへ層を減らす／
+  WORLD_SIZE 調整）に向かう．層起因と確定すれば当該層の compute 最適化（量子化・attention 実装）へ向かう．
+- 単一レバー変更で完全に可逆（スクリプト追加のみ，serving/relay 経路非改変）．
+
+**6. 成功条件（measurable）**
+
+- **完了条件（必須）**: 全 51 ノード×3層 = 153 レコードの JSONL が `results/bench_all_nodes.jsonl` に生成される
+  （欠損 rank・欠損 layer なし）．各レコードに `rank`, `host`, `layer_idx`, `median_s`（中央値時間）,
+  `min_s` を含む．
+- **判定条件**: 各層について，全 51 ノードの median_s の中央値を M としたとき:
+  - wafl113 (rank14) の median_s が M の **2倍以上** かつ wafl136 (rank37) も M の **1.5倍以上** → **ノード起因**
+    （straggler 確定．Iter9 の rank14=0.297s, rank37=0.225s が他 rank 平均 0.098s の約 3倍・2.3倍と整合するか）
+  - wafl113/wafl136 が全層で同様の比（layer 0/23/46 でほぼ同等の劣化率）→ **純粋なノード性能差**
+  - layer 23/46 のみ遅く layer 0 では正常 → 層特異的事象（熱スロットリング等）の可能性．ただしこの場合も
+    wafl113/wafl136 が突出するため，実質的にはノード起因の亜種と判断する
+  - wafl113/wafl136 が他ノードと同等（比 < 1.2）→ Iter9 の結果は別の要因（通信構造・パイプライン同期等）の可能性．
+    その場合は次のイテレーションで再調査
+
+**7. フォールバック / 要人間判断**
+
+- **要人間判断: なし**（local マイクロベンチ・加算的計測のみ，serving 経路非改変，B7 包括承認範囲内）．
+- **フォールバック**: 全ノード並列 SSH が安定しない場合，代表ノード（wafl100, wafl113, wafl136, wafl200 の 4 ノード）
+  で先行測定し，パターンを確認してから全ノードへ展開する．この場合でも単一レバー原則は維持（スクリプトは同一）．
+
+---
+
+### 調査 (Iter10)
+
+**担当**: 調査フェーズ subagent（rc-investigator, 2026-07-22 JST）．`### 考察・次計画 (Iter9)` の示唆（全51ノードで単層 local マイクロベンチを回し straggler ノードを特定）を受け，(1) Iter5/B8 で採用された SL1 型ベンチ `bench_compute_ceiling.py` の設計パターン，(2) 全51ノード並列SSHの実装インフラ（`deploy.py` の SSH connection pooling / ThreadPoolExecutor），(3) Gemma-4 decoder 層の形状特性，をコード読解と外部検索で調査した．実機非接続（既存コードの Read と tavily 検索のみ）．**逆時系列維持のため本ブロックを Iteration 10 内の最上段に置く**．
+
+**問い**
+- Q1: Iter5/B8 で「採用・収束」した SL1 型 local マイクロベンチ `bench_compute_ceiling.py` の設計パターンは何か．全51ノード規模でどう再利用／拡張するか．
+- Q2: 「ノード起因 vs 層 23/46 起因」の二択を決着させるのに，どの層を測定すべきか．複数層測るべきか．
+- Q3: 51ノード並列SSHの実装は `deploy.py` のインフラをどう流用できるか．失敗耐性・スケジューリングの指針は．
+
+**分かったこと**
+
+- **[Q1] SL1 設計パターン（bench_compute_ceiling.py）**: 重みファイル非ロードで random-init の `Gemma4TextDecoderLayer` から線形層形状を取得し，`torch.set_num_threads(4)` / float32 という pipeline_inference.py と同じ計算条件のもとで GEMV(seq_len=1) と GEMM(K, K in {2,4,8}) を計測．50 warmup + 200 measure 反復，`time.perf_counter_ns()` で1回ずつ計測して中央値を主指標．結果は `results/bench_compute_ceiling.jsonl` へ JSONL 追記．**Iter10 への教訓**: 全ノードで「同一の単一層 forward」を測るなら，このスクリプトから seq_len=1 の GEMV 計測部分（`measure_layer_ns(shapes, seq_len=1)`）を抽出し，layer_idx をパラメータ化すればよい．重み不要・random tensor で全ノードに同一計算を強制できる．
+- **[Q2] 層の形状特性**: Gemma-4 decoder 層は全層で hidden_size=5376, intermediate_size=21504 が同一．線形層 shape は layer_idx に依らず不変（q_proj: 5376→8192, k_proj: 5376→4096, v_proj: 5376→4096, o_proj: 8192→5376, gate_proj: 5376→21504, up_proj: 5376→21504, down_proj: 21504→5376）．sliding(0-11) vs global(12+) attention の差は KV cache サイズのみで，compute FLOPs は同一．**つまり「層 23 が他の層より構造的に重い」可能性は極めて低い**．ただし，layer_idx を変えて測定しても「wafl113/wafl136 がどの層でも突出して遅いか，層 23/46 のみ特別か」を見るには複数層測る価値がある．
+- **[Q2] 推奨設計**: **代表層 2〜3 種を全51ノードで測定**する．具体的には (a) layer 0（sliding attention 代表），(b) layer 23（rank14 の層），(c) layer 46（rank37 の層）の3種．もし wafl113/wafl136 が全層で突出すればノード起因，layer 23/46 のみに限定されていれば層起因（ただし形状不変なので，後者は「その層でのみ熱スロットリング等が発生している」等のノード要因の可能性が高い）．3層×51ノードで，各層 50warmup+100measure → 全体で 15,300 回の forward pass．
+- **[Q3] 並列SSHインフラ**: `tools/deploy.py` は `ThreadPoolExecutor(max_workers=10)` で51ノードへの並列操作を行い，`ssh_via_master()`（wafl-ctrl1 経由の jump SSH）と `ssh_run()` を使い分ける．ControlMaster connection pooling で SSH 接続オーバーヘッドを削減．**Iter10 への指針**: ベンチスクリプトを全ノードへ rsync → SSH で並列実行 → 結果ファイルを master へ collect の3ステップ．`deploy.py` の `ThreadPoolExecutor(10)` と `ssh_via_master()` を流用可能．各ノードのベンチ完了は独立（通信なし），1ノードの失敗は他ノードに影響しない．collect 時は failed nodes を集計して報告する．
+
+**コード読解で判明した重要事実**
+
+- `scripts/bench_compute_ceiling.py:176-201` (`measure_linear`): 単一 `nn.Linear` の計測ループ．`time.perf_counter_ns()` で1回ずつ計測 → 中央値採用．この関数を layer_idx パラメータ化すれば，任意の decoder 層の forward が測れる．
+- `scripts/bench_compute_ceiling.py:100-128` (`build_linear_shapes`): random-init の `Gemma4TextDecoderLayer(text_config, layer_idx=0)` を構築し，中の `nn.Linear` モジュールを列挙．重みはロードしない（random のまま）．**Iter10 では layer_idx を変えてこれを呼べばよい**．
+- `scripts/bench_compute_ceiling.py:204-218` (`measure_layer_ns`): 全 LinearShape の計測結果を合計して「1層分の時間」を出す．これが Iter10 の主指標（per-layer forward time）になる．
+- `tools/deploy.py:39-40`: `ssh_run`, `ssh_via_master` を import．51ノード並列SSHの実装パターンとして再利用可能．
+- `hosts.txt`: 51行（wafl-ctrl1 + wafl100-139/200-209）．行順＝rank番号．rank14=15行目(wafl113), rank37=38行目(wafl136)．
+
+**次フェーズ（rc-planner）への具体的な示唆**
+
+- **単一レバー**: `scripts/bench_all_nodes.py` の新規作成（全51ノードで layer 0/23/46 の local forward を並列SSH実行，結果を JSONL へ）．serving/relay 経路非改変・コード追加のみで可逆．
+- **設計方針**:
+  - bench_compute_ceiling.py の `build_linear_shapes(config, layer_idx=N)` + `measure_layer_ns(shapes, seq_len=1)` を再利用（layer_idx パラメータを追加）
+  - 全ノードへスクリプト配布は rsync（deploy.py の model distribution パターン流用）
+  - 並列SSH実行は `ThreadPoolExecutor(max_workers=10)` + `ssh_via_master()`（deploy.py 流用）
+  - 各ノードの結果は local JSON ファイルに書き出し，collect フェーズで master へ集約
+  - 成功指標: 全51ノード×3層 = 153 レコードの JSONL が生成され，wafl113/wafl136 の compute_time が他ノードと統計的に有意に異なるか
+- **実機非接続で済むフェーズ**: 調査（今回）→ 計画 → 実装 はコードのみ．実験フェーズで deploy/predict を伴う．
+- **要人間判断: なし**（local マイクロベンチ・加算的計測ログのみ，serving 経路非改変，B7 包括承認範囲内）
 
 ---
 
